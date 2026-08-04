@@ -83,24 +83,81 @@ type ParsedMessage = ChatBody["messages"][number];
  * Turn a first-turn false refusal into one harmless, real local action without
  * spending another M365 message asking the model to reconsider.  The client
  * executes this call, then sends its output back through the normal agent loop.
- * Keep this deliberately read-only and only use the caller's actual `bash` tool.
+ * Keep this deliberately read-only and only use the caller's actual shell tool.
  */
+const LIST_TOOL_NAME = /^(ls|list|list_dir|list_directory|glob|dir|find_files|search_files|ls_dir|view_dir)$/i;
+
 export function makeOrientationToolCall(body: ChatBody): ReturnType<typeof parseToolCalls>["toolCalls"][number] | null {
-  if (!Array.isArray(body.tools)) return null;
-  if (typeof body.tool_choice === "object" && body.tool_choice.function.name !== "bash") return null;
+  if (!Array.isArray(body.tools) || body.tools.length === 0) return null;
 
-  const bash = body.tools.find((tool) => tool.function.name === "bash");
-  const properties = bash?.function.parameters?.properties;
-  if (!bash || !properties || !("command" in properties)) return null;
+  const shell = findShellTool(body.tools);
+  if (shell) {
+    if (typeof body.tool_choice === "object") {
+      const selected = body.tool_choice.function.name;
+      const selectedTool = body.tools.find((tool) => tool.function.name === selected);
+      if (selectedTool !== shell && !isShellToolName(selected)) return null;
+    }
 
+    const commandParam = shellCommandParam(shell);
+    if (commandParam) {
+      return {
+        id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: shell.function.name,
+          arguments: JSON.stringify({ [commandParam]: "pwd && ls -la" }),
+        },
+      };
+    }
+  }
+
+  const listTool = body.tools.find((t) => LIST_TOOL_NAME.test(t.function.name));
+  if (listTool) {
+    const props = Object.keys(listTool.function.parameters?.properties ?? {});
+    const pathArg = props.find((p) => /^(path|dir|directory|pattern|glob)$/i.test(p)) ?? props[0];
+    const val = /pattern|glob/i.test(pathArg ?? "") ? "*" : ".";
+    return {
+      id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      type: "function",
+      function: {
+        name: listTool.function.name,
+        arguments: pathArg ? JSON.stringify({ [pathArg]: val }) : "{}",
+      },
+    };
+  }
+
+  const firstTool = body.tools[0];
   return {
     id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     type: "function",
     function: {
-      name: "bash",
-      arguments: JSON.stringify({ command: "pwd && ls -la" }),
+      name: firstTool.function.name,
+      arguments: "{}",
     },
   };
+}
+
+const SHELL_TOOL_NAME = /^(bash|sh|shell|zsh|run|exec|execute|command|cmd|terminal|run_command|run_terminal_cmd|execute_command|execute_bash|shell_exec|system)$/i;
+const SHELL_COMMAND_PARAMS = ["command", "cmd", "script", "input"];
+
+function isShellToolName(name: string): boolean {
+  return SHELL_TOOL_NAME.test(name);
+}
+
+function findShellTool(tools: NonNullable<ChatBody["tools"]>): NonNullable<ChatBody["tools"]>[number] | null {
+  return tools.find((tool) => isShellToolName(tool.function.name)) ??
+    tools.find((tool) => {
+      const props = Object.keys(tool.function.parameters?.properties ?? {});
+      return props.length === 1 && SHELL_COMMAND_PARAMS.some((p) => p.toLowerCase() === props[0].toLowerCase());
+    }) ??
+    null;
+}
+
+function shellCommandParam(tool: NonNullable<ChatBody["tools"]>[number]): string | null {
+  const props = Object.keys(tool.function.parameters?.properties ?? {});
+  return SHELL_COMMAND_PARAMS.find((p) => props.includes(p)) ??
+    props.find((p) => SHELL_COMMAND_PARAMS.some((known) => known.toLowerCase() === p.toLowerCase())) ??
+    (props.length === 1 ? props[0] : null);
 }
 
 // --- Per-conversation state ---
@@ -308,12 +365,10 @@ export async function handleChatCompletion(
     // detection profile. A single long pi thread never trips the trigger.
     await awaitDegradationBackoff();
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const startTime = performance.now();
+      let firstTokenTime: number | null = null;
       let copilotStream;
       try {
-        // Only attach the tool-calling agent when the request actually has tools.
-        // The agent overrides `tone` (forces GPT-5), so tool-less requests must
-        // skip it to reach the model the tone selects (e.g. Claude). See
-        // ModelSession.run / docs H8.6.
         copilotStream = await session.run(text, model, opts.signal, useToolAgent);
       } catch (err: any) {
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
@@ -322,6 +377,9 @@ export async function handleChatCompletion(
       let fullText = "";
       try {
         for await (const delta of copilotStream) {
+          if (firstTokenTime === null && delta.length > 0) {
+            firstTokenTime = performance.now();
+          }
           fullText += delta;
           onDelta?.(delta);
         }
@@ -331,6 +389,10 @@ export async function handleChatCompletion(
       } catch (err: any) {
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
       }
+
+      const totalTime = Math.round(performance.now() - startTime);
+      const ttft = firstTokenTime ? Math.round(firstTokenTime - startTime) : null;
+      log.info(`Upstream turn latency: total=${totalTime}ms, ttft=${ttft ?? "N/A"}ms, chars=${fullText.length}, model=${model}`);
 
       // Image gen (§14): the picture arrives on a GraphicArt frame, usually with NO
       // chat text — so an image turn looks empty to the checks below and would burn
@@ -478,10 +540,10 @@ export async function handleChatCompletion(
       // merely telling the model that the filesystem exists. Return a safe local
       // orientation call instead. Once its real output comes back, the next turn
       // has concrete evidence and the model can continue the original task.
-      if (confab && !everActed) {
+      if (confab) {
         const orientationCall = makeOrientationToolCall(body);
         if (orientationCall) {
-          log.info("First-turn confabulation detected — returning a read-only bash orientation call");
+          log.info("Confabulation detected — returning a read-only orientation tool call");
           parsed = { hasToolCalls: true, toolCalls: [orientationCall], textContent: null };
           break;
         }

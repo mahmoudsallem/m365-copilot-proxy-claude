@@ -495,6 +495,9 @@ async function runBrowserLogin(
 // --- Token acquisition methods ---
 
 export async function getTokenSilent(): Promise<string | null> {
+  const cached = readCachedToken(SCOPES);
+  if (cached) return cached;
+
   const app = getApp();
   const accounts = await app.getTokenCache().getAllAccounts();
   if (accounts.length === 0) return null;
@@ -505,7 +508,7 @@ export async function getTokenSilent(): Promise<string | null> {
       account: accounts[0],
     });
     saveCache(app);
-    return result.accessToken;
+    return cacheToken(SCOPES, result.accessToken, result.expiresOn);
   } catch {
     return null;
   }
@@ -529,21 +532,21 @@ export async function loginAutomated(
       `Automated login failed — see artifacts in ${LOGIN_DEBUG_DIR}`,
     );
   }
-  return token;
+  return cacheToken(SCOPES, token);
 }
 
 /** Start a visible Microsoft sign-in for the normal M365 Copilot chat scopes. */
 export async function loginInteractive(): Promise<string> {
   const token = await runInteractiveBrowserLogin(getApp(), SCOPES);
   if (!token) throw new Error("Interactive Microsoft login did not complete");
-  return token;
+  return cacheToken(SCOPES, token);
 }
 
 /** Start a visible Microsoft sign-in for one additional resource scope. */
 export async function loginInteractiveForScopes(scopes: string[]): Promise<string> {
   const token = await runInteractiveBrowserLogin(getApp(), scopes);
   if (!token) throw new Error(`Interactive Microsoft login did not complete for ${scopes.join(", ")}`);
-  return token;
+  return cacheToken(scopes, token);
 }
 
 /**
@@ -570,7 +573,7 @@ export async function loginDeviceCodeForScopes(
   if (!result) throw new Error(`Microsoft device-code login did not complete for ${scopes.join(", ")}`);
   saveCache(app);
   log.info(`Device-code login succeeded as ${result.account?.username}`);
-  return result.accessToken;
+  return cacheToken(scopes, result.accessToken, result.expiresOn);
 }
 
 /** Start device-code authentication for the normal M365 Copilot chat scopes. */
@@ -597,6 +600,7 @@ export function forceReauth(): Promise<boolean> {
 }
 
 async function doForceReauth(): Promise<boolean> {
+  tokenCache.clear();
   try {
     const silent = await getTokenSilent();
     if (silent) {
@@ -635,7 +639,70 @@ export function loadSecrets(): {
   return null;
 }
 
+interface CachedTokenEntry {
+  token: string;
+  expiresAtMs: number;
+}
+const tokenCache = new Map<string, CachedTokenEntry>();
+const TOKEN_REFRESH_SKEW_MS = 60_000;
+
+function tokenCacheKey(scopes: string[]): string {
+  return [...scopes].sort().join(" ");
+}
+
+function tokenExpiryMs(token: string, expiresOn?: Date | null): number {
+  if (expiresOn) return expiresOn.getTime();
+  try {
+    const [, payload] = token.split(".");
+    if (payload) {
+      const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+      if (typeof json.exp === "number") return json.exp * 1000;
+    }
+  } catch {
+    // Fall through to the conservative default below.
+  }
+  return Date.now() + 55 * 60_000;
+}
+
+function readCachedToken(scopes: string[]): string | null {
+  const cached = tokenCache.get(tokenCacheKey(scopes));
+  if (!cached) return null;
+  if (Date.now() < cached.expiresAtMs - TOKEN_REFRESH_SKEW_MS) return cached.token;
+  tokenCache.delete(tokenCacheKey(scopes));
+  return null;
+}
+
+function cacheToken(scopes: string[], token: string, expiresOn?: Date | null): string {
+  tokenCache.set(tokenCacheKey(scopes), {
+    token,
+    expiresAtMs: tokenExpiryMs(token, expiresOn),
+  });
+  return token;
+}
+
+const inflightScopedTokens = new Map<string, Promise<string | null>>();
+
 export async function getTokenForScope(scopes: string[]): Promise<string | null> {
+  const cached = readCachedToken(scopes);
+  if (cached) return cached;
+
+  const cacheKey = tokenCacheKey(scopes);
+  const inflight = inflightScopedTokens.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = doGetTokenForScope(scopes).finally(() => {
+    inflightScopedTokens.delete(cacheKey);
+  });
+  inflightScopedTokens.set(cacheKey, promise);
+  return promise;
+}
+
+async function doGetTokenForScope(scopes: string[]): Promise<string | null> {
+  const cached = readCachedToken(scopes);
+  if (cached) {
+    return cached;
+  }
+
   const app = getApp();
   const accounts = await app.getTokenCache().getAllAccounts();
   log.info(`getTokenForScope: ${scopes.join(",")} — ${accounts.length} accounts in cache`);
@@ -647,7 +714,7 @@ export async function getTokenForScope(scopes: string[]): Promise<string | null>
         account: accounts[0],
       });
       saveCache(app);
-      return result.accessToken;
+      return cacheToken(scopes, result.accessToken, result.expiresOn);
     } catch (err: any) {
       log.info(`getTokenForScope: silent failed (${err.message}), trying browser login`);
     }
@@ -655,9 +722,13 @@ export async function getTokenForScope(scopes: string[]): Promise<string | null>
 
   // Silent unavailable — fall back to automated browser login with stored creds.
   const secrets = loadSecrets();
-  if (secrets) return runBrowserLogin(app, scopes, secrets);
-  if (interactiveLoginEnabled()) return runInteractiveBrowserLogin(app, scopes);
-  return null;
+  let token: string | null = null;
+  if (secrets) token = await runBrowserLogin(app, scopes, secrets);
+  else if (interactiveLoginEnabled()) token = await runInteractiveBrowserLogin(app, scopes);
+  if (token) {
+    cacheToken(scopes, token);
+  }
+  return token;
 }
 
 // Serialize token acquisition: concurrent callers share one in-flight login
