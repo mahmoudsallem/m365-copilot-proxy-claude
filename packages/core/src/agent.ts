@@ -395,3 +395,14 @@ export async function getOrCreateAgent(
     return null;
   }
 }
+
+let agentResolutionPromise: Promise<string | null> | null = null;
+
+/** Single-flight wrapper around getOrCreateAgent to prevent race conditions during initial resolution. */
+export async function getOrCreateAgentSingleFlight(): Promise<string | null> {
+  if (agentResolutionPromise) return agentResolutionPromise;
+  agentResolutionPromise = getOrCreateAgent().finally(() => {
+    agentResolutionPromise = null;
+  });
+  return agentResolutionPromise;
+}

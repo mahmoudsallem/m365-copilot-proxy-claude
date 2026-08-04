@@ -11,11 +11,11 @@ export default defineNitroPlugin(async () => {
       "M365_PROXY_API_KEY is required. Run `pnpm setup:local` and start with `pnpm proxy:local`.",
     );
   }
-  console.log("Authenticating...");
+  console.log("Authenticating against Microsoft 365...");
   try {
     await getToken();
+    console.log("Authenticated against Microsoft 365 successfully.");
   } catch (err: any) {
-    console.error(`Auth failed: ${err.message}`);
-    throw err;
+    console.warn(`Startup auth notice: ${err.message}. Server online; auth will be re-attempted on request.`);
   }
 });

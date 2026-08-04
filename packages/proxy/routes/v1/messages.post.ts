@@ -24,5 +24,10 @@ export default defineEventHandler(async (event) => {
     res.once("close", abort);
   }
 
-  return handleAnthropicMessages(body, pool, controller.signal);
+  try {
+    return await handleAnthropicMessages(body, pool, controller.signal);
+  } catch (err: any) {
+    console.error("[messages.post error]", err.stack || err);
+    throw err;
+  }
 });

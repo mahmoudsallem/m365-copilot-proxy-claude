@@ -4,6 +4,8 @@ import {
   createLogger,
   trunc,
   getToneForModel,
+  resolveModel,
+  UnsupportedModelError,
   formatMessages,
   parseToolCalls,
   looksLikeConfabulation,
@@ -215,29 +217,38 @@ export async function handleChatCompletion(
   pool: SessionPool,
   opts: { signal?: AbortSignal } = {},
 ): Promise<Response> {
+  let resolved;
+  try {
+    resolved = resolveModel(body.model);
+  } catch (err: any) {
+    if (err instanceof UnsupportedModelError) {
+      return jsonResponse(400, {
+        error: {
+          message: err.message,
+          type: "invalid_request_error",
+          code: "UNSUPPORTED_MODEL",
+          supported_models: err.supportedModels,
+        },
+      });
+    }
+    return jsonResponse(400, { error: { message: err.message, type: "invalid_request_error" } });
+  }
+
+  // Log warnings for deprecated/preset model aliases
+  if (resolved.warnings.length > 0) {
+    for (const warn of resolved.warnings) {
+      log.warn(`Model resolution warning: ${warn}`);
+    }
+  }
+
   const conv = pool.resolve(body.messages);
   const { session } = conv;
   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
-  const model = body.model;
+  const model = resolved.canonicalModel;
 
-  // Claude (Claude_Sonnet tone) tool-calls reliably AGENT-LESS (probe: 4/4 ```bash,
-  // 0 disengage) and self-IDs as Claude Sonnet 4.5; the declarative agent would
-  // override the tone back to GPT-5 (H8.6) AND add jailbreak-shape signal. GPT-the-
-  // chat-model, by contrast, won't tool-call agent-less (0/4) so it still needs the
-  // agent. So: attach the tool agent EXCEPT on Claude models — there, stay agent-less
-  // to get real Claude doing tools via shell-routing (docs §10 F23). Force the old
-  // behavior with M365_FORCE_AGENT=1.
-  // Stay agent-less ONLY when the tone is actually a Claude tone — empirically that's
-  // the path that tool-calls right now (route-probe 2026-07-07: Claude_Sonnet agent-less
-  // 2/2; the magic path 0/2). Derive it from the RESOLVED tone, not the raw model
-  // string: getToneForModel now routes any unmapped `claude-*` (e.g. the
-  // `claude-opus-4-8[1m]` a Claude Code client sends) to Claude_Sonnet, so this check
-  // then keeps that request on the working agent-less path. The old
-  // `/claude/i.test(model)` + `magic` fallback split a claude-* string into GPT-tone +
-  // agent-suppressed — the confab quadrant we observed. One resolved tone drives both.
-  const tone = getToneForModel(model);
+  const tone = resolved.config.tone;
   const isClaudeTone = /^Claude_/i.test(tone);
-  const useToolAgent = !!hasTools && (process.env.M365_FORCE_AGENT === "1" || !isClaudeTone);
+  const useToolAgent = !!hasTools && resolved.config.supportsAgent && (process.env.M365_FORCE_AGENT === "1" || !isClaudeTone);
 
   // Format message: full prompt on first turn, delta on follow-ups.
   // M365 is stateful — it remembers everything from prior turns,
@@ -545,13 +556,13 @@ export async function handleChatCompletion(
     if (parsed.hasToolCalls && parsed.toolCalls.length > 0) {
       return { kind: "tools", toolCalls: parsed.toolCalls };
     }
-    return { kind: "text", text: fullText };
+    return { kind: "text", text: fullText.trim() || "Okay." };
   } else {
     // No tools — stream deltas live (onDelta) while buffering for the retry logic.
     const result = await runBuffered(onDelta);
     if ("error" in result) return { kind: "error", resp: result.error };
     conv.sentMessageCount = body.messages.length;
-    return { kind: "text", text: result.fullText };
+    return { kind: "text", text: result.fullText.trim() || "Okay." };
   }
   } // end produce()
 
@@ -560,7 +571,13 @@ export async function handleChatCompletion(
   const usage = () => buildUsage(lastThrottle, lastContentOrigin, lastMessageType, lastScores, lastTurnCount);
 
   if (!body.stream) {
-    const p = await produce();
+    let p: Produced;
+    try {
+      p = await produce();
+    } catch (err: any) {
+      console.error("[produce error non-stream]", err.stack || err);
+      return jsonResponse(502, { error: { message: err?.message ?? "upstream error", type: "upstream_error" } });
+    }
     if (p.kind === "error") return p.resp;
     if (p.kind === "tools") {
       return jsonResponse(200, {
@@ -604,8 +621,12 @@ export async function handleChatCompletion(
       };
 
       let p: Produced;
-      try { p = await produce(liveDelta); }
-      catch (err: any) { p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) }; }
+      try {
+        p = await produce(liveDelta);
+      } catch (err: any) {
+        console.error("[produce error stream]", err.stack || err);
+        p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) };
+      }
       clearInterval(hb);
       try {
         if (p.kind === "error") {
@@ -618,15 +639,11 @@ export async function handleChatCompletion(
             send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] }));
           send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], ...(includeUsage ? { usage: usage() } : {}) });
         } else {
-          // Emit only what wasn't already streamed live: the whole text if nothing was
-          // (tool-mode prose fallback, or a fully-buffered turn), or just the tail when
-          // live deltas already covered a prefix. If `sent` somehow isn't a prefix of
-          // the final text (a divergent snapshot upstream chose not to stream), fall
-          // back to sending nothing more rather than duplicating already-sent bytes.
-          const remainder = p.text.startsWith(sent) ? p.text.slice(sent.length) : "";
-          if (!p.text.startsWith(sent)) log.info(`Streamed prefix diverged from final text (sent ${sent.length}, final ${p.text.length} chars) — not re-sending to avoid duplication`);
+          const finalText = p.text ?? "";
+          const remainder = finalText.startsWith(sent) ? finalText.slice(sent.length) : "";
+          if (!finalText.startsWith(sent)) log.info(`Streamed prefix diverged from final text (sent ${sent.length}, final ${finalText.length} chars) — not re-sending to avoid duplication`);
           if (remainder) send({ ...base, choices: [{ index: 0, delta: { content: remainder }, finish_reason: null }] });
-          send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: outputFinishReason(p.text) }], ...(includeUsage ? { usage: usage() } : {}) });
+          send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: outputFinishReason(finalText) }], ...(includeUsage ? { usage: usage() } : {}) });
         }
       } catch {
         // client likely disconnected mid-emit — nothing more to do

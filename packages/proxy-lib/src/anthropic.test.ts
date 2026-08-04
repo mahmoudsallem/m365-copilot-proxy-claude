@@ -25,7 +25,7 @@ describe("Anthropic Messages compatibility", () => {
 
     const translated = toOpenAIChatRequest(body);
     expect(translated.stream).toBe(false);
-    expect(translated.model).toBe("claude-sonnet-4.5");
+    expect(translated.model).toBe("claude-sonnet");
     expect(translated.tools?.[0].function.name).toBe("Bash");
     expect(translated.messages).toEqual([
       { role: "system", content: "You are a coding agent." },
@@ -58,9 +58,9 @@ describe("Anthropic Messages compatibility", () => {
     expect(estimateAnthropicInputTokens({ messages: [{ content: "hello" }] })).toBeGreaterThan(0);
   });
 
-  it("maps Claude-only picker models to the stable M365 default", () => {
-    expect(resolveM365Model("claude-opus-5")).toBe("gpt-5.5-think-deeper");
-    expect(resolveM365Model("opus[1m]")).toBe("gpt-5.5-think-deeper");
+  it("maps Claude picker models to canonical M365 models", () => {
+    expect(resolveM365Model("claude-opus-5")).toBe("claude-opus");
+    expect(resolveM365Model("opus[1m]")).toBe("claude-opus");
     expect(resolveM365Model("gpt-5.5-think-deeper")).toBe("gpt-5.5-think-deeper");
   });
 });

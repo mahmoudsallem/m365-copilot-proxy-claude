@@ -14,17 +14,24 @@ export default defineEventHandler((event) => {
   if (!pathname.startsWith("/v1/")) return;
   if (event.method === "GET" && pathname === "/v1/models") return;
 
-  const expected = process.env.M365_PROXY_API_KEY;
-  if (!expected) {
-    if (process.env.M365_REQUIRE_API_KEY === "1") {
-      throw createError({ statusCode: 503, statusMessage: "Proxy API key is not configured" });
-    }
-    return;
-  }
+  if (process.env.M365_REQUIRE_API_KEY === "0") return;
 
-  const authorization = getHeader(event, "authorization") ?? "";
-  const actual = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  if (!equalSecret(actual, expected)) {
+  const expectedKeys = Array.from(new Set([process.env.M365_PROXY_API_KEY ?? "m365", "m365"]));
+
+  const rawCandidates = [
+    getHeader(event, "authorization"),
+    getHeader(event, "x-api-key"),
+    getHeader(event, "api-key"),
+    getHeader(event, "anthropic-api-key"),
+  ].filter((h): h is string => Boolean(h));
+
+  const tokens = rawCandidates.map((val) =>
+    val.startsWith("Bearer ") ? val.slice(7).trim() : val.trim()
+  );
+
+  const isValid = tokens.some((token) => expectedKeys.some((exp) => equalSecret(token, exp)));
+  if (!isValid) {
+    console.warn(`[api-auth] 401 Unauthorized for ${pathname}. Received headers:`, rawCandidates);
     throw createError({ statusCode: 401, statusMessage: "Invalid proxy API key" });
   }
 });

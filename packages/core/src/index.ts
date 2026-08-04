@@ -35,12 +35,27 @@ export {
   type BackoffOptions,
 } from "./auth-recovery.js";
 
-export { getOrCreateAgent } from "./agent.js";
+export {
+  M365ProxyError,
+  UnsupportedModelError,
+  redactSensitive,
+  type ProxyErrorCode,
+} from "./errors.js";
+
+export { getOrCreateAgent, getOrCreateAgentSingleFlight } from "./agent.js";
 
 export {
   decodeJwt,
   getToneForModel,
   getAvailableModels,
+  resolveModel,
+  normalizeModelName,
+  CANONICAL_MODELS,
+  MODEL_ALIASES,
+  type ModelConfig,
+  type ResolvedModel,
+  type BackendFamily,
+  type ToolMode,
   type CopilotStream,
   type CapturedImage,
 } from "./copilot.js";

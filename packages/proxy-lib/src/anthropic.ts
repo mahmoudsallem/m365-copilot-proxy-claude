@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { getAvailableModels, resolveModel } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { handleChatCompletion, type SessionPool } from "./handler.js";
 
@@ -25,7 +26,9 @@ const IgnoredBlock = z.object({ type: z.string() }).passthrough();
 const ContentBlock = z.union([TextBlock, ToolUseBlock, ToolResultBlock, IgnoredBlock]);
 
 const AnthropicMessage = z.object({
-  role: z.enum(["user", "assistant"]),
+  // Accept 'system' role in the messages array — some clients (Cursor, older Claude Code)
+  // send system instructions as a message rather than in the top-level `system` field.
+  role: z.enum(["user", "assistant", "system"]),
   content: z.union([z.string(), z.array(ContentBlock)]),
 });
 
@@ -89,15 +92,43 @@ function textFromUnknown(value: unknown): string {
 function systemText(system: AnthropicBody["system"]): string {
   if (!system) return "";
   if (typeof system === "string") return system;
-  return system.map((block) => block.text).join("\n\n");
+  if (Array.isArray(system)) {
+    return system
+      .map((block: any) => (typeof block === "string" ? block : block?.text ?? ""))
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  if (typeof system === "object" && system !== null) {
+    const s = system as any;
+    if (typeof s.text === "string") return s.text;
+    try { return JSON.stringify(system); } catch { return String(system); }
+  }
+  return String(system);
 }
 
 function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
-  const system = systemText(body.system);
-  if (system) messages.push({ role: "system", content: system });
 
-  for (const message of body.messages) {
+  // Collect system content from both the top-level `system` field and any
+  // system-role messages in the messages array (sent by Cursor / older clients).
+  const systemParts: string[] = [];
+  const topLevel = systemText(body.system);
+  if (topLevel) systemParts.push(topLevel);
+
+  // Extract system-role messages so they don't pollute the turn array.
+  const nonSystemMessages = body.messages.filter((m) => {
+    if ((m as any).role === "system") {
+      const text = typeof m.content === "string" ? m.content : textFromUnknown(m.content);
+      if (text) systemParts.push(text);
+      return false;
+    }
+    return true;
+  });
+
+  const combinedSystem = systemParts.join("\n\n");
+  if (combinedSystem) messages.push({ role: "system", content: combinedSystem });
+
+  for (const message of nonSystemMessages) {
     if (typeof message.content === "string") {
       messages.push({ role: message.role, content: message.content });
       continue;
@@ -157,23 +188,17 @@ function mapToolChoice(choice: AnthropicBody["tool_choice"]) {
   return { type: "function" as const, function: { name: choice.name } };
 }
 
-const M365_MODEL_IDS = new Set([
-  "m365-copilot", "auto", "quick", "think-deeper",
-  "claude", "claude-sonnet", "claude-sonnet-4.5", "claude-sonnet-think-deeper", "claude-opus",
-  "gpt-5.5", "gpt-5.5-quick", "gpt-5.5-think-deeper",
-  "gpt-5.4", "gpt-5.4-quick", "gpt-5.4-think-deeper",
-  "gpt-5.3", "gpt-5.3-quick", "gpt-5.3-think-deeper",
-  "gpt-5.2", "gpt-5.2-quick", "gpt-5.2-think-deeper",
-]);
-
 /**
- * Claude Code's /model picker only knows Anthropic catalog IDs. If a user picks
- * Opus/Sonnet there, do not forward that unrecognised ID into M365 and poison an
- * otherwise healthy conversation. Explicit M365 catalog IDs still pass through.
+ * Claude Code's /model picker sends Anthropic model names or custom model aliases.
+ * Resolve against our centralized capability-aware model registry.
  */
 export function resolveM365Model(requested: string): string {
-  if (M365_MODEL_IDS.has(requested)) return requested;
-  return process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5-think-deeper";
+  try {
+    const resolved = resolveModel(requested);
+    return resolved.canonicalModel;
+  } catch {
+    return process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5";
+  }
 }
 
 /** Translate Claude's Messages API request into the proxy's OpenAI Chat request. */
@@ -220,9 +245,23 @@ export function fromOpenAIChatResponse(payload: any, requestedModel: string): An
   const choice = payload?.choices?.[0] ?? {};
   const message = choice.message ?? {};
   const content: AnthropicContent[] = [];
-  if (typeof message.content === "string" && message.content.length) {
+
+  if (typeof message.content === "string" && message.content.trim().length > 0) {
     content.push({ type: "text", text: message.content });
+  } else if (Array.isArray(message.content)) {
+    for (const item of message.content) {
+      if (typeof item === "string" && item.trim().length > 0) {
+        content.push({ type: "text", text: item });
+      } else if (item && typeof item === "object") {
+        if (item.type === "text" && typeof item.text === "string" && item.text.trim().length > 0) {
+          content.push({ type: "text", text: item.text });
+        } else if (item.type === "tool_use") {
+          content.push(item);
+        }
+      }
+    }
   }
+
   for (const call of message.tool_calls ?? []) {
     content.push({
       type: "tool_use",
@@ -231,7 +270,8 @@ export function fromOpenAIChatResponse(payload: any, requestedModel: string): An
       input: parseToolInput(String(call.function?.arguments ?? "{}")),
     });
   }
-  if (content.length === 0) content.push({ type: "text", text: "" });
+
+  if (content.length === 0) content.push({ type: "text", text: "Okay." });
 
   const finish = choice.finish_reason;
   const stopReason = finish === "tool_calls"
@@ -273,10 +313,11 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
         type: "message_start",
         message: { ...message, content: [], stop_reason: null, stop_sequence: null },
       });
-      message.content.forEach((block, index) => {
+      (message?.content ?? []).forEach((block, index) => {
         if (block.type === "text") {
+          const textVal = block.text?.trim() ? block.text : "Okay.";
           send("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
-          if (block.text) send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } });
+          send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: textVal } });
         } else {
           send("content_block_start", {
             type: "content_block_start",

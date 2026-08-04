@@ -15,7 +15,7 @@ mkdir -p "$(dirname "$ENV_FILE")"
 chmod 700 "$(dirname "$ENV_FILE")"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-  API_KEY="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
+  API_KEY="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   printf 'export M365_PROXY_API_KEY=%q\nexport M365_REQUIRE_API_KEY=1\nexport M365_INTERACTIVE_LOGIN=1\nexport HOST=127.0.0.1\nexport NITRO_HOST=127.0.0.1\n' "$API_KEY" > "$ENV_FILE"
 fi
 

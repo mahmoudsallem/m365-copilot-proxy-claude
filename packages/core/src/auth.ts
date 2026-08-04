@@ -558,7 +558,7 @@ export async function loginDeviceCodeForScopes(
   const app = getApp();
   const result = await app.acquireTokenByDeviceCode({
     scopes,
-    authority: "https://login.microsoftonline.com/organizations",
+    authority: AUTHORITY,
     deviceCodeCallback: (response) =>
       onPrompt({
         verificationUri: response.verificationUri,

@@ -103,7 +103,21 @@ export function formatToolChoiceInstruction(toolChoice: ToolChoice): string {
 export function getMessageContent(msg: Message): string {
   if (msg.content === null || msg.content === undefined) return "";
   if (typeof msg.content === "string") return msg.content;
-  return msg.content.map((p) => p.text || "").join("");
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .map((p: any) => {
+        if (typeof p === "string") return p;
+        if (p && typeof p === "object") return p.text ?? "";
+        return "";
+      })
+      .join("");
+  }
+  if (typeof msg.content === "object") {
+    const obj = msg.content as any;
+    if (typeof obj.text === "string") return obj.text;
+    try { return JSON.stringify(msg.content); } catch { return String(msg.content); }
+  }
+  return String(msg.content);
 }
 
 /** A short one-line description of what a tool call did, for labelling its result
