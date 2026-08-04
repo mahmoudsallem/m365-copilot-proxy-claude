@@ -1,11 +1,9 @@
-/**
- * Permissive CORS for every route, matching the old Hono `cors()` default.
- * `handleCors` returns true when it has fully handled a preflight (OPTIONS)
- * request, in which case we stop here; otherwise it appends the CORS headers
- * and the matched route runs as usual.
- */
+/** The local CLI client never sends a browser Origin. Reject browser-initiated
+ * requests so arbitrary pages cannot consume the user's M365 account through
+ * localhost. */
 export default defineEventHandler((event) => {
-  if (handleCors(event, { origin: "*", methods: "*", allowHeaders: "*" })) {
-    return;
+  if (getHeader(event, "origin")) {
+    throw createError({ statusCode: 403, statusMessage: "Browser origins are not allowed" });
   }
+  if (event.method === "OPTIONS") return sendNoContent(event, 204);
 });

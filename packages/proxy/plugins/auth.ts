@@ -6,6 +6,11 @@ import { getToken } from "@m365-copilot/core";
  * failure, so the server never comes up half-broken.
  */
 export default defineNitroPlugin(async () => {
+  if (process.env.M365_REQUIRE_API_KEY === "1" && !process.env.M365_PROXY_API_KEY) {
+    throw new Error(
+      "M365_PROXY_API_KEY is required. Run `pnpm setup:local` and start with `pnpm proxy:local`.",
+    );
+  }
   console.log("Authenticating...");
   try {
     await getToken();

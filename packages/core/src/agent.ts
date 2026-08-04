@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -82,18 +82,19 @@ async function getEnvironmentUrl(ppToken: string): Promise<string> {
 
   const data = await res.json();
   const envName: string = data.name; // e.g. "Default-fa7f56d8-49c4-4327-b816-9a0eeaa273df"
-  const envId = envName
-    .replace(/^Default-/i, "")
-    .replace(/-/g, "")
-    .toLowerCase();
+  const normalizedName = envName.replace(/-/g, "").toLowerCase();
+  const envId = normalizedName.replace(/^default/i, "");
 
-  // Microsoft constructs the subdomain as "default{envId}" but DNS resolution
-  // requires finding the correct label. Try the full ID first, fall back to
-  // progressively shorter versions if DNS doesn't resolve.
-  const base = `.df.environment.api.powerplatform.com`;
+  // Current environment API hosts split the normalized environment name before
+  // its final two characters:
+  //   Default-...-ac08 -> default...ac.08.environment.api.powerplatform.com
+  // Keep the older `.df` guesses as fallbacks for tenants that still expose
+  // legacy hostnames. The BAP response's PowerVirtualAgents runtime endpoint is
+  // a regional gateway and does not serve the Copilot Studio minimalBots route.
   const candidates = [
-    `https://default${envId}${base}`,
-    `https://default${envId.slice(0, -2)}${base}`, // some tenants truncate last 2 chars
+    `https://${normalizedName.slice(0, -2)}.${normalizedName.slice(-2)}.environment.api.powerplatform.com`,
+    `https://default${envId}.df.environment.api.powerplatform.com`,
+    `https://default${envId.slice(0, -2)}.df.environment.api.powerplatform.com`,
   ];
 
   for (const url of candidates) {
@@ -137,7 +138,14 @@ function loadCachedAgent(): CachedAgent | null {
 }
 
 function saveCachedAgent(data: CachedAgent): void {
-  writeFileSync(AGENT_CACHE_FILE, JSON.stringify(data, null, 2));
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(AGENT_CACHE_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
+  try {
+    chmodSync(CONFIG_DIR, 0o700);
+    chmodSync(AGENT_CACHE_FILE, 0o600);
+  } catch {
+    // Best effort on filesystems that do not support POSIX modes.
+  }
 }
 
 async function ppFetch(

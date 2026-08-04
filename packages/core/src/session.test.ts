@@ -78,7 +78,7 @@ describe("GraphicArt image frame parsing (§14)", () => {
             size: "Xlimage",
             orientation: "Landscape",
             pollUrl: "eyJQb2xsSWQiOiJ4In0=",
-            fileToken: "359965a5-6ca9-409d-a4ca-43b0cc9cdf81",
+            fileToken: "00000000-0000-4000-8000-000000000000",
             ImageReferenceUrls: ["https://designerapp.officeapps.live.com/designerapp/document.ashx?path=%2Fx%2FDallEGeneratedImages%2Fdalle-abc.png"],
             status: 2,
           },

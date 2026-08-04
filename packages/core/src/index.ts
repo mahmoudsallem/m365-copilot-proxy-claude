@@ -4,8 +4,13 @@ export {
   getTokenForScope,
   getImageArtifactToken,
   loginAutomated,
+  loginInteractive,
+  loginInteractiveForScopes,
+  loginDeviceCode,
+  loginDeviceCodeForScopes,
   loadSecrets,
   forceReauth,
+  type DeviceCodePrompt,
 } from "./auth.js";
 
 export {

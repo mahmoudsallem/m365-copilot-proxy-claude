@@ -1,5 +1,6 @@
 import * as msal from "@azure/msal-node";
 import {
+  chmodSync,
   readFileSync,
   writeFileSync,
   existsSync,
@@ -38,9 +39,27 @@ const log = createLogger("auth");
 
 const CONFIG_DIR = join(homedir(), ".config", "opencode-m365");
 
+function ensurePrivateDir(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(path, 0o700);
+  } catch {
+    // Best effort on filesystems that do not support POSIX modes.
+  }
+}
+
+function writePrivateFile(path: string, data: string): void {
+  writeFileSync(path, data, { mode: 0o600 });
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Best effort on filesystems that do not support POSIX modes.
+  }
+}
+
 function resolveFile(envVar: string, defaultName: string): string {
   if (process.env[envVar]) return process.env[envVar]!;
-  mkdirSync(CONFIG_DIR, { recursive: true });
+  ensurePrivateDir(CONFIG_DIR);
   return join(CONFIG_DIR, defaultName);
 }
 
@@ -59,7 +78,7 @@ function loadCache(app: msal.PublicClientApplication) {
 
 function saveCache(app: msal.PublicClientApplication) {
   try {
-    writeFileSync(CACHE_FILE, app.getTokenCache().serialize());
+    writePrivateFile(CACHE_FILE, app.getTokenCache().serialize());
   } catch {}
 }
 
@@ -117,6 +136,92 @@ interface Credentials {
   email: string;
   password: string;
   mfaSecret: string;
+}
+
+export interface DeviceCodePrompt {
+  verificationUri: string;
+  userCode: string;
+  expiresIn: number;
+  message: string;
+}
+
+const INTERACTIVE_LOGIN_TIMEOUT_MS = Number(
+  process.env.M365_INTERACTIVE_LOGIN_TIMEOUT_MS ?? 15 * 60 * 1000,
+);
+
+function interactiveLoginEnabled(): boolean {
+  return process.env.M365_INTERACTIVE_LOGIN === "1";
+}
+
+async function exchangeAuthCode(
+  app: msal.PublicClientApplication,
+  scopes: string[],
+  code: string,
+  verifier: string,
+): Promise<string> {
+  const result = await app.acquireTokenByCode({
+    code,
+    scopes,
+    redirectUri: REDIRECT_URI,
+    codeVerifier: verifier,
+  });
+  saveCache(app);
+  log.info(`Browser login succeeded as ${result.account?.username}`);
+  return result.accessToken;
+}
+
+/**
+ * Acquire a token in a visible browser. The user types their password and completes
+ * MFA directly on Microsoft's page; this process never receives or stores either.
+ * The resulting refresh/access tokens are persisted in the private MSAL cache.
+ */
+async function runInteractiveBrowserLogin(
+  app: msal.PublicClientApplication,
+  scopes: string[],
+): Promise<string | null> {
+  const { chromium } = await import("playwright");
+  const { authUrl, verifier } = await buildAuthUrlForScopes(app, scopes);
+  ensurePrivateDir(BROWSER_PROFILE_DIR);
+
+  const context = await chromium.launchPersistentContext(BROWSER_PROFILE_DIR, {
+    headless: false,
+    executablePath: resolveChromiumPath(),
+    args: ["--disable-dev-shm-usage"],
+    locale: "en-GB",
+    viewport: { width: 1280, height: 800 },
+  });
+  const page = context.pages()[0] ?? (await context.newPage());
+
+  let resolveCode!: (code: string) => void;
+  const codePromise = new Promise<string>((resolve) => {
+    resolveCode = resolve;
+  });
+  page.on("request", (req: any) => {
+    const url = req.url();
+    if (!url.includes("/oauth2/nativeclient") || !url.includes("code=")) return;
+    const code = new URL(url).searchParams.get("code");
+    if (code) resolveCode(code);
+  });
+
+  try {
+    log.info(`Waiting for interactive Microsoft login for [${scopes.join(", ")}]`);
+    await page.goto(authUrl, { waitUntil: "domcontentloaded" });
+    const code = await Promise.race([
+      codePromise,
+      new Promise<string>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Timed out waiting for interactive Microsoft login")),
+          INTERACTIVE_LOGIN_TIMEOUT_MS,
+        ),
+      ),
+    ]);
+    return await exchangeAuthCode(app, scopes, code, verifier);
+  } catch (err: any) {
+    log.error(`Interactive browser login failed: ${err.message}`);
+    return null;
+  } finally {
+    await context.close();
+  }
 }
 
 /**
@@ -372,15 +477,7 @@ async function runBrowserLogin(
       ]);
       void drive; // fire-and-forget; context.close() below tears down any pending step
 
-      const result = await app.acquireTokenByCode({
-        code: authCode,
-        scopes,
-        redirectUri: REDIRECT_URI,
-        codeVerifier: verifier,
-      });
-      saveCache(app);
-      log.info(`Browser login succeeded as ${result.account?.username}`);
-      return result.accessToken;
+      return await exchangeAuthCode(app, scopes, authCode, verifier);
     } catch (err: any) {
       await capture(page, `attempt-${attempt}-fail`);
       log.error(`Browser login attempt ${attempt}/${attempts} failed: ${err.message}`);
@@ -435,6 +532,52 @@ export async function loginAutomated(
   return token;
 }
 
+/** Start a visible Microsoft sign-in for the normal M365 Copilot chat scopes. */
+export async function loginInteractive(): Promise<string> {
+  const token = await runInteractiveBrowserLogin(getApp(), SCOPES);
+  if (!token) throw new Error("Interactive Microsoft login did not complete");
+  return token;
+}
+
+/** Start a visible Microsoft sign-in for one additional resource scope. */
+export async function loginInteractiveForScopes(scopes: string[]): Promise<string> {
+  const token = await runInteractiveBrowserLogin(getApp(), scopes);
+  if (!token) throw new Error(`Interactive Microsoft login did not complete for ${scopes.join(", ")}`);
+  return token;
+}
+
+/**
+ * Acquire a token through Microsoft's device-code flow. The callback is responsible
+ * for displaying the short-lived code; access and refresh tokens are never returned
+ * to the UI and are persisted only in the private MSAL cache.
+ */
+export async function loginDeviceCodeForScopes(
+  scopes: string[],
+  onPrompt: (prompt: DeviceCodePrompt) => void,
+): Promise<string> {
+  const app = getApp();
+  const result = await app.acquireTokenByDeviceCode({
+    scopes,
+    authority: "https://login.microsoftonline.com/organizations",
+    deviceCodeCallback: (response) =>
+      onPrompt({
+        verificationUri: response.verificationUri,
+        userCode: response.userCode,
+        expiresIn: response.expiresIn,
+        message: response.message,
+      }),
+  });
+  if (!result) throw new Error(`Microsoft device-code login did not complete for ${scopes.join(", ")}`);
+  saveCache(app);
+  log.info(`Device-code login succeeded as ${result.account?.username}`);
+  return result.accessToken;
+}
+
+/** Start device-code authentication for the normal M365 Copilot chat scopes. */
+export function loginDeviceCode(onPrompt: (prompt: DeviceCodePrompt) => void): Promise<string> {
+  return loginDeviceCodeForScopes(SCOPES, onPrompt);
+}
+
 // Ensure we hold a usable token. Retained as a MANUAL lever only — nothing auto-invokes
 // it anymore (see auth-recovery.ts: degradation is handled by backoff, not re-login).
 //
@@ -462,8 +605,12 @@ async function doForceReauth(): Promise<boolean> {
     }
     const secrets = loadSecrets();
     if (!secrets) {
-      log.error("forceReauth: silent refresh failed and no secrets file — cannot re-login");
-      return false;
+      if (!interactiveLoginEnabled()) {
+        log.error("forceReauth: silent refresh failed and no interactive or secrets login is enabled");
+        return false;
+      }
+      await loginInteractive();
+      return true;
     }
     log.info("forceReauth: silent unavailable, doing automated login");
     await loginAutomated(secrets.email, secrets.password, secrets.mfaSecret);
@@ -508,8 +655,9 @@ export async function getTokenForScope(scopes: string[]): Promise<string | null>
 
   // Silent unavailable — fall back to automated browser login with stored creds.
   const secrets = loadSecrets();
-  if (!secrets) return null;
-  return runBrowserLogin(app, scopes, secrets);
+  if (secrets) return runBrowserLogin(app, scopes, secrets);
+  if (interactiveLoginEnabled()) return runInteractiveBrowserLogin(app, scopes);
+  return null;
 }
 
 // Serialize token acquisition: concurrent callers share one in-flight login
@@ -531,8 +679,9 @@ async function doGetToken(): Promise<string> {
 
   const secrets = loadSecrets();
   if (!secrets) {
+    if (interactiveLoginEnabled()) return loginInteractive();
     throw new Error(
-      "No cached token and no secrets.json — cannot authenticate. Provide email/password/mfaSecret for automated login.",
+      "No cached token. Run `pnpm auth` for a private interactive Microsoft sign-in, or provide secrets.json only for an explicitly headless deployment.",
     );
   }
   // Automated (headless) login only. There is intentionally no interactive

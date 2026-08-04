@@ -77,6 +77,30 @@ function outputFinishReason(text: string): "stop" | "length" {
 type ChatBody = z.infer<typeof ChatCompletionRequest>;
 type ParsedMessage = ChatBody["messages"][number];
 
+/**
+ * Turn a first-turn false refusal into one harmless, real local action without
+ * spending another M365 message asking the model to reconsider.  The client
+ * executes this call, then sends its output back through the normal agent loop.
+ * Keep this deliberately read-only and only use the caller's actual `bash` tool.
+ */
+export function makeOrientationToolCall(body: ChatBody): ReturnType<typeof parseToolCalls>["toolCalls"][number] | null {
+  if (!Array.isArray(body.tools)) return null;
+  if (typeof body.tool_choice === "object" && body.tool_choice.function.name !== "bash") return null;
+
+  const bash = body.tools.find((tool) => tool.function.name === "bash");
+  const properties = bash?.function.parameters?.properties;
+  if (!bash || !properties || !("command" in properties)) return null;
+
+  return {
+    id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+    type: "function",
+    function: {
+      name: "bash",
+      arguments: JSON.stringify({ command: "pwd && ls -la" }),
+    },
+  };
+}
+
 // --- Per-conversation state ---
 
 interface ConversationState {
@@ -438,6 +462,20 @@ export async function handleChatCompletion(
       const confab = looksLikeConfabulation(parsed.textContent);
       const halluc = !everActed && looksLikeHallucinatedCompletion(parsed.textContent);
       if (!confab && !halluc) break;
+
+      // On a first-turn false refusal, do not spend another scarce M365 message
+      // merely telling the model that the filesystem exists. Return a safe local
+      // orientation call instead. Once its real output comes back, the next turn
+      // has concrete evidence and the model can continue the original task.
+      if (confab && !everActed) {
+        const orientationCall = makeOrientationToolCall(body);
+        if (orientationCall) {
+          log.info("First-turn confabulation detected — returning a read-only bash orientation call");
+          parsed = { hasToolCalls: true, toolCalls: [orientationCall], textContent: null };
+          break;
+        }
+      }
+
       log.info(`${confab ? "Confabulation" : "Hallucinated completion"} detected (no tool call) — forcing retry ${attempt + 1}/${maxConfabRetries}`);
       text = confab ? CONFAB_FORCE_PROMPT : HALLUCINATION_FORCE_PROMPT;
       const retry = await runBuffered();

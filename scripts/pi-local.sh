@@ -3,7 +3,7 @@
 # repo-local pi HOME (./.pi-local) so it never touches your real ~/.pi config,
 # sessions, or auth.
 #
-#   pnpm run pi                    # interactive, default model m365-copilot
+#   pnpm run pi                    # interactive, default model gpt-5.5-think-deeper
 #   PORT=24034 pnpm run pi         # point at a proxy on a different port
 #   MODEL=quick pnpm run pi        # different default model
 #   pnpm run pi -- -p "write hi"   # pass a prompt / extra pi flags through
@@ -12,17 +12,30 @@
 set -euo pipefail
 
 PORT="${PORT:-4141}"
-MODEL="${MODEL:-m365-copilot}"
+MODEL="${MODEL:-gpt-5.5-think-deeper}"
 BASE="http://localhost:${PORT}/v1"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PIHOME="$ROOT/.pi-local"
+PIHOME="${M365_PI_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/m365-copilot-proxy/pi-home}"
 
+if [[ -z "${M365_LOCAL_ENV:-}" ]]; then
+  bash "$ROOT/scripts/setup-local.sh" >/dev/null
+fi
+# shellcheck disable=SC1091
+source "${M365_LOCAL_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/m365-copilot-proxy/proxy.env}"
+: "${M365_PROXY_API_KEY:?Local proxy API key is missing}"
+export PATH="$ROOT/.runtime/node/node_modules/node/bin:$PATH"
+
+umask 077
 mkdir -p "$PIHOME/.pi/agent"
+chmod 700 "$PIHOME" "$PIHOME/.pi" "$PIHOME/.pi/agent"
 
 # Model list mirrors the proxy's MODEL_TONES (getAvailableModels) so Ctrl+P
 # cycling works. baseUrl points at the local proxy.
 cat > "$PIHOME/.pi/agent/models.json" <<EOF
-{"providers":{"m365":{"api":"openai-completions","apiKey":"m365","baseUrl":"$BASE","compat":{"supportsDeveloperRole":false,"supportsReasoningEffort":false,"supportsUsageInStreaming":false},"models":[
+{"providers":{"m365":{"api":"openai-completions","apiKey":"$M365_PROXY_API_KEY","baseUrl":"$BASE","compat":{"supportsDeveloperRole":false,"supportsReasoningEffort":false,"supportsUsageInStreaming":false},"models":[
+  {"id":"gpt-5.5-think-deeper","name":"GPT-5.5 Think Deeper (recommended)"},
+  {"id":"gpt-5.5","name":"GPT-5.5 Chat"},
+  {"id":"gpt-5.5-quick","name":"GPT-5.5 Quick"},
   {"id":"m365-copilot","name":"M365 Copilot (default / magic)"},
   {"id":"auto","name":"Auto (magic)"},
   {"id":"quick","name":"Quick"},
@@ -35,7 +48,8 @@ cat > "$PIHOME/.pi/agent/models.json" <<EOF
   {"id":"gpt-5.3-think-deeper","name":"GPT-5.3 Think Deeper"},
   {"id":"gpt-5.2","name":"GPT-5.2 Quick"},
   {"id":"gpt-5.2-quick","name":"GPT-5.2 Quick"},
-  {"id":"gpt-5.2-think-deeper","name":"GPT-5.2 Think Deeper"}
+  {"id":"gpt-5.2-think-deeper","name":"GPT-5.2 Think Deeper"},
+  {"id":"claude-sonnet","name":"Claude Sonnet (agent-less tools)"}
 ]}}}
 EOF
 
@@ -45,8 +59,8 @@ EOF
 
 # Warn (don't fail) if the proxy isn't reachable — pi can still start.
 if ! curl -s --max-time 3 "http://localhost:${PORT}/health" >/dev/null 2>&1; then
-  echo "[pi-local] ⚠ no proxy answering on :${PORT} — start it with 'pnpm run proxy' (or set PORT=...)"
+  echo "[pi-local] ⚠ no proxy answering on :${PORT} — start it with 'pnpm run proxy:local' (or set PORT=...)"
 fi
 
 echo "[pi-local] proxy=$BASE  model=$MODEL  home=$PIHOME"
-exec env HOME="$PIHOME" PI_OFFLINE=1 pi --provider m365 --model "$MODEL" "$@"
+exec env HOME="$PIHOME" PI_OFFLINE=1 "$ROOT/node_modules/.bin/pi" --provider m365 --model "$MODEL" "$@"

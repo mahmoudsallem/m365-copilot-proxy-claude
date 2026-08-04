@@ -264,6 +264,9 @@ That should be everything you need to get going quickly.`;
 
 describe("looksLikeConfabulation", () => {
   it("flags real M365 give-up confabulations", () => {
+    // Exact Pi response observed with a real bash tool available. Curly apostrophe
+    // included so a typography change cannot silently bypass recovery.
+    expect(looksLikeConfabulation("I can’t execute shell commands or inspect the filesystem from here, so I’m not able to list the files directly.")).toBe(true);
     expect(looksLikeConfabulation("I'm unable to access or list any files in the working directory (all shell commands are returning no output).")).toBe(true);
     expect(looksLikeConfabulation("I don't have access to your project files or the ability to run python3 check.py here.")).toBe(true);
     expect(looksLikeConfabulation("To move forward, please paste the contents of calc.py and check.py.")).toBe(true);

@@ -7,6 +7,10 @@ import { dirname, resolve } from "node:path";
 const port = process.argv[2] || process.env.PORT || "4141";
 process.env.PORT = String(port);
 process.env.NITRO_PORT = String(port);
+// This service has no reason to listen on a LAN interface. An explicit HOST or
+// NITRO_HOST can still override this for a deliberately isolated deployment.
+process.env.HOST ??= "127.0.0.1";
+process.env.NITRO_HOST ??= "127.0.0.1";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const entry = resolve(here, "../.output/server/index.mjs");

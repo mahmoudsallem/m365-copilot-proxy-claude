@@ -4,6 +4,17 @@ import { SessionPool, handleChatCompletion } from "./handler.js";
 
 export { SessionPool, handleChatCompletion } from "./handler.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
+export {
+  AnthropicMessagesRequest,
+  resolveM365Model,
+  toOpenAIChatRequest,
+  fromOpenAIChatResponse,
+  anthropicSse,
+  handleAnthropicMessages,
+  estimateAnthropicInputTokens,
+  type AnthropicBody,
+  type AnthropicMessageResponse,
+} from "./anthropic.js";
 
 // Re-export tool utilities from core
 export {

@@ -1,6 +1,15 @@
 # m365-copilot-proxy
 
-Use Microsoft 365 Copilot as an LLM backend for OpenAI-compatible coding agents like [pi](https://pi.dev/) and [OpenClaw](https://docs.openclaw.ai/). Wraps M365 Copilot's WebSocket/SignalR API in an OpenAI-compatible interface with tool calling support.
+Use an eligible Microsoft 365 work or university account as a local LLM backend for
+Claude Code, [pi](https://pi.dev/), [OpenClaw](https://docs.openclaw.ai/), and other
+OpenAI-compatible clients. The proxy translates M365 Copilot's WebSocket/SignalR
+protocol into OpenAI and Anthropic-compatible localhost APIs with agent tool support.
+
+> [!WARNING]
+> This is an independent, unofficial compatibility project built on an undocumented
+> Microsoft endpoint. It can stop working when Microsoft changes the service. Confirm
+> that your account and tenant policies allow this use. Keep the proxy on
+> `127.0.0.1`; never publish its port or bearer key.
 
 > **Want the gory protocol details?** See [docs/m365-copilot-api.md](docs/m365-copilot-api.md) — a full write-up of M365 Copilot's undocumented WebSocket API: auth, SignalR frames, tones/models, throttling, the "Disengaged" filter, and the Copilot Studio agent trick that makes tool calling work.
 
@@ -53,188 +62,174 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
 └── @m365-copilot/openclaw-plugin  — OpenClaw config generator + setup CLI + skill
 ```
 
-## Setup
+## One-click Linux setup
 
-### Prerequisites
+### Requirements
 
-- Node.js 24+
-- pnpm 10+
-- An M365 account with Copilot access
-- TOTP-based MFA, with the base32 secret in hand — the automated login types the
-  6-digit code itself, so it needs the seed, not an app on your phone. See
-  [Getting the TOTP secret](#getting-the-totp-secret) (and the note after it if your
-  tenant doesn't offer TOTP at all).
+- 64-bit Linux with Bash
+- `npm`, `curl`, and Git (Git is unnecessary when using a downloaded archive)
+- An eligible Microsoft 365 work or university account with Copilot Chat access
+- A Chromium-based browser for the recommended interactive sign-in
+- Claude Code, only if you want to use the Claude terminal interface
 
-### 1. Install
+The installer downloads a private Node.js 24 runtime into this repository's `.runtime/`
+directory. It does not replace the system Node.js and it installs locked dependency
+versions from `pnpm-lock.yaml`.
 
-```sh
-git clone https://github.com/cramt/m365-copilot-proxy
+### Fast path
+
+Clone the private repository or download and extract its archive, then run:
+
+```bash
+git clone https://github.com/Arkedia-develipment/m365-copilot-proxy.git
 cd m365-copilot-proxy
-pnpm install
-pnpm build
+
+./install.sh
+./login.sh
+./start-proxy.sh
+./connect-claude.sh
+claude
 ```
 
-### 2. Configure credentials
+If an extracted archive lost executable permissions, use `bash install.sh`,
+`bash login.sh`, and so on. Installation also adds the `m365-copilot` command under
+`~/.local/bin`.
 
-Create `~/.config/opencode-m365/secrets.json`:
+### Included executable files
 
-```json
-{
-  "email": "you@company.com",
-  "password": "your-password",
-  "mfaSecret": "YOUR_TOTP_BASE32_SECRET"
-}
+| File | Purpose |
+|---|---|
+| `install.sh` | Install the private runtime, locked dependencies, build, and command |
+| `login.sh` | Open the safe interactive Microsoft login |
+| `login-device-code.sh` | Try Microsoft's device-code login on another trusted device |
+| `start-proxy.sh` | Start the proxy in the background and verify its health |
+| `stop-proxy.sh` | Stop only the proxy process managed by this installation |
+| `proxy-status.sh` | Show proxy health, PID, configuration, log, and Claude mode |
+| `connect-claude.sh` | Make plain `claude` use M365; preserve the original executable |
+| `disconnect-claude.sh` | Restore normal Anthropic Claude exactly |
+| `doctor.sh` | Diagnose dependencies, login state, proxy health, and Claude mode |
+| `uninstall.sh` | Remove launchers while preserving login data by default |
+
+Every action is also available through one command:
+
+```bash
+m365-copilot help
+m365-copilot login
+m365-copilot start
+m365-copilot status
+m365-copilot models
+m365-copilot logs --follow
+m365-copilot connect-claude
+m365-copilot disconnect-claude
 ```
 
-`mfaSecret` is the **base32 seed** your authenticator app derives its 6-digit codes
-from — not a code itself. It looks like `JBSWY3DPEHPK3PXP`: 16–32 characters, `A`–`Z`
-and `2`–`7` only, no spaces.
+### Sign in safely
 
-#### Getting the TOTP secret
+`login.sh` opens a visible Microsoft browser. Enter the address, password, and MFA only
+on Microsoft's page. The proxy captures a short-lived OAuth authorization code and stores
+an MSAL refresh cache at `~/.config/opencode-m365/msal-cache.json`; it never requests or
+stores the password or MFA seed.
 
-**Already using a password manager for TOTP? Just read it back out.** 1Password,
-Bitwarden, KeePassXC, Aegis, Ente Auth and friends all keep the seed and will show it
-on demand — open the item's one-time-password field and reveal it. You'll get either a
-bare base32 string or an `otpauth://totp/...?secret=JBSWY3DPEHPK3PXP&...` URI; in the
-second case the `secret=` parameter is the bit you want. No re-enrollment needed.
+If interactive login is unavailable, `login-device-code.sh` prints Microsoft's URL and a
+short-lived code. Do not paste that code into chat or store it in a file. Error `53003`
+means the university's Conditional Access policy rejected that device, platform, or auth
+flow. The launcher cannot bypass it; use the interactive browser flow or ask the tenant
+administrator.
 
-**If the seed is trapped in Microsoft Authenticator, enroll a second method.** That app
-deliberately never exposes it, and Microsoft's security-info page won't re-display the
-key after enrollment either — between them that's the only case where the seed is
-genuinely unrecoverable. Enroll a fresh entry and copy it on the way past:
+### Start and manage the proxy
 
-1. Go to <https://aka.ms/mfasetup> (**My Account → Security info**).
-2. **Add sign-in method → Authenticator app**.
-3. Click **"I want to use a different authenticator app"**. This step is the one that
-   matters — the default path assumes Microsoft Authenticator and registers a
-   push-only method with no seed you can extract.
-4. At the QR-code screen, click **"Can't scan image?"**. It reveals a **Secret key** —
-   that's your base32 string.
-5. Generate a code from it to finish enrollment — `oathtool --totp -b <secret>`, or
-   paste the seed into your password manager — and enter that code.
+The proxy runs in the background on `http://127.0.0.1:4141`:
 
-Store it somewhere that will give it back (see above) so this is a one-time chore. The
-new entry sits alongside your existing sign-in methods; you don't have to remove
-Microsoft Authenticator.
-
-#### If your tenant has no TOTP option
-
-Plenty of tenants can't do the above, and then there is no seed to extract:
-
-- the authenticator-app / software-OATH method is disabled by tenant policy;
-- MFA is push / number-matching only, FIDO2, Windows Hello, or certificate-based;
-- sign-in is federated to a third-party IdP (Okta, Ping, Duo) that owns the MFA step.
-
-The stored-credentials flow above cannot work in those cases — the automated login has
-no code to type, and no amount of configuration fixes that. A user-driven fallback
-(visible browser, you complete MFA by hand once, tokens refresh silently afterwards) is
-tracked in [#4](https://github.com/cramt/m365-copilot-proxy/issues/4) and not shipped
-yet.
-
-#### First run
-
-On first run, the system does an automated browser login (via Playwright/Chromium) to get OAuth tokens. After that, tokens refresh silently from the MSAL cache.
-
-### 3. Use with pi (or any OpenAI-compatible agent)
-
-Start the proxy:
-
-```sh
-m365-proxy 4143        # or: pnpm run proxy 4143
+```bash
+m365-copilot start
+m365-copilot status
+m365-copilot models
+m365-copilot logs --follow
+m365-copilot stop
 ```
 
-Point [pi](https://pi.dev/) at it via `~/.pi/agent/models.json`:
+The manager records an exact PID and refuses to kill an unrelated process. Runtime files:
 
-```json
-{
-  "providers": {
-    "m365": {
-      "baseUrl": "http://localhost:4143/v1",
-      "api": "openai-completions",
-      "apiKey": "m365",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
-        "supportsUsageInStreaming": false
-      },
-      "models": [
-        { "id": "gpt-5.5-think-deeper", "name": "M365 Copilot (GPT-5.5, recommended)" },
-        { "id": "m365-copilot", "name": "M365 Copilot (Auto)" }
-      ]
-    }
-  }
-}
+- private API key: `~/.config/m365-copilot-proxy/proxy.env` (mode `0600`)
+- proxy PID and log: `~/.local/state/m365-copilot-proxy/`
+- Microsoft token cache: `~/.config/opencode-m365/msal-cache.json`
+
+The read-only model catalog can be opened at `http://127.0.0.1:4141/v1/models`.
+All model-consuming endpoints require the generated local bearer key.
+
+### Connect and disconnect Claude Code
+
+Connection is reversible. `connect-claude.sh` preserves the currently resolved Claude
+executable and installs a small wrapper at `~/.local/bin/claude`. It does not overwrite
+Claude's subscription credentials. It also installs `claude-direct`, which bypasses M365
+without disconnecting:
+
+```bash
+m365-copilot connect-claude
+m365-copilot start
+
+claude                         # M365-backed Claude Code interface
+MODEL=quick claude             # faster M365 model
+MODEL=gpt-5.5-think-deeper claude
+claude-direct                  # original Anthropic provider
+
+m365-copilot disconnect-claude # restore normal `claude`
 ```
 
-Then run pi (use `gpt-5.5-think-deeper` — the reliable tool-calling model — and keep the
-toolset lean; M365 "disengages" on very large tool payloads, see
-[docs/m365-copilot-api.md](docs/m365-copilot-api.md#the-disengaged-filter)):
+Claude's `/model` picker contains Anthropic product names rather than the M365 catalog.
+Unsupported choices are mapped to `gpt-5.5-think-deeper`; selecting “Opus” does not grant
+an Anthropic Opus model. Use `MODEL=<id> claude` for an explicit M365 model.
 
-```sh
-pi --models "gpt-5.5-think-deeper" -p --tools read,list,edit,write "your task"
+The wrapper intentionally exposes only `Bash`, `Read`, `Edit`, `Write`, `Glob`, and
+`Grep`. Larger tool schemas frequently trigger M365's content filter. Treat every command
+as untrusted: keep Claude permissions enabled, inspect diffs, and run tests before commits.
+
+### Other clients
+
+Pi in a selected bubblewrap workspace:
+
+```bash
+bash scripts/pi-sandbox.sh /absolute/path/to/project
 ```
 
-This is verified working end-to-end, including multi-tool calls and real file edits.
+OpenClaw:
 
-### 4. Use with OpenClaw
-
-```sh
-# Configure and start in one command
-m365-openclaw-setup --start
-
-# Or configure only, then start separately
+```bash
 m365-openclaw-setup
-m365-proxy 4141
 ```
 
-The proxy uses session reuse and delta messages — follow-up turns only send new messages, saving M365 quota. New conversations are detected automatically when the message array shrinks or the first user message changes.
+Any OpenAI-compatible client can use `http://127.0.0.1:4141/v1` with the bearer key in
+`~/.config/m365-copilot-proxy/proxy.env`. Anthropic Messages-compatible clients can use
+`http://127.0.0.1:4141/v1/messages`.
 
-### 5. Use as standalone proxy
+### Troubleshooting
 
-```sh
-npx m365-proxy 4141
-# or
-pnpm run dev
+Run `m365-copilot doctor` first. Common cases:
+
+- **`EADDRINUSE :4141`** — another proxy/process owns the port. Stop its terminal or run
+  the existing instance; the manager will not kill an unrecognized process.
+- **Connection error in Claude** — run `m365-copilot status`, then
+  `m365-copilot start`.
+- **Empty response / `Disengaged`** — do not retry rapidly. Large prompts, large tool
+  payloads, or account-level throttling can cause empty replies. Wait, then continue one
+  conversation rather than opening many new ones.
+- **`Both ANTHROPIC_AUTH_TOKEN and apiKeyHelper set`** — reconnect once with
+  `m365-copilot connect-claude`; it safely removes legacy localhost proxy fields while
+  backing up the prior Claude settings.
+- **Return to paid/normal Claude immediately** — run `claude-direct`, or permanently run
+  `m365-copilot disconnect-claude`.
+
+### Uninstall
+
+```bash
+./uninstall.sh
+./uninstall.sh --purge
 ```
 
-Then point any OpenAI-compatible client at `http://localhost:4141/v1`.
-
-### 6. Run on NixOS (systemd service)
-
-The proxy is a [Nitro](https://nitro.build/) service. The flake exposes a package
-(built from the workspace via [pnpm2nix](https://github.com/cramt/pnpm2nix)) and a NixOS
-module:
-
-```nix
-# flake.nix
-{
-  inputs.m365.url = "github:cramt/m365-copilot-proxy";
-
-  outputs = { nixpkgs, m365, ... }: {
-    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      modules = [
-        m365.nixosModules.default
-        {
-          services.m365-copilot-proxy = {
-            enable = true;
-            # JSON with { email, password, mfaSecret } — kept out of the Nix store,
-            # delivered via systemd LoadCredential. Manage with sops-nix/agenix.
-            secretsFile = "/run/secrets/m365-copilot.json";
-            # port = 4141;          # default
-            # host = "127.0.0.1";   # default — do not expose; unauthenticated, paid account
-            # openFirewall = false;
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-The service runs as a hardened `DynamicUser` unit. Auth state (`msal-cache.json`,
-`agent-id.json`) persists in `/var/lib/m365-copilot-proxy`; a fresh deploy self-bootstraps
-via headless login using `secretsFile` + the bundled Chromium. To run the package directly
-without NixOS: `nix run github:cramt/m365-copilot-proxy -- 4141`.
+The default removes the command wrappers and restores Claude while keeping configuration,
+logs, and Microsoft login state. `--purge` additionally removes this proxy's configuration
+and logs, but intentionally preserves the Microsoft token cache. The downloaded repository
+and `.runtime/` remain until you delete that exact folder yourself.
 
 ## Available models
 
@@ -314,8 +309,12 @@ next step — the core API it needs is already in place.
 The auth flow uses Azure MSAL with PKCE:
 
 1. **Silent refresh** — Uses cached tokens from `~/.config/opencode-m365/msal-cache.json`
-2. **Automated login** — Playwright-driven browser login using stored credentials + TOTP
-3. **Interactive login** — Opens browser for manual OAuth flow (fallback)
+2. **Interactive login** — Opens a visible browser; the user completes Microsoft's
+   sign-in and MFA directly, with no password or MFA secret stored by the proxy
+3. **Device-code login** — Displays a short-lived Microsoft device code for completion
+   on another trusted browser/device; useful for CLI and broker-oriented accounts
+4. **Legacy automated login** — Available only when an operator deliberately supplies
+   the older `secrets.json`; it is not used by the local launcher
 
 Three token scopes are acquired:
 - `substrate.office.com/sydney/*` — For M365 Copilot chat
@@ -332,12 +331,16 @@ Three token scopes are acquired:
 | `M365_DUMP_FRAMES` | Set to `1` to write every WebSocket frame (both directions) to `~/.config/opencode-m365/frames/<requestId>.ndjson`. For offline diffing of new M365 fields. |
 | `M365_ALLOW_MULTI_TOOL` | Allow the model to emit multiple tool calls per turn (default: only the first is kept) |
 | `M365_INJECT_REPLY_TOOL` | Set to `1` to inject a synthetic `reply(text)` tool. Forces every turn to be a tool call, including pure-prose answers. Cleaner contract for the model, +1 tool to the prompt (watch the Disengaged threshold). Confirmed 5/5 compliance on June 9 2026 ([hypotheses §1.1](docs/hypotheses.md)). |
-| `M365_NO_CONFAB_RETRY` / `M365_CONFAB_RETRIES` | M365's chat model sometimes produces prose instead of a tool call when it should act — either confabulating an inability ("I can't access the files, please paste them") **or** claiming a completion it never did ("I've replaced the README", with no tool call). By default the proxy detects both and re-prompts forcefully **in the same conversation** (`M365_CONFAB_RETRIES`, default `1`) to force a real action. Set `M365_NO_CONFAB_RETRY=1` to disable. |
+| `M365_NO_CONFAB_RETRY` / `M365_CONFAB_RETRIES` | M365's chat model sometimes produces prose instead of a tool call when it should act — either confabulating an inability ("I can't access the files, please paste them") **or** claiming a completion it never did ("I've replaced the README", with no tool call). On a first-turn refusal, the proxy now returns a safe read-only `bash` orientation call directly (when available), avoiding an extra M365 message; other detected cases are re-prompted forcefully **in the same conversation** (`M365_CONFAB_RETRIES`, default `1`). Set `M365_NO_CONFAB_RETRY=1` to disable recovery. |
 | `M365_NO_BACKOFF` (alias `M365_NO_AUTO_REAUTH`) | Set to `1` to disable degradation backoff. By default, when empty/throttled responses span several **distinct conversations** in a short window (the thread-rate-throttle signature, [F13](docs/hypotheses.md)), the proxy **paces subsequent turns** (a jittered delay before starting new backend conversations) to let the account self-heal. This replaced the old auto-reauth: a fresh login does **not** clear this throttle (it's `oid`-keyed — [§11 H-R1](docs/hypotheses.md)) and raised our detection profile. A single long pi thread never trips the trigger. |
 | `M365_BACKOFF_THRESHOLD` / `M365_BACKOFF_WINDOW_MS` / `M365_BACKOFF_BASE_MS` / `M365_BACKOFF_MAX_MS` | Tune backoff: distinct-conversation empties to trigger (default `3`), the window they must fall in (default `120000`), the initial pacing window (default `90000`), and its escalation cap (default `600000`). |
 | `M365_BROWSER_PROFILE` / `M365_LOGIN_UA` | Override the persistent browser-profile dir and the login User-Agent used for the (rare) automated interactive login. The persistent profile keeps AAD SSO/device cookies so repeat logins are silent and look like a familiar device ([§11 H-R3](docs/hypotheses.md)). |
 | `M365_CACHE_FILE` | Override MSAL token cache location |
 | `M365_SECRETS_FILE` | Override credentials file location |
+| `M365_INTERACTIVE_LOGIN` | Set to `1` to use visible browser sign-in when silent refresh is unavailable |
+| `M365_PROXY_API_KEY` | Bearer key required by `/v1/*`; generated by `scripts/setup-local.sh` |
+| `M365_REQUIRE_API_KEY` | Fail startup when the bearer key is absent; enabled by the local launcher |
+| `M365_LOCAL_ENV` | Override the private local environment file used by the launch scripts |
 | `CHROMIUM_PATH` | Path to Chromium binary for automated login |
 
 ### Usage / context-window % in responses
@@ -380,23 +383,27 @@ findings dump and [§2](docs/hypotheses.md) for what we tried and didn't find.
 
 ## Config files
 
-All stored in `~/.config/opencode-m365/`:
+Authentication state is stored in `~/.config/opencode-m365/`:
 
 | File | Description |
 |---|---|
-| `secrets.json` | Login credentials (email, password, mfaSecret) |
 | `msal-cache.json` | MSAL token cache (auto-managed) |
 | `agent-id.json` | Cached Copilot Studio agent ID |
 | `debug.log` | Debug log (when `M365_DEBUG=1`) |
 
+The local proxy key is stored separately at
+`~/.config/m365-copilot-proxy/proxy.env` (`0600`). Pi state is stored under
+`~/.local/state/m365-copilot-proxy/pi-home/`. Neither location contains the Microsoft
+password or an MFA seed.
+
 ## Development
 
 ```sh
-pnpm install
-pnpm build            # Build all packages
-pnpm run dev          # Start standalone proxy on :4141
-pnpm run test:unit    # Run vitest unit tests (no auth/network)
-pnpm run test:live    # Run live integration tests against M365
+bash scripts/local.sh install
+bash scripts/local.sh build            # Build all packages
+bash scripts/local.sh proxy:local       # Start localhost-only proxy on :4141
+bash scripts/local.sh test:unit         # Run vitest unit tests (no auth/network)
+bash scripts/local.sh test:live         # Run live integration tests against M365
 ```
 
 ## Known limitations

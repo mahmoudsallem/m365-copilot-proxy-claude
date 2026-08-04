@@ -2447,3 +2447,31 @@ sent on every agent-less turn, so any type the GUI can reach is reachable here.
 
 `session.ts` used to list `"GenerateContentQuery"` twice in `allowedMessageTypes`; the image-mode
 edit collapsed it to one.
+
+## 15. Aug 3 2026 — Claude Code Anthropic-Messages bridge 🟢
+
+### H15.1 — translating `/v1/messages` to the existing OpenAI handler makes Claude Code usable
+
+**Hypothesis.** Claude Code can reuse the working M365 chat/tool machinery if the proxy translates
+Anthropic Messages content blocks, tools, tool results, stop reasons, errors, and SSE events to/from
+its existing OpenAI Chat surface. This should need no Claude subscription because Claude Code is
+launched with `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`.
+
+**Prediction.** A tool-free Claude Code turn returns M365 text, and a lean six-tool session can run
+one read-only `Bash(pwd)` call and consume its `tool_result` in the same M365 conversation.
+
+**Implemented evidence.** `anthropic.ts` plus the two Nitro routes build successfully; 3/3 focused
+translation/SSE tests pass; authenticated `/v1/messages/count_tokens` returns 200; and a non-stream
+Messages request maps the current upstream failure to Anthropic-shaped HTTP 502. The launcher keeps
+the existing Claude login untouched and reads the proxy bearer only from the private local env file.
+
+**Live conclusion: CONFIRMED.** The initial two attempts coincided with an M365 upstream failure and
+also exposed a retry-amplification bug: Claude Code replayed empty 502 turns up to ten times. Empty /
+Disengaged responses are now mapped to a non-retryable `invalid_request_error`; the default moved to
+`gpt-5.5-think-deeper`; prompt caching is no longer needlessly disabled; and plain `claude` is a lean
+six-tool wrapper (the original binary remains available explicitly as `claude-direct`). After a fresh
+proxy/session, a tool-free turn returned `M365_READY` in 4.6s, one turn, reported cost `$0`. A real
+two-turn Bash loop then ran `sha256sum package.json | cut -d' ' -f1` and returned
+`2040d5b821f4066916e872ad390f502a9e4567869584b219f888b60e13babc3d`, exactly matching a direct
+shell calculation. This proves Claude Code request → Anthropic bridge → M365 model → tool call →
+Claude Code Bash execution → tool result → M365 final answer end to end.

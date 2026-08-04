@@ -19,6 +19,7 @@ scripts/output-ceiling-out/
 scripts/cancel-frame-out/
 scripts/send-cancel-out/
 .pi-local/
+.runtime/
 scripts/code-interp-out/
 scripts/tone-out/
 scripts/sentinel-hits.log

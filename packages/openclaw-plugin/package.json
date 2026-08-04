@@ -26,7 +26,7 @@
   "dependencies": {
     "@m365-copilot/core": "workspace:*",
     "@m365-copilot/proxy-lib": "workspace:*",
-    "srvx": "^0.8.0"
+    "srvx": "^0.12.5"
   },
   "publishConfig": {
     "access": "public"

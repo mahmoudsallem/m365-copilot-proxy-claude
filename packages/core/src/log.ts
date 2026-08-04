@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -28,8 +28,10 @@ function write(level: string, component: string, ...args: unknown[]) {
   const line = `[${timestamp()}] [${level}] [${component}] ${msg}\n`;
   if (stdoutEnabled) process.stdout.write(line);
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
-    appendFileSync(LOG_FILE, line);
+    mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
+    appendFileSync(LOG_FILE, line, { mode: 0o600 });
+    chmodSync(LOG_DIR, 0o700);
+    chmodSync(LOG_FILE, 0o600);
   } catch {
     // best effort
   }

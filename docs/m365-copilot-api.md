@@ -67,7 +67,22 @@ wss://substrate.office.com/m365Copilot/Chathub/{oid}@{tid}?{query}
 ### Flow: MSAL PKCE
 We use `@azure/msal-node` `PublicClientApplication` with PKCE. The token cache is persisted to `~/.config/opencode-m365/msal-cache.json` and refreshed silently when possible.
 
-> **The cache is disposable (tested June 2026, `scripts/token-regen-probe.mjs`).** Delete `msal-cache.json` and the next `getToken()` self-heals: silent fails → automated browser login (stored creds + TOTP) → a fresh, working token in **~12s**, no human in the loop. The regenerated token is **functionally identical** — same `aud`/`appid`/`tid`/`oid`/scopes, only `iat`/`exp`/`uti` change. Point auth at a throwaway cache with `M365_CACHE_FILE` to test this without touching the real one.
+The preferred local flow sets `M365_INTERACTIVE_LOGIN=1`: silent refresh is attempted
+first, then Playwright opens a visible persistent browser profile. The user types the
+password and completes MFA on Microsoft's page. The proxy observes only the transient
+authorization code from the `nativeclient` request and never receives or stores the
+password or MFA value. `pnpm auth` acquires chat, Power Platform, and BAP scopes this
+way. The older headless stored-credentials/TOTP path remains for explicitly configured
+service deployments but is not required by the local launcher.
+
+`pnpm auth:device` is the CLI fallback for accounts that cannot authenticate in the
+dedicated browser profile. It uses MSAL Node's `acquireTokenByDeviceCode()` against the
+`organizations` authority, displays the short-lived verification code only in the
+local terminal, and persists the resulting tokens in the same private cache. Separate
+resource scopes may require separate device-code interactions. Tenant Conditional
+Access can disable this flow.
+
+> **The cache is disposable (tested June 2026, `scripts/token-regen-probe.mjs`).** Delete `msal-cache.json` and the next interactive login produces a functionally identical token — same `aud`/`appid`/`tid`/`oid`/scopes, only `iat`/`exp`/`uti` change. Point auth at a throwaway cache with `M365_CACHE_FILE` to test this without touching the real one.
 >
 > **Re-auth does NOT clear account throttling** — the fresh token carries the same `oid`, so it lands in the same account-keyed throttle bucket. Throttling is identity-level, not token-level.
 >
@@ -478,7 +493,7 @@ Evidence (`scripts/dataverse-bot-probe.mjs`, with a `<org>.crm4.dynamics.com/.de
 
 | File | Responsibility |
 |---|---|
-| `packages/core/src/auth.ts` | MSAL PKCE, silent refresh, automated Playwright login, token-for-scope |
+| `packages/core/src/auth.ts` | MSAL PKCE/device-code, silent refresh, interactive/automated Playwright login, token-for-scope |
 | `packages/core/src/copilot.ts` | One-shot WS chat, `decodeJwt`, `MODEL_TONES`, `VARIANTS` |
 | `packages/core/src/session.ts` | Stateful `CopilotSession` (reconnect per turn, reuse ids), SignalR frame handling |
 | `packages/core/src/model.ts` | `ModelSession` — auth + agent + conversation continuity, string-in/stream-out |
