@@ -282,6 +282,7 @@ function buildExecutionPrompt(context: ExecutionContext): string {
     `Task: ${plan.objective}`,
     `Constraints:\n${plan.constraints.map((item) => `- ${item}`).join("\n") || "- none"}`,
     `Steps:\n${plan.steps.map((step) => `${step.id}. ${step.title}\n${step.instructions}\nAcceptance: ${step.acceptanceCriteria.join("; ")}`).join("\n\n")}`,
+    `Before stopping, run these immutable validation commands so the verification hooks can observe them. The external orchestrator will repeat them independently:\n${plan.validation.commands.map((item) => `- ${item.command}`).join("\n")}`,
     repair,
     `Turn budget: ${context.maxTurns}; message budget: ${context.maxMessages}.`,
   ].join("\n\n");
