@@ -21,7 +21,7 @@ export function makePlan(overrides: Partial<MyClaudePlan> = {}): MyClaudePlan {
       expectedFiles: [],
       acceptanceCriteria: ["The requested behavior works"],
     }],
-    validation: { commands: [{ command: "true", timeoutMs: 10_000 }] },
+    validation: { commands: [{ command: "pnpm test", timeoutMs: 10_000 }] },
     execution: {
       profile: "guarded",
       concurrency: 1,

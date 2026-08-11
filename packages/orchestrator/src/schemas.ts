@@ -195,6 +195,14 @@ export interface ExecutionEvidence {
     stderr: string;
     durationMs: number;
   }>;
+  validationPolicy?: Array<{
+    command: string;
+    allowed: boolean;
+    executable?: string;
+    args?: string[];
+    reasons: string[];
+    mode: "enforced";
+  }>;
   reviews: MyClaudeReview[];
   unresolvedRisks: string[];
   artifacts?: {

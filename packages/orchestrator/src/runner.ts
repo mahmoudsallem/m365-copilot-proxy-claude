@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { MyClaudePlan } from "./schemas.js";
 import { redactText } from "./schemas.js";
 import { errorMessage } from "./util.js";
+import { assertSafeValidationPlan } from "./validation-policy.js";
 
 export interface ProcessRequest {
   executable: string;
@@ -193,12 +194,14 @@ export class CommandExecutorAdapter implements ExecutorAdapter {
     });
     const combined = `${result.stdout}\n${result.stderr}`;
     const changed = await this.inspectGit(context.plan, context.signal);
+    const turns = extractCount(combined, "num_turns") || extractCount(combined, "turns");
+    const messages = extractCount(combined, "messages") || turns;
     return {
       exitCode: result.exitCode,
       stdout: limitedOutput(result.stdout),
       stderr: limitedOutput(result.stderr),
-      turns: extractCount(combined, "num_turns") || extractCount(combined, "turns"),
-      messages: extractCount(combined, "messages"),
+      turns,
+      messages,
       changedFiles: changed.files,
       diffLines: changed.lines,
       upstreamSignals: [
@@ -246,12 +249,14 @@ export class CommandValidatorAdapter implements ValidatorAdapter {
 
   async validate(plan: MyClaudePlan, signal: AbortSignal): Promise<ValidationResult[]> {
     const results: ValidationResult[] = [];
-    for (const validation of plan.validation.commands) {
+    const decisions = assertSafeValidationPlan(plan);
+    for (const [index, validation] of plan.validation.commands.entries()) {
       if (signal.aborted) throw new Error("validation cancelled");
+      const decision = decisions[index];
       try {
         const result = await this.runner.run({
-          executable: "/bin/sh",
-          args: ["-lc", validation.command],
+          executable: decision.executable!,
+          args: decision.args!,
           cwd: plan.workspace,
           env: process.env,
           timeoutMs: validation.timeoutMs,

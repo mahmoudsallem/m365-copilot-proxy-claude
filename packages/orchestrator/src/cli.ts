@@ -16,6 +16,7 @@ import { type MyClaudePlan, parsePlan, TERMINAL_TASK_STATES } from "./schemas.js
 import { TaskStore } from "./store.js";
 import { errorMessage, secureDirectory, secureWriteFile } from "./util.js";
 import { runAutomaticWorkflow, waitForExecution } from "./workflow.js";
+import { formatTaskProgress } from "./progress.js";
 
 const args = process.argv.slice(2);
 void main(args).catch((error) => {
@@ -122,6 +123,7 @@ async function taskCommand(command: string | undefined, argv: string[]): Promise
     const plannerName = (flag(argv, "--planner") ?? "none") as "claude" | "codex" | "none";
     if (!new Set(["claude", "codex", "none"]).has(plannerName)) throw new Error("--planner must be claude, codex, or none");
     const task = await client.createTask({ objective, workspace, title: flag(argv, "--title") });
+    process.stderr.write(formatTaskProgress(task.id, "created"));
     const seed = {
       taskId: task.id,
       title: task.title,
@@ -150,7 +152,9 @@ async function taskCommand(command: string | undefined, argv: string[]): Promise
       plan = (await planner.createPlan(seed)).artifact;
     }
     await client.submitPlan(plan);
+    process.stderr.write(formatTaskProgress(task.id, "plan-submitted"));
     await client.startTask(task.id);
+    process.stderr.write(formatTaskProgress(task.id, "queued"));
     const final = planner ? await runAutomaticWorkflow(client, plan, planner) : await waitForExecution(client, plan);
     process.stdout.write(`${JSON.stringify(final, null, 2)}\n`);
     return;

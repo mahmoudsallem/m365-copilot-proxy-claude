@@ -66,4 +66,49 @@ describe("daemon and SDK", () => {
     expect((await store.readEvents(task.id)).some((event) => event.type === "task.recovered")).toBe(true);
     await daemon.close();
   });
+
+  it("cancels and settles active execution before removing its socket", async () => {
+    const root = await mkdtemp(join(tmpdir(), "myclaude-shutdown-test-"));
+    roots.push(root);
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(join(workspace, "file.txt"), "initial\n");
+    const stateRoot = join(root, "state");
+    const socketPath = join(root, "shutdown.sock");
+    const store = new TaskStore(stateRoot);
+    let executions = 0;
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const blockingExecutor: ExecutorAdapter = {
+      async execute(context) {
+        executions += 1;
+        started();
+        await new Promise<void>((resolve) => {
+          if (context.signal.aborted) return resolve();
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return { exitCode: 1, stdout: "", stderr: "cancelled", turns: 1, messages: 1, changedFiles: [], diffLines: 0, upstreamSignals: [], sessionId: context.sessionId };
+      },
+    };
+    const scheduler = new TaskScheduler(store, blockingExecutor, validator);
+    const daemon = new OrchestratorDaemon({ socketPath, store, scheduler });
+    await daemon.start();
+    const client = new MyClaudeClient({ socketPath, requestTimeoutMs: 5_000 });
+    const task = await client.createTask({ objective: "Implement the requested test change", workspace });
+    const fingerprint = await (await import("./fingerprint.js")).computeWorkspaceFingerprint(workspace);
+    await client.submitPlan(makePlan({ taskId: task.id, workspace, baseFingerprint: fingerprint }));
+    await client.startTask(task.id);
+    await startedPromise;
+    await client.call("daemon_shutdown", {});
+    await daemon.waitClosed();
+    expect((await store.getTask(task.id)).state).toBe("cancelled");
+    expect(executions).toBe(1);
+
+    const secondScheduler = new TaskScheduler(store, blockingExecutor, validator);
+    const secondDaemon = new OrchestratorDaemon({ socketPath, store, scheduler: secondScheduler });
+    await secondDaemon.start();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(executions).toBe(1);
+    await secondDaemon.close();
+  });
 });

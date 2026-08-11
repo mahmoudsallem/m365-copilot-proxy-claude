@@ -171,7 +171,7 @@ function normalizePlan(raw: unknown, seed: PlanSeed, planner: MyClaudePlan["plan
 function planPrompt(seed: PlanSeed): string {
   return [
     "Inspect the repository read-only and produce a decision-complete implementation plan matching the supplied JSON schema.",
-    "Do not edit files. Do not include secrets. Validation commands must be deterministic commands appropriate to this repository; they are the only suggested commands the executor may run outside its own agent loop.",
+    "Do not edit files. Do not include secrets. Validation commands must be individual deterministic repo-local commands with no pipes, redirections, chaining, quoting, subshells, network, or output-path flags. Allowed families are pnpm/npm/yarn/bun test|lint|build|typecheck scripts; npx --no-install vitest|jest|eslint|tsc; cargo test|check|clippy; go test; pytest; and dotnet test.",
     `Objective: ${seed.objective}`,
     `Workspace: ${seed.workspace}`,
     `Risk: ${seed.risk ?? "medium"}`,

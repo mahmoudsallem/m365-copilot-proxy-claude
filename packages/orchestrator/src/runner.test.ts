@@ -18,7 +18,7 @@ describe("process adapters", () => {
     const launch = requests.find((request) => request.executable === "/proxy-claude")!;
     expect(launch.args).toContain("--resume");
     expect(launch.args).toContain("d7424f0b-0000-4000-8000-000000000001");
-    expect(launch.stdin).toContain("- true");
+    expect(launch.stdin).toContain("- pnpm test");
     expect(launch.stdin).toContain("external orchestrator will repeat them independently");
     expect(launch.env).toMatchObject({
       MYCLAUDE_RUN_DIR: "/private/run",
@@ -57,5 +57,18 @@ describe("process adapters", () => {
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
+  });
+
+  it("uses num_turns as the message count when Claude omits messages", async () => {
+    const runner: ProcessRunner = { async run(request) {
+      if (request.executable === "git") return { exitCode: 0, stdout: "", stderr: "", durationMs: 1 };
+      return { exitCode: 0, stdout: '{"num_turns":7}', stderr: "", durationMs: 1 };
+    } };
+    const result = await new CommandExecutorAdapter({ executable: "/proxy-claude", runner }).execute({
+      plan: makePlan(), phase: "initial", repairInstructions: [], signal: new AbortController().signal,
+      maxTurns: 40, maxMessages: 80, runDirectory: "/tmp/run",
+    });
+    expect(result.turns).toBe(7);
+    expect(result.messages).toBe(7);
   });
 });

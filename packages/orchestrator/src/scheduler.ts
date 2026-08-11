@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import type { ExecutionEvidence, MyClaudeReview, TaskEvent, TaskRecord } from "./schemas.js";
+import type { ExecutionEvidence, MyClaudePlan, MyClaudeReview, TaskRecord } from "./schemas.js";
 import { TERMINAL_TASK_STATES } from "./schemas.js";
 import type { ExecutorAdapter, ValidatorAdapter } from "./runner.js";
 import { errorMessage } from "./util.js";
 import { TaskStore } from "./store.js";
 import { computeWorkspaceFingerprint } from "./fingerprint.js";
+import { assertSafeValidationPlan, evaluatePlanValidation } from "./validation-policy.js";
 
 export interface SchedulerOptions {
   concurrency?: number;
@@ -20,16 +21,18 @@ export class TaskScheduler extends EventEmitter {
   private effectiveConcurrency: number;
   private paused = false;
   private degraded = false;
+  private readonly executionProfile: "guarded" | "host-unrestricted";
 
   constructor(
     readonly store: TaskStore,
     private readonly executor: ExecutorAdapter,
     private readonly validator: ValidatorAdapter,
-    private readonly options: SchedulerOptions = {},
+    options: SchedulerOptions = {},
   ) {
     super();
     this.configuredConcurrency = clampConcurrency(options.concurrency ?? 1);
     this.effectiveConcurrency = this.configuredConcurrency;
+    this.executionProfile = options.executionProfile ?? "guarded";
   }
 
   status() {
@@ -40,6 +43,7 @@ export class TaskScheduler extends EventEmitter {
       configuredConcurrency: this.configuredConcurrency,
       effectiveConcurrency: this.effectiveConcurrency,
       degraded: this.degraded,
+      executionProfile: this.executionProfile,
     };
   }
 
@@ -58,9 +62,12 @@ export class TaskScheduler extends EventEmitter {
     const current = await this.store.getTask(taskId);
     if (!current.planSha256) throw new Error("task has no immutable plan");
     const plan = await this.store.getPlan(taskId);
-    if (this.options.executionProfile && plan.execution.profile !== this.options.executionProfile) {
-      throw new Error(`plan execution profile ${plan.execution.profile} is not allowed by daemon policy ${this.options.executionProfile}`);
+    if (plan.execution.profile !== this.executionProfile) {
+      throw new Error(`plan execution profile ${plan.execution.profile} is not allowed by daemon policy ${this.executionProfile}`);
     }
+    const validationPolicy = evaluatePlanValidation(plan);
+    await this.store.appendEvent(taskId, "validation.policy", { profile: this.executionProfile, decisions: validationPolicy });
+    assertSafeValidationPlan(plan);
     const priorEvents = await this.store.readEvents(taskId);
     if (!priorEvents.some((event) => event.type === "execution.started")) {
       const currentFingerprint = await computeWorkspaceFingerprint(plan.workspace);
@@ -111,10 +118,36 @@ export class TaskScheduler extends EventEmitter {
     }
   }
 
+  async shutdown(timeoutMs = 10_000): Promise<void> {
+    this.pause();
+    const taskIds = [...new Set([...this.queue, ...this.active.keys()])];
+    await Promise.all(taskIds.map((taskId) => this.cancel(taskId)));
+    const deadline = Date.now() + timeoutMs;
+    while (this.active.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (this.active.size > 0) {
+      throw new Error(`scheduler shutdown timed out with active tasks: ${[...this.active.keys()].join(", ")}`);
+    }
+  }
+
   async applyReview(taskId: string, review: MyClaudeReview): Promise<TaskRecord> {
-    await this.store.addReview(taskId, review);
     const current = await this.store.getTask(taskId);
     const plan = await this.store.getPlan(taskId);
+    if (!["reviewing", "partial", "failed"].includes(current.state)) {
+      throw new Error(`reviews are not accepted while task is ${current.state}`);
+    }
+    if (review.verdict === "approve") {
+      if (current.state !== "reviewing") {
+        throw new Error(`approval rejected: task is ${current.state}, not reviewing`);
+      }
+      const evidence = await this.store.getEvidence(taskId);
+      if (evidence.state !== "reviewing" || !hasCompleteSuccessfulEvidence(plan, evidence)) {
+        throw new Error("approval rejected: current execution and every declared validation command must have fresh successful evidence");
+      }
+    }
+    await this.store.addReview(taskId, review);
+    const reviewed = await this.store.getTask(taskId);
     if (review.verdict === "approve") {
       await this.setEvidenceState(taskId, "passed");
       return this.store.transition(taskId, "passed", { lastError: undefined });
@@ -123,12 +156,12 @@ export class TaskScheduler extends EventEmitter {
       await this.setEvidenceState(taskId, "blocked", review.summary);
       return this.store.transition(taskId, "blocked", { lastError: review.summary });
     }
-    if (current.repairCycles >= plan.execution.budgets.reviewCycles) {
+    if (reviewed.repairCycles >= plan.execution.budgets.reviewCycles) {
       await this.setEvidenceState(taskId, "blocked", "review repair-cycle budget exhausted");
       return this.store.transition(taskId, "blocked", { lastError: "review repair-cycle budget exhausted" });
     }
     await this.store.appendEvent(taskId, "repair.requested", { instructions: review.repairInstructions, source: "review" });
-    await this.store.patchTask(taskId, { repairCycles: current.repairCycles + 1 });
+    await this.store.patchTask(taskId, { repairCycles: reviewed.repairCycles + 1 });
     await this.store.transition(taskId, "repairing");
     return this.enqueue(taskId);
   }
@@ -185,12 +218,18 @@ export class TaskScheduler extends EventEmitter {
       }
       await this.store.transition(taskId, "executing");
       if (phase === "repair") await this.store.transition(taskId, "repairing");
+      const previousEvidence = await this.store.getEvidence(taskId);
       const evidence: ExecutionEvidence = {
-        ...(await this.store.getEvidence(taskId)),
+        taskId,
         state: phase === "repair" ? "repairing" : "executing",
         startedAt: new Date().toISOString(),
+        validation: [],
+        validationPolicy: evaluatePlanValidation(plan),
+        reviews: previousEvidence.reviews,
+        unresolvedRisks: [],
+        artifacts: previousEvidence.artifacts,
       };
-      const executorSessionId = evidence.executor?.sessionId ?? evidence.executorSessionId ?? randomUUID();
+      const executorSessionId = previousEvidence.executor?.sessionId ?? previousEvidence.executorSessionId ?? randomUUID();
       evidence.executorSessionId = executorSessionId;
       await this.store.setEvidence(taskId, evidence);
       await this.store.appendEvent(taskId, "execution.started", { phase, sessionId: executorSessionId, resumed: resumingInterruptedExecution });
@@ -225,7 +264,7 @@ export class TaskScheduler extends EventEmitter {
       await this.store.transition(taskId, "validating");
       const validation = await this.validator.validate(plan, controller.signal);
       await this.store.writeVerification(taskId, validation);
-      const updatedEvidence: ExecutionEvidence = { ...evidence, state: "validating", executor: result, validation };
+      const updatedEvidence: ExecutionEvidence = { ...evidence, state: "validating", executor: result, validation, validationPolicy: evaluatePlanValidation(plan) };
       await this.store.setEvidence(taskId, updatedEvidence);
       const validationFailed = validation.some((check) => check.exitCode !== 0);
       const expectedFiles = plan.steps.flatMap((step) => step.expectedFiles);
@@ -289,5 +328,14 @@ function isExpectedFile(changedFile: string, expectedFiles: string[]): boolean {
   return expectedFiles.some((expected) => {
     const candidate = expected.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
     return normalized === candidate || normalized.startsWith(`${candidate}/`);
+  });
+}
+
+function hasCompleteSuccessfulEvidence(plan: MyClaudePlan, evidence: ExecutionEvidence): boolean {
+  if (evidence.executor?.exitCode !== 0) return false;
+  if (evidence.validation.length !== plan.validation.commands.length) return false;
+  return plan.validation.commands.every((declared, index) => {
+    const actual = evidence.validation[index];
+    return actual?.command === declared.command && actual.exitCode === 0;
   });
 }

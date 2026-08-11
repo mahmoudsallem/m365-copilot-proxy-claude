@@ -54,12 +54,18 @@ export class OrchestratorDaemon {
   async close(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
-    await new Promise<void>((resolve) => {
-      if (!this.server) return resolve();
-      this.server.close(() => resolve());
-    });
-    await rm(this.options.socketPath, { force: true });
-    this.resolveClosed();
+    try {
+      await this.options.scheduler.shutdown();
+      await new Promise<void>((resolve) => {
+        if (!this.server) return resolve();
+        this.server.close(() => resolve());
+      });
+      await rm(this.options.socketPath, { force: true });
+      this.resolveClosed();
+    } catch (error) {
+      this.shuttingDown = false;
+      throw error;
+    }
   }
 
   waitClosed(): Promise<void> { return this.closedPromise; }
@@ -111,7 +117,8 @@ export class OrchestratorDaemon {
         this.options.scheduler.resume();
         return { paused: false };
       case "daemon_shutdown":
-        setTimeout(() => void this.close(), 10).unref();
+        await this.options.scheduler.shutdown();
+        setTimeout(() => void this.close().catch(() => {}), 10).unref();
         return { shuttingDown: true };
       default:
         throw Object.assign(new Error(`unknown RPC method: ${method}`), { rpcCode: -32601 });

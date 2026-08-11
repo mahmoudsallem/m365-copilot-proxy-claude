@@ -50,3 +50,10 @@ export { computeWorkspaceFingerprint } from "./fingerprint.js";
 export { fetchModels, runDoctor, type ModelEntry, type DoctorCheck } from "./diagnostics.js";
 export { MCP_TOOLS, dispatchMcpRequest } from "./mcp-server.js";
 export { runAutomaticWorkflow, waitForExecution } from "./workflow.js";
+export {
+  evaluateValidationCommand,
+  evaluatePlanValidation,
+  assertSafeValidationPlan,
+  type ValidationPolicyDecision,
+} from "./validation-policy.js";
+export { formatTaskProgress, type TaskProgressStage } from "./progress.js";
