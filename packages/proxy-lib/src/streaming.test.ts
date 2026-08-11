@@ -200,7 +200,14 @@ describe("incremental streaming (non-tool path)", () => {
         model: "quick",
         messages: [{ role: "user", content: "Bearer private-prompt-secret" }],
       });
-      expect((await handleChatCompletion(success, new SessionPool(), { sessionId })).status).toBe(200);
+      const successResponse = await handleChatCompletion(success, new SessionPool(), {
+        sessionId,
+        requestedModel: "claude-m365--quick",
+      });
+      expect(successResponse.status).toBe(200);
+      const successPayload = await successResponse.json() as any;
+      expect(successPayload.usage.x_m365_requested_model).toBe("claude-m365--quick");
+      expect(successPayload.usage.x_m365_resolved_model).toBe("quick");
 
       scripted.error = new Error("https://upstream.example/?token=private-response-secret");
       const failure = ChatCompletionRequest.parse({
@@ -225,7 +232,7 @@ describe("incremental streaming (non-tool path)", () => {
       const records = text.trim().split("\n").map((line) => JSON.parse(line));
       expect(records).toHaveLength(3);
       expect(records[0]).toMatchObject({
-        requested_model: "quick",
+        requested_model: "claude-m365--quick",
         resolved_model: "quick",
         tone: "Gpt_Quick",
         route: "agentless",

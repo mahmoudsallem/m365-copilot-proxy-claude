@@ -99,14 +99,14 @@ interface RequestTelemetryContext {
   terminalRecorded: boolean;
 }
 
-function requestTelemetryContext(body: ChatBody): RequestTelemetryContext {
+function requestTelemetryContext(body: ChatBody, requestedModel = body.model): RequestTelemetryContext {
   const capability = resolveModelCapability(body.model);
   const hasTools = !!body.tools?.length && body.tool_choice !== "none";
   const useToolAgent = hasTools && (
     process.env.M365_FORCE_AGENT === "1" || capability.route.tools === "declarative-agent"
   );
   return {
-    requestedModel: body.model,
+    requestedModel,
     resolvedModel: capability.id,
     tone: capability.tone,
     route: useToolAgent ? "declarative-agent" : "agentless",
@@ -496,9 +496,9 @@ export function enforceSingleToolCall<T extends { function: { name: string } }>(
 export async function handleChatCompletion(
   body: ChatBody,
   pool: SessionPool,
-  opts: { signal?: AbortSignal; sessionId?: string } = {},
+  opts: { signal?: AbortSignal; sessionId?: string; requestedModel?: string } = {},
 ): Promise<Response> {
-  const telemetry = requestTelemetryContext(body);
+  const telemetry = requestTelemetryContext(body, opts.requestedModel);
   let lease: SessionLease;
   try {
     lease = await pool.acquire(body.messages, opts.sessionId, `openai:${body.model}`);
@@ -905,7 +905,7 @@ async function handleChatCompletionLocked(
     lastTurnCount,
     lastSourceAttributions,
     {
-      requestedModel: model,
+      requestedModel: telemetry.requestedModel,
       resolvedModel: capability.id,
       tone,
       agentRoute: useToolAgent ? "declarative-agent" : "agentless",

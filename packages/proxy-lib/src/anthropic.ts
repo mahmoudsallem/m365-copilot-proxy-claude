@@ -420,7 +420,11 @@ async function produceAnthropic(
   sessionId?: string,
 ): Promise<AnthropicMessageResponse | Response> {
   const openai = toOpenAIChatRequest(body);
-  const upstream = await handleChatCompletion(openai, pool, { signal, sessionId });
+  const upstream = await handleChatCompletion(openai, pool, {
+    signal,
+    sessionId,
+    requestedModel: body.model,
+  });
   if (!upstream.ok) {
     let message = `M365 upstream returned HTTP ${upstream.status}`;
     let upstreamType = "upstream_error";
