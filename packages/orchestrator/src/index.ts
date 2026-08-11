@@ -49,4 +49,4 @@ export { IntegrationManager, type IntegrationTarget, type IntegrationStatus } fr
 export { computeWorkspaceFingerprint } from "./fingerprint.js";
 export { fetchModels, runDoctor, type ModelEntry, type DoctorCheck } from "./diagnostics.js";
 export { MCP_TOOLS, dispatchMcpRequest } from "./mcp-server.js";
-export { runAutomaticWorkflow } from "./workflow.js";
+export { runAutomaticWorkflow, waitForExecution } from "./workflow.js";

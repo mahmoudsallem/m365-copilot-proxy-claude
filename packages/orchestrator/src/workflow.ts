@@ -5,6 +5,23 @@ import type { PlannerAdapter } from "./planners.js";
 
 type WorkflowClient = Pick<MyClaudeClient, "waitTask" | "getEvidence" | "submitReview" | "cancelTask">;
 
+/** Wait for executor settlement without invoking a paid reviewer. */
+export async function waitForExecution(
+  client: Pick<MyClaudeClient, "waitTask" | "getEvidence" | "cancelTask">,
+  plan: MyClaudePlan,
+  options: { deadlineMs?: number; waitSliceMs?: number } = {},
+) {
+  const deadline = Date.now() + (options.deadlineMs ?? (plan.execution.budgets.timeoutMinutes + 5) * 60_000);
+  while (Date.now() < deadline) {
+    const task = await client.waitTask(plan.taskId, options.waitSliceMs ?? 300_000);
+    if (TERMINAL_TASK_STATES.has(task.state) || task.state === "reviewing") {
+      return { task, evidence: await client.getEvidence(plan.taskId) };
+    }
+  }
+  await client.cancelTask(plan.taskId);
+  throw new Error("executor wait exceeded its deadline");
+}
+
 /** Drive the bounded plan -> execute -> review -> repair loop using one planner session. */
 export async function runAutomaticWorkflow(
   client: WorkflowClient,

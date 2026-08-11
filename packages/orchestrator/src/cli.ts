@@ -15,7 +15,7 @@ import { TaskScheduler } from "./scheduler.js";
 import { type MyClaudePlan, parsePlan, TERMINAL_TASK_STATES } from "./schemas.js";
 import { TaskStore } from "./store.js";
 import { errorMessage, secureDirectory, secureWriteFile } from "./util.js";
-import { runAutomaticWorkflow } from "./workflow.js";
+import { runAutomaticWorkflow, waitForExecution } from "./workflow.js";
 
 const args = process.argv.slice(2);
 void main(args).catch((error) => {
@@ -151,7 +151,7 @@ async function taskCommand(command: string | undefined, argv: string[]): Promise
     }
     await client.submitPlan(plan);
     await client.startTask(task.id);
-    const final = planner ? await runAutomaticWorkflow(client, plan, planner) : { task: await client.getTask(task.id), evidence: await client.getEvidence(task.id) };
+    const final = planner ? await runAutomaticWorkflow(client, plan, planner) : await waitForExecution(client, plan);
     process.stdout.write(`${JSON.stringify(final, null, 2)}\n`);
     return;
   }

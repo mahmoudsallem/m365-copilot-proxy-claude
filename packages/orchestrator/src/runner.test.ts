@@ -32,4 +32,23 @@ describe("process adapters", () => {
     const result = await new NodeProcessRunner().run({ executable: "/bin/true", args: [], cwd: "/tmp", stdin: "a large prompt".repeat(1000), timeoutMs: 5_000 });
     expect(result.exitCode).toBe(0);
   });
+
+  it("includes untracked files and their lines in change evidence", async () => {
+    const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const workspace = await mkdtemp(join(tmpdir(), "myclaude-runner-test-"));
+    try {
+      await new NodeProcessRunner().run({ executable: "git", args: ["init", "-q"], cwd: workspace, timeoutMs: 5_000 });
+      await writeFile(join(workspace, "new.ts"), "one\ntwo\n");
+      const result = await new CommandExecutorAdapter({ executable: "/bin/true", runner: new NodeProcessRunner(), supportsSessionResume: false }).execute({
+        plan: makePlan({ workspace }), phase: "initial", repairInstructions: [], signal: new AbortController().signal,
+        maxTurns: 40, maxMessages: 80, runDirectory: workspace,
+      });
+      expect(result.changedFiles).toContain("new.ts");
+      expect(result.diffLines).toBeGreaterThanOrEqual(2);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 });

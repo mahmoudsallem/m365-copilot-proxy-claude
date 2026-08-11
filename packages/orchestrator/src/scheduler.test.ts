@@ -17,14 +17,20 @@ class FakeExecutor implements ExecutorAdapter {
   active = 0;
   maximum = 0;
   sessions: Array<string | undefined> = [];
-  constructor(private readonly delay = 0, private readonly signals: ExecutionResult["upstreamSignals"] = []) {}
+  instructions: string[][] = [];
+  constructor(
+    private readonly delay = 0,
+    private readonly signals: ExecutionResult["upstreamSignals"] = [],
+    private readonly changedFiles = ["x.ts"],
+  ) {}
   async execute(context: ExecutionContext): Promise<ExecutionResult> {
     this.active += 1;
     this.maximum = Math.max(this.maximum, this.active);
     this.sessions.push(context.sessionId);
+    this.instructions.push(context.repairInstructions);
     if (this.delay) await new Promise((resolve) => setTimeout(resolve, this.delay));
     this.active -= 1;
-    return { exitCode: 0, stdout: "done", stderr: "", turns: 2, messages: 3, changedFiles: ["x.ts"], diffLines: 10, upstreamSignals: this.signals, sessionId: context.sessionId ?? "executor-session" };
+    return { exitCode: 0, stdout: "done", stderr: "", turns: 2, messages: 3, changedFiles: this.changedFiles, diffLines: 10, upstreamSignals: this.signals, sessionId: context.sessionId ?? "executor-session" };
   }
 }
 
@@ -112,6 +118,24 @@ describe("TaskScheduler", () => {
     await wait;
     expect(executor.sessions[0]).toMatch(/^[0-9a-f-]{36}$/);
     expect(executor.sessions[1]).toBe(executor.sessions[0]);
+    expect(executor.instructions[1]).toContain("fix issue");
     expect((await store.getTask(task.id)).state).toBe("reviewing");
+  });
+
+  it("treats changes outside nonempty expectedFiles as an adaptive-review deviation", async () => {
+    const { store, workspace, fingerprint } = await fixture();
+    const executor = new FakeExecutor(0, [], ["unexpected.ts"]);
+    const scheduler = new TaskScheduler(store, executor, validator);
+    const base = makePlan();
+    const task = await plannedTask(store, workspace, fingerprint, {
+      review: { policy: "adaptive" },
+      risk: "low",
+      steps: [{ ...base.steps[0], expectedFiles: ["x.ts"] }],
+    });
+    const wait = settled(scheduler, task.id);
+    await scheduler.enqueue(task.id);
+    await wait;
+    expect((await store.getTask(task.id)).state).toBe("reviewing");
+    expect((await store.getEvidence(task.id)).unresolvedRisks).toContain("changed files outside plan expectedFiles");
   });
 });

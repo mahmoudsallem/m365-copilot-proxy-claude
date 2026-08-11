@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { MyClaudePlan } from "./schemas.js";
 import { redactText } from "./schemas.js";
 import { errorMessage } from "./util.js";
@@ -210,15 +212,32 @@ export class CommandExecutorAdapter implements ExecutorAdapter {
     try {
       const names = await this.runner.run({ executable: "git", args: ["diff", "--name-only", "--"], cwd: plan.workspace, timeoutMs: 30_000, signal });
       const stats = await this.runner.run({ executable: "git", args: ["diff", "--numstat", "--"], cwd: plan.workspace, timeoutMs: 30_000, signal });
-      const lines = stats.stdout.split("\n").filter(Boolean).reduce((total, line) => {
+      const untracked = await this.runner.run({ executable: "git", args: ["ls-files", "--others", "--exclude-standard", "-z"], cwd: plan.workspace, timeoutMs: 30_000, signal });
+      const untrackedFiles = untracked.stdout.split("\0").map((item) => item.trim()).filter(Boolean);
+      let lines = stats.stdout.split("\n").filter(Boolean).reduce((total, line) => {
         const [added, removed] = line.split("\t");
         return total + (Number(added) || 0) + (Number(removed) || 0);
       }, 0);
-      return { files: names.stdout.split("\n").map((item) => item.trim()).filter(Boolean), lines };
+      for (const file of untrackedFiles) {
+        try {
+          const content = await readFile(join(plan.workspace, file));
+          lines += content.includes(0) ? 1 : countTextLines(content.toString("utf8"));
+        } catch {
+          // A concurrently removed untracked file remains listed as changed but contributes no lines.
+        }
+      }
+      const trackedFiles = names.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
+      return { files: [...new Set([...trackedFiles, ...untrackedFiles])], lines };
     } catch {
       return { files: [], lines: 0 };
     }
   }
+}
+
+function countTextLines(value: string): number {
+  if (!value) return 0;
+  const newlines = value.match(/\n/g)?.length ?? 0;
+  return newlines + (value.endsWith("\n") ? 0 : 1);
 }
 
 export class CommandValidatorAdapter implements ValidatorAdapter {

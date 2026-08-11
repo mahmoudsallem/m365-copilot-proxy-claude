@@ -127,6 +127,7 @@ export class TaskScheduler extends EventEmitter {
       await this.setEvidenceState(taskId, "blocked", "review repair-cycle budget exhausted");
       return this.store.transition(taskId, "blocked", { lastError: "review repair-cycle budget exhausted" });
     }
+    await this.store.appendEvent(taskId, "repair.requested", { instructions: review.repairInstructions, source: "review" });
     await this.store.patchTask(taskId, { repairCycles: current.repairCycles + 1 });
     await this.store.transition(taskId, "repairing");
     return this.enqueue(taskId);
@@ -227,8 +228,10 @@ export class TaskScheduler extends EventEmitter {
       const updatedEvidence: ExecutionEvidence = { ...evidence, state: "validating", executor: result, validation };
       await this.store.setEvidence(taskId, updatedEvidence);
       const validationFailed = validation.some((check) => check.exitCode !== 0);
+      const expectedFiles = plan.steps.flatMap((step) => step.expectedFiles);
+      const planDeviation = expectedFiles.length > 0 && result.changedFiles.some((file) => !isExpectedFile(file, expectedFiles));
       const needsReview = plan.review.policy === "always"
-        || (plan.review.policy === "adaptive" && (validationFailed || plan.risk !== "low" || result.changedFiles.length > 5 || result.diffLines > 500));
+        || (plan.review.policy === "adaptive" && (validationFailed || planDeviation || plan.risk !== "low" || result.changedFiles.length > 5 || result.diffLines > 500));
       if (validationFailed && !needsReview) {
         await this.finish(taskId, "partial", { ...updatedEvidence, unresolvedRisks: ["one or more deterministic checks failed"] }, "deterministic validation failed");
         return;
@@ -236,6 +239,7 @@ export class TaskScheduler extends EventEmitter {
       if (needsReview) {
         const reviewing = { ...updatedEvidence, state: "reviewing" as const, unresolvedRisks: [
           ...(validationFailed ? ["one or more deterministic checks failed"] : []),
+          ...(planDeviation ? ["changed files outside plan expectedFiles"] : []),
           "external review required",
         ] };
         await this.store.setEvidence(taskId, reviewing);
@@ -278,4 +282,12 @@ export class TaskScheduler extends EventEmitter {
 function clampConcurrency(value: number): number {
   if (!Number.isInteger(value)) throw new Error("concurrency must be an integer");
   return Math.max(1, Math.min(4, value));
+}
+
+function isExpectedFile(changedFile: string, expectedFiles: string[]): boolean {
+  const normalized = changedFile.replaceAll("\\", "/").replace(/^\.\//, "");
+  return expectedFiles.some((expected) => {
+    const candidate = expected.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+    return normalized === candidate || normalized.startsWith(`${candidate}/`);
+  });
 }

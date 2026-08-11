@@ -3,7 +3,7 @@ import type { MyClaudeClient } from "./client.js";
 import type { PlannerAdapter } from "./planners.js";
 import type { TaskRecord } from "./schemas.js";
 import { makePlan } from "./test-helpers.js";
-import { runAutomaticWorkflow } from "./workflow.js";
+import { runAutomaticWorkflow, waitForExecution } from "./workflow.js";
 
 describe("automatic CLI workflow", () => {
   it("reuses one planner session across review and repair until verified", async () => {
@@ -38,6 +38,21 @@ describe("automatic CLI workflow", () => {
     expect(result.task.state).toBe("passed");
     expect(sessions).toEqual(["planner-session", "planner-session"]);
     expect(client.submitReview).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for planner-none execution settlement without invoking a reviewer", async () => {
+    const plan = makePlan();
+    const queued = task(plan.taskId, "queued");
+    const passed = task(plan.taskId, "passed");
+    const client = {
+      waitTask: vi.fn().mockResolvedValueOnce(queued).mockResolvedValueOnce(passed),
+      getEvidence: vi.fn().mockResolvedValue({ taskId: plan.taskId, state: "passed", validation: [], reviews: [], unresolvedRisks: [] }),
+      cancelTask: vi.fn(),
+    } as unknown as MyClaudeClient;
+    const result = await waitForExecution(client, plan, { deadlineMs: 5_000, waitSliceMs: 10 });
+    expect(result.task.state).toBe("passed");
+    expect(client.waitTask).toHaveBeenCalledTimes(2);
+    expect(client.cancelTask).not.toHaveBeenCalled();
   });
 });
 
