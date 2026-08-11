@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" = /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+ORCHESTRATOR_CLI="$ROOT/packages/orchestrator/dist/cli.mjs"
+command_name="${1:-}"
+
+case "$command_name" in
+  task|server|integrate)
+    [[ -f "$ORCHESTRATOR_CLI" ]] || {
+      printf 'Error: the MyClaude orchestrator is not built. Run: m365-copilot install\n' >&2
+      exit 1
+    }
+    exec node "$ORCHESTRATOR_CLI" "$@"
+    ;;
+  doctor)
+    bash "$ROOT/scripts/m365-control.sh" doctor
+    if [[ -f "$ORCHESTRATOR_CLI" ]]; then
+      exec node "$ORCHESTRATOR_CLI" doctor
+    fi
+    exit 0
+    ;;
+  models)
+    shift
+    exec bash "$ROOT/scripts/m365-control.sh" models "$@"
+    ;;
+  help|-h|--help)
+    cat <<'EOF'
+MyClaude — verified M365 executor and task orchestrator
+
+Usage:
+  myclaude [Claude Code arguments]      Start the proxied Claude Code interface
+  myclaude task ...                     Plan, execute, validate, and review tasks
+  myclaude server start|stop|status     Manage the task orchestrator
+  myclaude integrate add|remove|status  Connect Codex or direct Claude over MCP
+  myclaude models [--all] [--json]      Show the M365 model catalog
+  myclaude doctor                       Diagnose the proxy and orchestrator
+
+The ordinary `claude` command is never modified by this launcher.
+EOF
+    ;;
+  *)
+    exec bash "$ROOT/scripts/m365-control.sh" myclaude "$@"
+    ;;
+esac

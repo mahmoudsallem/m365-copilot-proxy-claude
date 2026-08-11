@@ -25,28 +25,37 @@ export M365_CONFIG_DIR="$CONFIG_DIR"
 export M365_STATE_DIR="$STATE_DIR"
 export CLAUDE_SETTINGS_FILE="$SETTINGS_FILE"
 
+bash "$ROOT/scripts/m365-control.sh" install-myclaude >/dev/null
+[[ -L "$USER_BIN/myclaude" ]]
+[[ "$(readlink "$USER_BIN/myclaude")" == "$ROOT/bin/myclaude" ]]
+[[ "$(command -v claude)" == "$FAKE_BIN/claude" ]]
+[[ "$(claude --version)" == "fake-claude:--version" ]]
+"$USER_BIN/myclaude" --help | grep -q 'ordinary `claude` command is never modified'
+
+# The legacy command is now a migration command: it cleans only stale localhost
+# settings, installs myclaude, and leaves the real Claude executable untouched.
 bash "$ROOT/scripts/m365-control.sh" connect-claude >/dev/null
-grep -q '^# M365_COPILOT_MANAGED_CLAUDE=1$' "$USER_BIN/claude"
-grep -q '^# M365_COPILOT_MANAGED_CLAUDE=1$' "$USER_BIN/claude-direct"
+[[ "$(command -v claude)" == "$FAKE_BIN/claude" ]]
 [[ "$(jq -r '.env.KEEP_ME' "$SETTINGS_FILE")" == "yes" ]]
 [[ "$(jq -r '.env.ANTHROPIC_BASE_URL // "removed"' "$SETTINGS_FILE")" == "removed" ]]
 [[ "$(jq -r '.model' "$SETTINGS_FILE")" == "opus[1m]" ]]
-[[ "$("$USER_BIN/claude-direct" --version)" == "fake-claude:--version" ]]
-bash "$ROOT/scripts/m365-control.sh" disconnect-claude >/dev/null
-[[ ! -e "$USER_BIN/claude" ]]
-[[ ! -e "$USER_BIN/claude-direct" ]]
 
-printf '#!/usr/bin/env bash\nprintf "original-user-claude\\n"\n' > "$USER_BIN/claude"
-chmod 700 "$USER_BIN/claude"
-original_hash="$(sha256sum "$USER_BIN/claude" | cut -d' ' -f1)"
-bash "$ROOT/scripts/m365-control.sh" connect-claude >/dev/null
-grep -q '^# M365_COPILOT_MANAGED_CLAUDE=1$' "$USER_BIN/claude"
-bash "$ROOT/scripts/m365-control.sh" disconnect-claude >/dev/null
-restored_hash="$(sha256sum "$USER_BIN/claude" | cut -d' ' -f1)"
-[[ "$restored_hash" == "$original_hash" ]]
-[[ "$("$USER_BIN/claude")" == "original-user-claude" ]]
+bash "$ROOT/scripts/m365-control.sh" remove-myclaude >/dev/null
+[[ ! -e "$USER_BIN/myclaude" ]]
+[[ "$(claude)" == "fake-claude:" ]]
 
-bash -n "$ROOT"/*.sh "$ROOT/bin/m365-copilot" "$ROOT/scripts/m365-control.sh"
+# Never overwrite another tool that happens to use the myclaude command name.
+printf '#!/usr/bin/env bash\nprintf "unmanaged\\n"\n' > "$USER_BIN/myclaude"
+chmod 700 "$USER_BIN/myclaude"
+unmanaged_hash="$(sha256sum "$USER_BIN/myclaude" | cut -d' ' -f1)"
+if bash "$ROOT/scripts/m365-control.sh" install-myclaude >/dev/null 2>&1; then
+  printf '%s\n' 'install-myclaude unexpectedly replaced an unmanaged command' >&2
+  exit 1
+fi
+[[ "$(sha256sum "$USER_BIN/myclaude" | cut -d' ' -f1)" == "$unmanaged_hash" ]]
+rm -f "$USER_BIN/myclaude"
+
+bash -n "$ROOT"/*.sh "$ROOT/bin/m365-copilot" "$ROOT/bin/myclaude" "$ROOT/scripts/m365-control.sh"
 node --check "$ROOT/scripts/claude-settings.mjs"
 
 printf '%s\n' "launcher smoke tests passed"
