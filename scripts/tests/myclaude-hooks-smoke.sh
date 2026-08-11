@@ -25,6 +25,10 @@ node -e 'const value=JSON.parse(process.argv[1]); if(value.hookSpecificOutput.pe
 
 outside_output="$(hook '{"session_id":"session-1","cwd":"'"$MYCLAUDE_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Write","tool_use_id":"tool-2","tool_input":{"file_path":"'"$TEST_ROOT"'/outside.txt","content":"hello"}}')"
 node -e 'const value=JSON.parse(process.argv[1]); if(value.hookSpecificOutput.permissionDecision!=="deny") process.exit(1)' "$outside_output"
+mkdir -p "$TEST_ROOT/symlink-target"
+ln -s "$TEST_ROOT/symlink-target" "$MYCLAUDE_WORKSPACE/escape-link"
+symlink_output="$(hook '{"session_id":"session-1","cwd":"'"$MYCLAUDE_WORKSPACE"'","hook_event_name":"PreToolUse","tool_name":"Write","tool_use_id":"tool-2b","tool_input":{"file_path":"'"$MYCLAUDE_WORKSPACE"'/escape-link/outside.txt","content":"hello"}}')"
+node -e 'const value=JSON.parse(process.argv[1]); if(value.hookSpecificOutput.permissionDecision!=="deny") process.exit(1)' "$symlink_output"
 
 hook '{"session_id":"session-1","cwd":"'"$MYCLAUDE_WORKSPACE"'","hook_event_name":"PostToolUse","tool_name":"Write","tool_use_id":"tool-3","tool_input":{"file_path":"'"$MYCLAUDE_WORKSPACE"'/file.txt","content":"hello"},"tool_response":{"filePath":"'"$MYCLAUDE_WORKSPACE"'/file.txt","success":true}}' >/dev/null
 stop_output="$(hook '{"session_id":"session-1","cwd":"'"$MYCLAUDE_WORKSPACE"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"done"}')"

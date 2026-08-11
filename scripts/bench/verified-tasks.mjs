@@ -13,6 +13,7 @@ function task(id, category, prompt, verification, options = {}) {
     verification,
     risk: options.risk ?? "low",
     critical: Boolean(options.critical),
+    runtime: options.runtime ?? "node-bash",
     maxTurns: options.maxTurns ?? 24,
     files: options.files ?? {},
     faults: options.faults ?? [],

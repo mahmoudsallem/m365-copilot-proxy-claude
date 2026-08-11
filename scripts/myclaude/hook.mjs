@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import path from "node:path";
 import {
   appendEvent,
@@ -47,8 +48,22 @@ function allowedRoots(input) {
     : [];
   const roots = [process.env.MYCLAUDE_WORKSPACE, input.cwd, ...configured]
     .filter((item) => typeof item === "string" && item.length > 0)
-    .map((item) => path.resolve(item));
+    .map((item) => canonicalPath(path.resolve(item)));
   return [...new Set(roots)];
+}
+
+function canonicalPath(target) {
+  let existing = path.resolve(target);
+  const missing = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    missing.unshift(path.basename(existing));
+    existing = parent;
+  }
+  let canonical = existing;
+  try { canonical = fs.realpathSync.native(existing); } catch {}
+  return path.join(canonical, ...missing);
 }
 
 function within(target, root) {
@@ -61,7 +76,7 @@ function inspectPolicy(input) {
   const roots = allowedRoots(input);
   if (FILE_TOOLS.has(toolName)) {
     for (const requestedPath of filePathsFrom(input)) {
-      const target = path.resolve(input.cwd || process.cwd(), requestedPath);
+      const target = canonicalPath(path.resolve(input.cwd || process.cwd(), requestedPath));
       if (!roots.some((root) => within(target, root))) {
         return { risky: true, reason: `file access outside allowed workspace: ${target}` };
       }
