@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { getAvailableModels } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { handleChatCompletion, type SessionPool } from "./handler.js";
 
@@ -157,14 +158,17 @@ function mapToolChoice(choice: AnthropicBody["tool_choice"]) {
   return { type: "function" as const, function: { name: choice.name } };
 }
 
-const M365_MODEL_IDS = new Set([
-  "m365-copilot", "auto", "quick", "think-deeper",
-  "claude", "claude-sonnet", "claude-sonnet-4.5", "claude-sonnet-think-deeper", "claude-opus",
-  "gpt-5.5", "gpt-5.5-quick", "gpt-5.5-think-deeper",
-  "gpt-5.4", "gpt-5.4-quick", "gpt-5.4-think-deeper",
-  "gpt-5.3", "gpt-5.3-quick", "gpt-5.3-think-deeper",
-  "gpt-5.2", "gpt-5.2-quick", "gpt-5.2-think-deeper",
-]);
+const M365_MODEL_IDS = new Set(getAvailableModels());
+
+/**
+ * Claude Code only accepts gateway-discovered model IDs beginning with `claude`
+ * or `anthropic`. Keep that transport-only prefix out of the M365 model catalog.
+ */
+export const CLAUDE_GATEWAY_MODEL_PREFIX = "claude-m365--";
+
+export function toClaudeGatewayModelId(model: string): string {
+  return `${CLAUDE_GATEWAY_MODEL_PREFIX}${model}`;
+}
 
 /**
  * Claude Code's /model picker only knows Anthropic catalog IDs. If a user picks
@@ -172,6 +176,10 @@ const M365_MODEL_IDS = new Set([
  * otherwise healthy conversation. Explicit M365 catalog IDs still pass through.
  */
 export function resolveM365Model(requested: string): string {
+  if (requested.startsWith(CLAUDE_GATEWAY_MODEL_PREFIX)) {
+    const model = requested.slice(CLAUDE_GATEWAY_MODEL_PREFIX.length);
+    if (M365_MODEL_IDS.has(model)) return model;
+  }
   if (M365_MODEL_IDS.has(requested)) return requested;
   return process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5-think-deeper";
 }

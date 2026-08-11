@@ -176,9 +176,11 @@ claude-direct                  # original Anthropic provider
 m365-copilot disconnect-claude # restore normal `claude`
 ```
 
-Claude's `/model` picker contains Anthropic product names rather than the M365 catalog.
-Unsupported choices are mapped to `gpt-5.5-think-deeper`; selecting “Opus” does not grant
-an Anthropic Opus model. Use `MODEL=<id> claude` for an explicit M365 model.
+Claude Code 2.1.129 or newer discovers all 21 proxy models in `/model`; entries use the
+real M365 IDs and are marked `From gateway`. The connector filters ordinary Anthropic
+subscription choices from the proxied picker and pins Claude Code's unavoidable `Default`
+entry to `MODEL` (or `gpt-5.5-think-deeper`). This changes only the connected wrapper;
+`claude-direct` still shows and uses the normal Anthropic catalog.
 
 The wrapper intentionally exposes only `Bash`, `Read`, `Edit`, `Write`, `Glob`, and
 `Grep`. Larger tool schemas frequently trigger M365's content filter. Treat every command

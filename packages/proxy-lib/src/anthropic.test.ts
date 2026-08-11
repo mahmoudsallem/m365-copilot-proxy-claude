@@ -5,6 +5,7 @@ import {
   estimateAnthropicInputTokens,
   fromOpenAIChatResponse,
   resolveM365Model,
+  toClaudeGatewayModelId,
   toOpenAIChatRequest,
 } from "./anthropic.js";
 
@@ -62,5 +63,11 @@ describe("Anthropic Messages compatibility", () => {
     expect(resolveM365Model("claude-opus-5")).toBe("gpt-5.5-think-deeper");
     expect(resolveM365Model("opus[1m]")).toBe("gpt-5.5-think-deeper");
     expect(resolveM365Model("gpt-5.5-think-deeper")).toBe("gpt-5.5-think-deeper");
+  });
+
+  it("round-trips Claude Code gateway aliases to exact M365 model IDs", () => {
+    expect(toClaudeGatewayModelId("gpt-5.5-quick")).toBe("claude-m365--gpt-5.5-quick");
+    expect(resolveM365Model("claude-m365--gpt-5.5-quick")).toBe("gpt-5.5-quick");
+    expect(resolveM365Model("claude-m365--not-a-real-model")).toBe("gpt-5.5-think-deeper");
   });
 });

@@ -63,9 +63,12 @@ untouched.
 - Empty/disengaged M365 turns are exposed as non-retryable errors. This prevents
   Claude Code's automatic retries from consuming many messages on a dead conversation;
   retry manually after waiting or restarting the session.
-- Claude Code's `/model` picker contains Anthropic subscription models, not the M365
-  catalog. Unsupported picker IDs (for example `claude-opus-5` / `opus[1m]`) are safely
-  mapped back to `gpt-5.5-think-deeper`; explicit M365 model IDs pass through.
+- Claude Code 2.1.129 or newer discovers the proxy catalog in `/model`. The picker shows
+  the clean M365 IDs and labels them `From gateway`; transport-only `claude-m365--...`
+  aliases are translated back to the exact selected M365 ID by the proxy. Claude Code's
+  unavoidable `Default` entry is pinned to the wrapper's `MODEL` value. The wrapper
+  permits only its localhost model-discovery request even if global Claude settings set
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; telemetry and error reporting remain off.
 
 Keep the proxy bound to `127.0.0.1`. Do not expose the endpoint or its bearer token over
 the network.

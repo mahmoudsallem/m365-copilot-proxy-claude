@@ -6,7 +6,9 @@ export { SessionPool, handleChatCompletion } from "./handler.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
 export {
   AnthropicMessagesRequest,
+  CLAUDE_GATEWAY_MODEL_PREFIX,
   resolveM365Model,
+  toClaudeGatewayModelId,
   toOpenAIChatRequest,
   fromOpenAIChatResponse,
   anthropicSse,
@@ -15,6 +17,7 @@ export {
   type AnthropicBody,
   type AnthropicMessageResponse,
 } from "./anthropic.js";
+import { toClaudeGatewayModelId } from "./anthropic.js";
 
 // Re-export tool utilities from core
 export {
@@ -66,12 +69,31 @@ export function buildModelsPayload() {
   };
 }
 
+/** Build Anthropic's Models API shape for Claude Code gateway discovery. */
+export function buildClaudeGatewayModelsPayload() {
+  const createdAt = "1970-01-01T00:00:00Z";
+  const data = getAvailableModels().map((model) => ({
+    id: toClaudeGatewayModelId(model),
+    type: "model" as const,
+    display_name: model,
+    created_at: createdAt,
+    max_input_tokens: CONTEXT_WINDOW_TOKENS,
+    max_tokens: MAX_OUTPUT_TOKENS,
+  }));
+  return {
+    data,
+    first_id: data[0]?.id ?? null,
+    has_more: false,
+    last_id: data.at(-1)?.id ?? null,
+  };
+}
+
 // --- CORS (permissive, matches the previous Hono `cors()` default) ---
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-M365-Claude-Code",
 };
 
 function withCors(res: Response): Response {
@@ -116,7 +138,10 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
     }
 
     if (method === "GET" && pathname === "/v1/models") {
-      return withCors(json(200, buildModelsPayload()));
+      const isClaudeCode = req.headers.get("x-m365-claude-code") === "1";
+      return withCors(json(200, isClaudeCode
+        ? buildClaudeGatewayModelsPayload()
+        : buildModelsPayload()));
     }
 
     if (method === "POST" && pathname === "/v1/chat/completions") {
