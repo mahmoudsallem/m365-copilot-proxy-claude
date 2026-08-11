@@ -88,14 +88,55 @@ node "$ROOT/scripts/myclaude/install-hooks.mjs" remove --output "$SETTINGS" >/de
 [[ ! -e "$SETTINGS" && ! -e "$SETTINGS.managed" ]]
 
 UNIT="$TEST_ROOT/config/myclauded.service"
-node "$ROOT/scripts/myclaude/install-service.mjs" install --executable "$ROOT/bin/myclaude" --socket "$TEST_ROOT/myclauded.sock" --output "$UNIT" >/dev/null
+node "$ROOT/scripts/myclaude/install-service.mjs" install \
+  --executable "$ROOT/bin/myclaude" \
+  --socket "$TEST_ROOT/myclauded.sock" \
+  --state-root "$TEST_ROOT/service-state" \
+  --config-dir "$TEST_ROOT/service-config" \
+  --local-env "$TEST_ROOT/service-config%literal/proxy.env" \
+  --hook-settings "$TEST_ROOT/service-config/hooks.json" \
+  --executor "$ROOT/bin/myclaude" \
+  --executor-args '["--flag","value with spaces"]' \
+  --profile host-unrestricted \
+  --executor-resume 0 \
+  --concurrency 3 \
+  --allowed-workspace-roots "$TEST_ROOT/workspace:$TEST_ROOT/other" \
+  --bwrap-bin "$TEST_ROOT/bin%literal/bwrap" \
+  --output "$UNIT" >/dev/null
 grep -Fq "ExecStart=\"$ROOT/bin/myclaude\" server run" "$UNIT"
 grep -Fq "Environment=MYCLAUDE_SOCKET=\"$TEST_ROOT/myclauded.sock\"" "$UNIT"
+grep -Fq "Environment=MYCLAUDE_STATE_ROOT=\"$TEST_ROOT/service-state\"" "$UNIT"
+grep -Fq "Environment=M365_CONFIG_DIR=\"$TEST_ROOT/service-config\"" "$UNIT"
+grep -Fq "Environment=M365_LOCAL_ENV=\"$TEST_ROOT/service-config%%literal/proxy.env\"" "$UNIT"
+grep -Fq "Environment=MYCLAUDE_HOOK_SETTINGS=\"$TEST_ROOT/service-config/hooks.json\"" "$UNIT"
+grep -Fq "Environment=MYCLAUDE_EXECUTION_PROFILE=\"host-unrestricted\"" "$UNIT"
+grep -Fq 'Environment=MYCLAUDE_EXECUTOR_ARGS="[\"--flag\",\"value with spaces\"]"' "$UNIT"
+grep -Fq 'Environment=MYCLAUDE_EXECUTOR_RESUME="0"' "$UNIT"
+grep -Fq 'Environment=MYCLAUDE_CONCURRENCY="3"' "$UNIT"
+grep -Fq "Environment=MYCLAUDE_ALLOWED_WORKSPACE_ROOTS=\"$TEST_ROOT/workspace:$TEST_ROOT/other\"" "$UNIT"
+grep -Fq "Environment=MYCLAUDE_BWRAP_BIN=\"$TEST_ROOT/bin%%literal/bwrap\"" "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify "$UNIT" >/dev/null
 fi
 node "$ROOT/scripts/myclaude/install-service.mjs" status --output "$UNIT" --socket "$TEST_ROOT/myclauded.sock" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s);if(!v.managed||!v.intact)process.exit(1)})'
 node "$ROOT/scripts/myclaude/install-service.mjs" remove --output "$UNIT" --socket "$TEST_ROOT/myclauded.sock" >/dev/null
 [[ ! -e "$UNIT" && ! -e "$UNIT.managed" ]]
+
+DEFAULT_UNIT="$TEST_ROOT/config/myclauded-default.service"
+node "$ROOT/scripts/myclaude/install-service.mjs" install --executable "$ROOT/bin/myclaude" --output "$DEFAULT_UNIT" >/dev/null
+grep -Fq "Environment=MYCLAUDE_SOCKET=\"$XDG_STATE_HOME/m365-copilot-proxy/myclauded.sock\"" "$DEFAULT_UNIT"
+grep -Fq "Environment=MYCLAUDE_STATE_ROOT=\"$XDG_STATE_HOME/m365-copilot-proxy\"" "$DEFAULT_UNIT"
+node "$ROOT/scripts/myclaude/install-service.mjs" remove --output "$DEFAULT_UNIT" >/dev/null
+
+if node "$ROOT/scripts/myclaude/install-service.mjs" render --executable "$ROOT/bin/myclaude" \
+    --executor-args '{"not":"an array"}' >/dev/null 2>&1; then
+  printf '%s\n' 'service installer accepted invalid executor arguments' >&2
+  exit 1
+fi
+if node "$ROOT/scripts/myclaude/install-service.mjs" render --executable "$ROOT/bin/myclaude" \
+    --socket "$TEST_ROOT/line"$'\n'break.sock >/dev/null 2>&1; then
+  printf '%s\n' 'service installer accepted a line break' >&2
+  exit 1
+fi
 
 printf '%s\n' "myclaude hook smoke tests passed"

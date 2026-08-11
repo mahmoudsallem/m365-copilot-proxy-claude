@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" = /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+NODE_BIN="$ROOT/.runtime/node/node_modules/node/bin/node"
+[[ -x "$NODE_BIN" ]] || NODE_BIN="$(command -v node 2>/dev/null || true)"
+[[ -n "$NODE_BIN" ]] || {
+  printf 'Error: Node.js is unavailable. Run: m365-copilot install\n' >&2
+  exit 1
+}
+
+ENV_FILE="${M365_LOCAL_ENV:-${M365_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/m365-copilot-proxy}/proxy.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+exec "$NODE_BIN" "$ROOT/scripts/myclaude/myclaude-research.mjs" "$@"

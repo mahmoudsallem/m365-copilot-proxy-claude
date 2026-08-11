@@ -31,6 +31,57 @@ bash "$ROOT/scripts/m365-control.sh" install-myclaude >/dev/null
 [[ "$(command -v claude)" == "$FAKE_BIN/claude" ]]
 [[ "$(claude --version)" == "fake-claude:--version" ]]
 "$USER_BIN/myclaude" --help | grep -q 'ordinary `claude` command is never modified'
+bash "$ROOT/scripts/m365-control.sh" profile guarded >/dev/null
+[[ "$(jq -r '.env.MYCLAUDE_EXECUTION_PROFILE' "$CONFIG_DIR/myclaude-hooks.json")" == "guarded" ]]
+[[ "$(jq -r '.model' "$CONFIG_DIR/myclaude-hooks.json")" == "claude-m365--gpt-5.5-think-deeper" ]]
+# The repository path contains a space; parsing managed settings must still
+# invoke the private Node executable as one correctly quoted path.
+"$USER_BIN/myclaude" help | grep -q 'verified M365 executor'
+bash "$ROOT/scripts/m365-control.sh" profile host-unrestricted >/dev/null
+[[ "$(jq -r '.env.MYCLAUDE_EXECUTION_PROFILE' "$CONFIG_DIR/myclaude-hooks.json")" == "host-unrestricted" ]]
+
+# A modified settings body must never activate the unrestricted Claude Code
+# flag. The launcher fails before probing the proxy or invoking Claude.
+cp "$CONFIG_DIR/myclaude-hooks.json" "$TEST_ROOT/intact-hooks.json"
+printf '%s\n' '# modified' >> "$CONFIG_DIR/myclaude-hooks.json"
+if "$USER_BIN/myclaude" -p 'must not run' >"$TEST_ROOT/tampered-hooks.log" 2>&1; then
+  printf '%s\n' 'myclaude accepted modified managed hooks' >&2
+  exit 1
+fi
+grep -q 'verified MyClaude hooks failed their ownership/digest check' "$TEST_ROOT/tampered-hooks.log"
+mv "$TEST_ROOT/intact-hooks.json" "$CONFIG_DIR/myclaude-hooks.json"
+
+# Catalog output is available as stable JSON or an annotated human table.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf '\''%s\n'\'' '\''{"object":"list","data":[{"id":"gpt-test","x_m365_certification":"verified","x_m365_tone":"Gpt_Quick","max_input_tokens":128000,"max_output_tokens":3072},{"id":"gpt-experimental","x_m365_certification":"experimental","x_m365_tone":"ThinkDeeper","max_input_tokens":128000,"max_output_tokens":3072}]}'\''' \
+  > "$FAKE_BIN/curl"
+chmod 700 "$FAKE_BIN/curl"
+models_json="$("$USER_BIN/myclaude" models --all --json)"
+[[ "$(jq -r 'length' <<<"$models_json")" == "2" ]]
+[[ "$(jq -r '.[0].x_m365_certification' <<<"$models_json")" == "verified" ]]
+models_human="$("$USER_BIN/myclaude" models)"
+grep -Fq $'MODEL\tSTATUS\tTONE\tINPUT\tOUTPUT' <<<"$models_human"
+grep -Fq $'gpt-test\tverified\tGpt_Quick\t128000\t3072' <<<"$models_human"
+if "$USER_BIN/myclaude" models --unsupported >/dev/null 2>&1; then
+  printf '%s\n' 'models unexpectedly accepted an unknown option' >&2
+  exit 1
+fi
+
+# The research command is managed independently and never replaces a collision.
+bash "$ROOT/scripts/m365-control.sh" install-research >/dev/null
+[[ -L "$USER_BIN/myclaude-research" ]]
+[[ "$(readlink "$USER_BIN/myclaude-research")" == "$ROOT/bin/myclaude-research" ]]
+"$USER_BIN/myclaude-research" help | grep -q 'myclaude-research search'
+bash "$ROOT/scripts/m365-control.sh" remove-research >/dev/null
+printf '#!/usr/bin/env bash\nprintf "unmanaged-research\\n"\n' > "$USER_BIN/myclaude-research"
+chmod 700 "$USER_BIN/myclaude-research"
+research_hash="$(sha256sum "$USER_BIN/myclaude-research" | cut -d' ' -f1)"
+if bash "$ROOT/scripts/m365-control.sh" install-research >/dev/null 2>&1; then
+  printf '%s\n' 'install-research unexpectedly replaced an unmanaged command' >&2
+  exit 1
+fi
+[[ "$(sha256sum "$USER_BIN/myclaude-research" | cut -d' ' -f1)" == "$research_hash" ]]
+rm -f "$USER_BIN/myclaude-research"
 
 # The legacy command is now a migration command: it cleans only stale localhost
 # settings, installs myclaude, and leaves the real Claude executable untouched.
