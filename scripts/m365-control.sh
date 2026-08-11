@@ -355,7 +355,7 @@ install_myclaude() {
   fi
 
   if [[ -e "$MYCLAUDE_WRAPPER" || -L "$MYCLAUDE_WRAPPER" ]]; then
-    if [[ -f "$MYCLAUDE_WRAPPER" ]] && grep -Eq 'm365-copilot-proxy/(scripts/claude-local|bin/m365-copilot)' "$MYCLAUDE_WRAPPER"; then
+    if [[ -f "$MYCLAUDE_WRAPPER" ]] && grep -Eq 'claude-local\.sh|M365_COPILOT_MANAGED_MYCLAUDE=1' "$MYCLAUDE_WRAPPER"; then
       local migrated="$STATE_DIR/myclaude.legacy.$(date +%s)"
       mv "$MYCLAUDE_WRAPPER" "$migrated"
       chmod 600 "$migrated"
