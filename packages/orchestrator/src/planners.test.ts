@@ -35,6 +35,7 @@ describe("planner adapters", () => {
     try {
       const planned = await new ClaudePlannerAdapter(runner).createPlan(seed);
       expect(planned.artifact.taskId).toBe(seed.taskId);
+      expect(planned.artifact.review.policy).toBe("adaptive");
       expect(request.args).toContain("plan");
       expect(request.args).toContain("--json-schema");
       expect(request.env?.ANTHROPIC_BASE_URL).toBeUndefined();

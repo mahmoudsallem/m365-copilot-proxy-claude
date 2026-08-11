@@ -78,22 +78,34 @@ export class NodeProcessRunner implements ProcessRunner {
   }
 }
 
-const PROXY_ENV_KEYS = [
+const PROXY_ROUTE_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_API_KEY",
-  "CLAUDE_CODE_USE_BEDROCK",
-  "CLAUDE_CODE_USE_VERTEX",
-  "CLAUDE_CODE_USE_FOUNDRY",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
   "OPENAI_BASE_URL",
-  "OPENAI_API_KEY",
   "M365_PROXY_API_KEY",
 ];
+
+const PROVIDER_CREDENTIAL_KEYS = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const;
 
 /** Clone the environment while preventing planner calls from inheriting proxy credentials/routes. */
 export function directPlannerEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const clean = { ...source };
-  for (const key of PROXY_ENV_KEYS) delete clean[key];
+  const proxyKey = source.M365_PROXY_API_KEY;
+  for (const key of PROXY_ROUTE_ENV_KEYS) delete clean[key];
+  // Preserve genuine direct-provider credentials and enterprise provider flags.
+  // Remove only the localhost proxy bearer value when it was copied into a
+  // provider variable by a gateway launcher.
+  if (proxyKey) {
+    for (const key of PROVIDER_CREDENTIAL_KEYS) {
+      if (clean[key] === proxyKey) delete clean[key];
+    }
+  }
   return clean;
 }
 
@@ -113,8 +125,6 @@ export interface ExecutionResult {
   diffLines: number;
   upstreamSignals: Array<"throttle" | "empty-response">;
   sessionId?: string;
-  runDirectory: string;
-  resumeSession?: boolean;
 }
 
 export interface ExecutionContext {
@@ -125,6 +135,8 @@ export interface ExecutionContext {
   maxTurns: number;
   maxMessages: number;
   sessionId?: string;
+  runDirectory: string;
+  resumeSession?: boolean;
 }
 
 export interface ExecutorAdapter {

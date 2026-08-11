@@ -153,6 +153,7 @@ export class CodexPlannerAdapter implements PlannerAdapter {
 function normalizePlan(raw: unknown, seed: PlanSeed, planner: MyClaudePlan["planner"]): MyClaudePlan {
   const object = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const execution = (object.execution && typeof object.execution === "object" ? object.execution : {}) as Record<string, unknown>;
+  const review = (object.review && typeof object.review === "object" ? object.review : {}) as Record<string, unknown>;
   return parsePlan({
     ...object,
     schemaVersion: "myclaude.plan/v1",
@@ -164,6 +165,10 @@ function normalizePlan(raw: unknown, seed: PlanSeed, planner: MyClaudePlan["plan
     planner,
     risk: seed.risk ?? object.risk ?? "medium",
     execution: { ...execution, profile: seed.executionProfile ?? "guarded" },
+    // A paid planner cannot silently opt its own implementation out of the
+    // accepted adaptive review policy. File-submitted plans may still choose a
+    // different policy explicitly.
+    review: { ...review, policy: "adaptive" },
     createdAt: new Date().toISOString(),
   });
 }

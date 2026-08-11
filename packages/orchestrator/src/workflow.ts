@@ -34,6 +34,9 @@ export async function runAutomaticWorkflow(
   while (Date.now() < deadline) {
     const task = await client.waitTask(plan.taskId, options.waitSliceMs ?? 300_000);
     if (["passed", "blocked", "cancelled"].includes(task.state)) return { task, evidence: await client.getEvidence(plan.taskId) };
+    if (plan.review.policy === "never" && ["partial", "failed"].includes(task.state)) {
+      return { task, evidence: await client.getEvidence(plan.taskId) };
+    }
     if (["reviewing", "partial", "failed"].includes(task.state)) {
       const evidence = await client.getEvidence(plan.taskId);
       const reviewed = await planner.review({ plan, evidence, sessionId: plannerSession });

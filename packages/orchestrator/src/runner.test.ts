@@ -28,11 +28,15 @@ describe("process adapters", () => {
     });
   });
 
-  it("scrubs proxy routing and credentials from paid planner subprocesses", () => {
+  it("scrubs proxy routing and only proxy-derived credentials from direct planner subprocesses", () => {
     const clean = directPlannerEnvironment({
-      PATH: "/bin", ANTHROPIC_BASE_URL: "http://proxy", ANTHROPIC_AUTH_TOKEN: "proxy-token", OPENAI_API_KEY: "proxy-key", SAFE_VALUE: "kept",
+      PATH: "/bin", ANTHROPIC_BASE_URL: "http://proxy", ANTHROPIC_MODEL: "claude-m365--quick",
+      M365_PROXY_API_KEY: "proxy-token", ANTHROPIC_AUTH_TOKEN: "proxy-token",
+      OPENAI_API_KEY: "real-openai-key", CLAUDE_CODE_USE_BEDROCK: "1", SAFE_VALUE: "kept",
     });
-    expect(clean).toEqual({ PATH: "/bin", SAFE_VALUE: "kept" });
+    expect(clean).toEqual({
+      PATH: "/bin", OPENAI_API_KEY: "real-openai-key", CLAUDE_CODE_USE_BEDROCK: "1", SAFE_VALUE: "kept",
+    });
   });
 
   it("treats an early-closing child stdin as a normal process result", async () => {

@@ -67,7 +67,7 @@ describe("daemon and SDK", () => {
     await daemon.close();
   });
 
-  it("cancels and settles active execution before removing its socket", async () => {
+  it("quiesces active execution and recovers it once after daemon restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "myclaude-shutdown-test-"));
     roots.push(root);
     const workspace = join(root, "workspace");
@@ -101,14 +101,26 @@ describe("daemon and SDK", () => {
     await startedPromise;
     await client.call("daemon_shutdown", {});
     await daemon.waitClosed();
-    expect((await store.getTask(task.id)).state).toBe("cancelled");
+    expect((await store.getTask(task.id)).state).toBe("queued");
     expect(executions).toBe(1);
 
-    const secondScheduler = new TaskScheduler(store, blockingExecutor, validator);
+    let recoveredContext: { sessionId?: string; resumeSession?: boolean } | undefined;
+    const recoveryExecutor: ExecutorAdapter = {
+      async execute(context) {
+        executions += 1;
+        recoveredContext = { sessionId: context.sessionId, resumeSession: context.resumeSession };
+        return { exitCode: 0, stdout: "recovered", stderr: "", turns: 1, messages: 1, changedFiles: [], diffLines: 0, upstreamSignals: [], sessionId: context.sessionId };
+      },
+    };
+    const secondScheduler = new TaskScheduler(store, recoveryExecutor, validator);
     const secondDaemon = new OrchestratorDaemon({ socketPath, store, scheduler: secondScheduler });
+    const recovered = new Promise<void>((resolve) => secondScheduler.once("settled", () => resolve()));
     await secondDaemon.start();
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(executions).toBe(1);
+    await recovered;
+    expect(executions).toBe(2);
+    expect((await store.getTask(task.id)).state).toBe("passed");
+    expect(recoveredContext).toEqual({ sessionId: expect.any(String), resumeSession: true });
+    expect((await store.readEvents(task.id)).filter((event) => event.type === "task.interrupted")).toHaveLength(1);
     await secondDaemon.close();
   });
 });

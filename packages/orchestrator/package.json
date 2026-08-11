@@ -25,7 +25,8 @@
   ],
   "scripts": {
     "build": "tsdown src/index.ts src/client.ts src/cli.ts src/mcp.ts --format esm --dts",
-    "test": "vitest run src"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "pnpm typecheck && vitest run src"
   },
   "dependencies": {
     "zod": "^4.3.6"

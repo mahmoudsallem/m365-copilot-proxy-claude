@@ -21,6 +21,7 @@ export class TaskScheduler extends EventEmitter {
   private effectiveConcurrency: number;
   private paused = false;
   private degraded = false;
+  private shuttingDown = false;
   private readonly executionProfile: "guarded" | "host-unrestricted";
 
   constructor(
@@ -119,9 +120,12 @@ export class TaskScheduler extends EventEmitter {
   }
 
   async shutdown(timeoutMs = 10_000): Promise<void> {
+    this.shuttingDown = true;
     this.pause();
-    const taskIds = [...new Set([...this.queue, ...this.active.keys()])];
-    await Promise.all(taskIds.map((taskId) => this.cancel(taskId)));
+    // A daemon/service stop is an interruption, not a user cancellation. Keep
+    // queued work queued and abort only active workers so a new daemon can
+    // recover them with the same executor session.
+    for (const controller of this.active.values()) controller.abort();
     const deadline = Date.now() + timeoutMs;
     while (this.active.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -249,7 +253,12 @@ export class TaskScheduler extends EventEmitter {
       for (const signal of result.upstreamSignals) this.reportUpstreamSignal(signal);
       if (controller.signal.aborted) {
         const current = await this.store.getTask(taskId);
-        if (current.state !== "cancelled") await this.finish(taskId, "partial", { ...evidence, executor: result, unresolvedRisks: ["task timeout exceeded"] }, "task timeout exceeded");
+        if (current.state === "cancelled") return;
+        if (this.shuttingDown) {
+          await this.interruptForShutdown(taskId, { ...evidence, executor: result });
+          return;
+        }
+        await this.finish(taskId, "partial", { ...evidence, executor: result, unresolvedRisks: ["task timeout exceeded"] }, "task timeout exceeded");
         return;
       }
       if (result.exitCode !== 0) {
@@ -290,7 +299,12 @@ export class TaskScheduler extends EventEmitter {
     } catch (error) {
       try {
         const current = await this.store.getTask(taskId);
-        if (current.state !== "cancelled") await this.finish(taskId, controller.signal.aborted ? "partial" : "failed", await this.store.getEvidence(taskId), errorMessage(error));
+        if (current.state === "cancelled") return;
+        if (controller.signal.aborted && this.shuttingDown) {
+          await this.interruptForShutdown(taskId, await this.store.getEvidence(taskId));
+          return;
+        }
+        await this.finish(taskId, controller.signal.aborted ? "partial" : "failed", await this.store.getEvidence(taskId), errorMessage(error));
       } catch {
         // Preserve the original failure; corrupt-store failures are visible in daemon logs/RPC.
       }
@@ -305,6 +319,20 @@ export class TaskScheduler extends EventEmitter {
     await this.store.setEvidence(taskId, complete);
     await this.store.transition(taskId, state, { lastError });
     await this.store.appendEvent(taskId, "execution.completed", { state });
+  }
+
+  private async interruptForShutdown(taskId: string, evidence: ExecutionEvidence): Promise<void> {
+    const current = await this.store.getTask(taskId);
+    if (TERMINAL_TASK_STATES.has(current.state) || current.state === "queued") return;
+    const reason = "execution interrupted by daemon shutdown; queued for recovery";
+    await this.store.setEvidence(taskId, {
+      ...evidence,
+      state: "queued",
+      completedAt: undefined,
+      unresolvedRisks: [...new Set([...evidence.unresolvedRisks, reason])],
+    });
+    await this.store.transition(taskId, "queued", { lastError: reason });
+    await this.store.appendEvent(taskId, "task.interrupted", { reason: "daemon shutdown", resumable: true });
   }
 
   private async setEvidenceState(taskId: string, state: "passed" | "blocked", risk?: string): Promise<void> {

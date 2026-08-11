@@ -54,6 +54,21 @@ describe("automatic CLI workflow", () => {
     expect(client.waitTask).toHaveBeenCalledTimes(2);
     expect(client.cancelTask).not.toHaveBeenCalled();
   });
+
+  it("does not invoke a paid reviewer when the immutable policy is never", async () => {
+    const plan = makePlan({ planner: { provider: "claude", sessionId: "planner-session" }, review: { policy: "never" } });
+    const partial = task(plan.taskId, "partial");
+    const client = {
+      waitTask: vi.fn().mockResolvedValue(partial),
+      getEvidence: vi.fn().mockResolvedValue({ taskId: plan.taskId, state: "partial", validation: [], reviews: [], unresolvedRisks: ["validation failed"] }),
+      submitReview: vi.fn(),
+      cancelTask: vi.fn(),
+    } as unknown as MyClaudeClient;
+    const planner = { provider: "claude", createPlan: vi.fn(), review: vi.fn() } as unknown as PlannerAdapter;
+    const result = await runAutomaticWorkflow(client, plan, planner, { deadlineMs: 5_000, waitSliceMs: 10 });
+    expect(result.task.state).toBe("partial");
+    expect(planner.review).not.toHaveBeenCalled();
+  });
 });
 
 function task(id: string, state: TaskRecord["state"]): TaskRecord {
