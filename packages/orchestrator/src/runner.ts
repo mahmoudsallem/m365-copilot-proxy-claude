@@ -185,6 +185,7 @@ export class CommandExecutorAdapter implements ExecutorAdapter {
         MYCLAUDE_RUN_DIR: context.runDirectory,
         MYCLAUDE_WORKSPACE: context.plan.workspace,
         MYCLAUDE_EXECUTION_PROFILE: context.plan.execution.profile,
+        MYCLAUDE_SESSION_ID: sessionId,
       },
       stdin: prompt,
       timeoutMs,

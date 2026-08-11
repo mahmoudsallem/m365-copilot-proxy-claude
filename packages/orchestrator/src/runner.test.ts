@@ -18,7 +18,12 @@ describe("process adapters", () => {
     const launch = requests.find((request) => request.executable === "/proxy-claude")!;
     expect(launch.args).toContain("--resume");
     expect(launch.args).toContain("d7424f0b-0000-4000-8000-000000000001");
-    expect(launch.env).toMatchObject({ MYCLAUDE_RUN_DIR: "/private/run", MYCLAUDE_WORKSPACE: "/tmp/test-workspace", MYCLAUDE_EXECUTION_PROFILE: "guarded" });
+    expect(launch.env).toMatchObject({
+      MYCLAUDE_RUN_DIR: "/private/run",
+      MYCLAUDE_WORKSPACE: "/tmp/test-workspace",
+      MYCLAUDE_EXECUTION_PROFILE: "guarded",
+      MYCLAUDE_SESSION_ID: "d7424f0b-0000-4000-8000-000000000001",
+    });
   });
 
   it("scrubs proxy routing and credentials from paid planner subprocesses", () => {
