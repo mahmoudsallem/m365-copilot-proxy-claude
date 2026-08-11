@@ -1,0 +1,32 @@
+{
+  "schema": "myclaude.eval-mock/v1",
+  "tasks": {
+    "research-current-primary": {
+      "modes": {
+        "adaptive": {
+          "status": "passed",
+          "completed": true,
+          "answer": "The current value is 17. [[source:primary-current]]",
+          "sourceIds": ["model-invented-id"],
+          "citedUrls": ["https://invented.example/model-claim"],
+          "ungroundedUrls": ["https://invented.example/model-claim"],
+          "trace": [
+            "-----BEGIN PRIVATE KEY-----\nnever-persist-this-material\n-----END PRIVATE KEY-----"
+          ],
+          "messages": 2,
+          "toolCalls": 1
+        },
+        "standard": {
+          "status": "passed",
+          "completed": true,
+          "answer": "The current value is 17. https://invented.example/fake",
+          "sourceIds": ["primary-current"],
+          "citedUrls": ["https://docs.example.test/current"],
+          "ungroundedUrls": [],
+          "messages": 2,
+          "toolCalls": 1
+        }
+      }
+    }
+  }
+}

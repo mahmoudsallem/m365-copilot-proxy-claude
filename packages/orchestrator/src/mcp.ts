@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { MyClaudeClient } from "./client.js";
-import { dispatchMcpRequest } from "./mcp-server.js";
-import { errorMessage } from "./util.js";
+import { McpServerSession } from "./mcp-server.js";
+import { dispatchMcpLine } from "./mcp-transport.js";
 
 const client = new MyClaudeClient();
+const session = new McpServerSession(client);
 process.stdin.setEncoding("utf8");
 let buffer = "";
 process.stdin.on("data", (chunk: string) => {
@@ -23,13 +24,8 @@ process.stdin.on("data", (chunk: string) => {
 });
 
 async function respond(line: string): Promise<void> {
-  let id: string | number | null = null;
-  try {
-    const request = JSON.parse(line) as { id?: string | number };
-    id = request.id ?? null;
-    const response = await dispatchMcpRequest(request, client);
-    if (response !== undefined) process.stdout.write(`${JSON.stringify(response)}\n`);
-  } catch (error) {
-    process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: (error as { rpcCode?: number }).rpcCode ?? -32000, message: errorMessage(error) } })}\n`);
-  }
+  const response = await dispatchMcpLine(line, session);
+  if (response !== undefined) process.stdout.write(`${response}\n`);
 }
+
+process.stdin.once("end", () => session.close());

@@ -11,6 +11,8 @@ function run(system, mode, taskId, repetition, extra = {}) {
     system,
     adapter: "command",
     isolation: "docker",
+    agentIsolation: "docker",
+    verifierIsolation: "docker",
     mode,
     taskId,
     repetition,

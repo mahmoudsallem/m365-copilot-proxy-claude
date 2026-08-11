@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import type { ExecutionEvidence, MyClaudePlan, MyClaudeReview } from "./schemas.js";
-import { MyClaudePlanSchema, MyClaudeReviewSchema, parsePlan, parseReview } from "./schemas.js";
+import { MyClaudePlanSchema, MyClaudeReviewSchema, parsePlan, parseReview, reviewEvidenceSha256 } from "./schemas.js";
+import { sha256 } from "./util.js";
 import { directPlannerEnvironment, NodeProcessRunner, type ProcessRunner } from "./runner.js";
 
 export interface PlanSeed {
@@ -29,7 +30,13 @@ export interface PlannerAdapter {
 }
 
 const planJsonSchema = z.toJSONSchema(MyClaudePlanSchema, { io: "input" });
-const reviewJsonSchema = z.toJSONSchema(MyClaudeReviewSchema, { io: "input" });
+const reviewJsonSchema = z.toJSONSchema(MyClaudeReviewSchema.omit({
+  schemaVersion: true,
+  taskId: true,
+  reviewer: true,
+  binding: true,
+  createdAt: true,
+}), { io: "input" });
 
 export class ClaudePlannerAdapter implements PlannerAdapter {
   readonly provider = "claude" as const;
@@ -83,6 +90,7 @@ export class ClaudePlannerAdapter implements PlannerAdapter {
         schemaVersion: "myclaude.review/v1",
         taskId: input.plan.taskId,
         reviewer: { provider: "claude", model: this.model, sessionId },
+        binding: reviewBinding(input.plan, input.evidence),
         createdAt: new Date().toISOString(),
       }),
       sessionId,
@@ -140,6 +148,7 @@ export class CodexPlannerAdapter implements PlannerAdapter {
           schemaVersion: "myclaude.review/v1",
           taskId: input.plan.taskId,
           reviewer: { provider: "codex", model: this.model, sessionId },
+          binding: reviewBinding(input.plan, input.evidence),
           createdAt: new Date().toISOString(),
         }),
         sessionId,
@@ -148,6 +157,15 @@ export class CodexPlannerAdapter implements PlannerAdapter {
       await rm(temporary, { recursive: true, force: true });
     }
   }
+}
+
+function reviewBinding(plan: MyClaudePlan, evidence: ExecutionEvidence): MyClaudeReview["binding"] {
+  if (!evidence.attemptId) throw new Error("review evidence has no current attempt id");
+  return {
+    attemptId: evidence.attemptId,
+    planSha256: evidence.planSha256 ?? sha256(plan),
+    evidenceSha256: reviewEvidenceSha256(evidence),
+  };
 }
 
 function normalizePlan(raw: unknown, seed: PlanSeed, planner: MyClaudePlan["planner"]): MyClaudePlan {

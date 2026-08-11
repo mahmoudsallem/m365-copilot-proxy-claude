@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { openSync, closeSync } from "node:fs";
 import { chmod, readFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { MyClaudeClient, defaultSocketPath, defaultStateRoot } from "./client.js";
 import { OrchestratorDaemon } from "./daemon.js";
 import { runDoctor, fetchModels } from "./diagnostics.js";
@@ -57,6 +57,10 @@ async function serverCommand(command: string | undefined, argv: string[]): Promi
     const scheduler = new TaskScheduler(store, executor, new CommandValidatorAdapter(), {
       concurrency: Number(process.env.MYCLAUDE_CONCURRENCY || 1),
       executionProfile,
+      allowedWorkspaceRoots: (process.env.MYCLAUDE_ALLOWED_WORKSPACE_ROOTS ?? "")
+        .split(delimiter)
+        .map((entry) => entry.trim())
+        .filter(Boolean),
     });
     const daemon = new OrchestratorDaemon({ socketPath, store, scheduler });
     const shutdown = () => void daemon.close();

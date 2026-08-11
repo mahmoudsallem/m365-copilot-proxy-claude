@@ -28,6 +28,7 @@ describe("automatic CLI workflow", () => {
           sessionId: "planner-session",
           artifact: {
             schemaVersion: "myclaude.review/v1", taskId: plan.taskId, reviewer: { provider: "claude", sessionId: "planner-session" },
+            binding: { attemptId: "d7424f0b-0000-4000-8000-000000000001", planSha256: "a".repeat(64), evidenceSha256: "b".repeat(64) },
             verdict: requestChanges ? "request_changes" : "approve", summary: requestChanges ? "repair" : "verified", findings: [],
             repairInstructions: requestChanges ? ["fix it"] : [], createdAt: new Date().toISOString(),
           },

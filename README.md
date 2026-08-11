@@ -17,8 +17,12 @@ protocol into OpenAI and Anthropic-compatible localhost APIs with agent tool sup
 
 M365 Copilot uses a SignalR WebSocket protocol, not the OpenAI API. This project translates between the two:
 
-1. **Standalone proxy** — HTTP server with `/v1/chat/completions` and `/v1/models` endpoints. Works with any OpenAI-compatible client (pi, OpenClaw, etc.).
-2. **OpenClaw plugin** — Config generator + setup CLI for OpenClaw's provider system.
+1. **Standalone proxy** — HTTP server with OpenAI- and Anthropic-compatible endpoints.
+2. **Verified MyClaude executor** — Claude Code's terminal UI backed by M365, with
+   evidence hooks and deterministic validation instead of trusting a model's “done”.
+3. **Task orchestrator** — durable plans, a bounded execution/review/repair queue, a
+   TypeScript SDK, and a narrow local MCP server for direct Claude and Codex.
+4. **OpenClaw plugin** — Config generator + setup CLI for OpenClaw's provider system.
 
 ### Tool calling
 
@@ -59,7 +63,8 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
 ```
 @m365-copilot/core          — Shared: auth, WebSocket client, tool formatting, proxy server, agent management, session
 ├── @m365-copilot/proxy     — Standalone HTTP proxy binary
-└── @m365-copilot/openclaw-plugin  — OpenClaw config generator + setup CLI + skill
+├── @m365-copilot/orchestrator — Durable tasks, SDK, daemon, MCP, planner adapters
+└── @m365-copilot/openclaw-plugin — OpenClaw config generator + setup CLI + skill
 ```
 
 ## One-click Linux setup
@@ -68,6 +73,7 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
 
 - 64-bit Linux with Bash
 - `npm`, `curl`, and Git (Git is unnecessary when using a downloaded archive)
+- `bubblewrap` (`bwrap`) for isolated deterministic validation in durable tasks
 - An eligible Microsoft 365 work or university account with Copilot Chat access
 - A Chromium-based browser for the recommended interactive sign-in
 - Claude Code, only if you want to use the Claude terminal interface
@@ -87,8 +93,8 @@ cd m365-copilot-proxy
 ./install.sh
 ./login.sh
 ./start-proxy.sh
-./connect-claude.sh
-claude
+myclaude                      # M365-backed executor
+claude                        # unchanged: direct Anthropic Claude
 ```
 
 If an extracted archive lost executable permissions, use `bash install.sh`,
@@ -105,8 +111,13 @@ If an extracted archive lost executable permissions, use `bash install.sh`,
 | `start-proxy.sh` | Start the proxy in the background and verify its health |
 | `stop-proxy.sh` | Stop only the proxy process managed by this installation |
 | `proxy-status.sh` | Show proxy health, PID, configuration, log, and Claude mode |
-| `connect-claude.sh` | Make plain `claude` use M365; preserve the original executable |
-| `disconnect-claude.sh` | Restore normal Anthropic Claude exactly |
+| `install-myclaude.sh` | Install `myclaude` without replacing normal `claude` |
+| `remove-myclaude.sh` | Remove only the managed `myclaude` launcher |
+| `start-myclaude-server.sh` | Start the durable task orchestrator |
+| `stop-myclaude-server.sh` | Stop the task orchestrator |
+| `myclaude-status.sh` | Show task-orchestrator status |
+| `connect-claude.sh` | Migrate an older install that replaced `claude` to the split commands |
+| `disconnect-claude.sh` | Restore `claude` from a legacy managed wrapper |
 | `doctor.sh` | Diagnose dependencies, login state, proxy health, and Claude mode |
 | `uninstall.sh` | Remove launchers while preserving login data by default |
 
@@ -119,8 +130,11 @@ m365-copilot start
 m365-copilot status
 m365-copilot models
 m365-copilot logs --follow
-m365-copilot connect-claude
-m365-copilot disconnect-claude
+myclaude doctor
+myclaude server start
+myclaude integrate add claude
+myclaude integrate add codex
+myclaude integrate status claude
 ```
 
 ### Sign in safely
@@ -157,34 +171,88 @@ The manager records an exact PID and refuses to kill an unrelated process. Runti
 The read-only model catalog can be opened at `http://127.0.0.1:4141/v1/models`.
 All model-consuming endpoints require the generated local bearer key.
 
-### Connect and disconnect Claude Code
+### Direct Claude and proxied MyClaude stay separate
 
-Connection is reversible. `connect-claude.sh` preserves the currently resolved Claude
-executable and installs a small wrapper at `~/.local/bin/claude`. It does not overwrite
-Claude's subscription credentials. It also installs `claude-direct`, which bypasses M365
-without disconnecting:
+Installation never replaces the ordinary `claude` command:
 
 ```bash
-m365-copilot connect-claude
-m365-copilot start
-
-claude                         # M365-backed Claude Code interface
-MODEL=quick claude             # faster M365 model
-MODEL=gpt-5.5-think-deeper claude
-claude-direct                  # original Anthropic provider
-
-m365-copilot disconnect-claude # restore normal `claude`
+claude                            # direct Anthropic/Claude subscription
+myclaude                          # M365-backed Claude Code interface
+MODEL=quick myclaude              # select an M365 route for one session
+MODEL=gpt-5.5-think-deeper myclaude
 ```
 
-Claude Code 2.1.129 or newer discovers all 21 proxy models in `/model`; entries use the
-real M365 IDs and are marked `From gateway`. The connector filters ordinary Anthropic
-subscription choices from the proxied picker and pins Claude Code's unavoidable `Default`
-entry to `MODEL` (or `gpt-5.5-think-deeper`). This changes only the connected wrapper;
-`claude-direct` still shows and uses the normal Anthropic catalog.
+Claude Code 2.1.129 or newer discovers all 21 M365 route IDs in `/model`. The catalog
+labels each route with its measured certification status; a route name is not proof that
+Microsoft served that vendor/model. In particular, `claude-opus` is disabled from
+automatic routing because the historical probe failed 3/3 times.
 
-The wrapper intentionally exposes only `Bash`, `Read`, `Edit`, `Write`, `Glob`, and
-`Grep`. Larger tool schemas frequently trigger M365's content filter. Treat every command
-as untrusted: keep Claude permissions enabled, inspect diffs, and run tests before commits.
+The interactive wrapper intentionally exposes only `Bash`, `Read`, `Edit`, `Write`,
+`Glob`, and `Grep`. A random `X-M365-Session-ID` keeps each Claude Code session isolated.
+Larger tool schemas remain avoided because they can trigger M365's content filter.
+
+### Planner → executor → reviewer tasks
+
+The task orchestrator stores immutable `myclaude.plan/v1` artifacts and accepts plans
+from direct Claude, Codex, or a file. It executes through `myclaude`, runs declared
+validation, and requests a structured review only when the adaptive policy requires it:
+
+```bash
+myclaude server start
+myclaude task start --planner codex --workspace "$PWD" --task "Fix the failing tests"
+myclaude task status <task-id> --watch
+myclaude task evidence <task-id>
+
+# Allow direct Claude or Codex to create/start tasks and inspect evidence via MCP.
+myclaude integrate add claude
+myclaude integrate add codex
+myclaude integrate status claude
+```
+
+`task start` prints the durable run ID to stderr immediately, then reserves stdout
+for its final machine-readable JSON result. The remaining lifecycle commands are:
+
+```bash
+myclaude task submit /absolute/plan.json
+myclaude task list
+myclaude task resume <task-id>
+myclaude task review <task-id> --reviewer claude
+myclaude task cancel <task-id>
+myclaude server pause
+myclaude server resume
+```
+
+Task state is private under `~/.local/state/m365-copilot-proxy/tasks/`. Plans are
+checksummed and immutable; commands, exit codes, diffs, validation, reviews, and failures
+are recorded in a redacted, hash-linked evidence stream. MCP exposes task lifecycle
+operations, not a raw shell or credentials.
+
+External validators use a deliberately narrow command language and are spawned
+without a shell. They run with a scrubbed environment and no network inside
+Bubblewrap against a disposable copy of the post-execution tree; the real checkout
+is fingerprinted before and after validation and cannot be marked passed if it
+changes. Accepted families cover test/lint/build/typecheck commands for
+pnpm, npm, yarn, and bun; `npx --no-install` with common local validators; Cargo,
+Go, pytest, and .NET tests. Pipes, chaining, redirection, substitutions, network
+URLs, installs, publishing, output paths, and destructive commands are rejected
+before a task is queued.
+
+The daemon canonicalizes workspaces, rejects whole-host and credential/state roots,
+and leases equal or nested workspaces to one task at a time. Set
+`MYCLAUDE_ALLOWED_WORKSPACE_ROOTS` to an OS-path-delimited allowlist when running a
+shared daemon. Max-output responses are checkpointed and resumed in the same proxy
+session up to three times; an unrecovered truncation becomes `partial`, never
+`passed`. Reviews are bound to the exact plan, execution attempt, and evidence
+digest, and self-declared human approvals cannot promote a run.
+
+Proxy turns append a redacted mode-0600 JSONL record under
+`~/.local/state/m365-copilot-proxy/telemetry.jsonl`. It contains route, recovery,
+throttle, latency, tool-count, and terminal-outcome metadata—not prompts,
+responses, credentials, raw session IDs, or source excerpts.
+
+The distributed default is the guarded profile. `host-unrestricted` removes the command
+approval boundary and therefore cannot protect other files or credentials accessible to
+your Unix account; use it only as an explicit local opt-in.
 
 ### Other clients
 
@@ -215,11 +283,11 @@ Run `m365-copilot doctor` first. Common cases:
 - **Empty response / `Disengaged`** — do not retry rapidly. Large prompts, large tool
   payloads, or account-level throttling can cause empty replies. Wait, then continue one
   conversation rather than opening many new ones.
-- **`Both ANTHROPIC_AUTH_TOKEN and apiKeyHelper set`** — reconnect once with
-  `m365-copilot connect-claude`; it safely removes legacy localhost proxy fields while
-  backing up the prior Claude settings.
-- **Return to paid/normal Claude immediately** — run `claude-direct`, or permanently run
-  `m365-copilot disconnect-claude`.
+- **`Both ANTHROPIC_AUTH_TOKEN and apiKeyHelper set`** — run the one-time legacy
+  migration `m365-copilot connect-claude`; it removes only stale localhost proxy fields,
+  backs up the settings, and leaves `claude` direct.
+- **Use paid/normal Claude** — run `claude`. Provider switching is explicit; MyClaude
+  never silently falls back to Anthropic.
 
 ### Uninstall
 
@@ -237,29 +305,31 @@ and `.runtime/` remain until you delete that exact folder yourself.
 
 | Model ID | M365 Tone | Description |
 |---|---|---|
-| `gpt-5.5-think-deeper` | Gpt_5_5_Reasoning | **Recommended default for agents/tool-calling** — robust tool compliance |
+| `gpt-5.5-think-deeper` | Gpt_5_5_Reasoning | Experimental candidate; promising evidence, not production-certified |
 | `gpt-5.5` / `gpt-5.5-quick` | Gpt_5_5_Chat | GPT-5.5 fast |
 | `m365-copilot` / `auto` | magic | Auto-routing — high-variance at tool-calling (confabulates; see below) |
 | `quick` | Gpt_Quick | Fast responses |
 | `think-deeper` | Gpt_Reasoning | Slower, more thorough |
-| `claude` / `claude-sonnet` | Claude_Sonnet | Real Anthropic Claude (agent-less path) |
+| `claude` / `claude-sonnet` | Claude_Sonnet | Agent-less Claude-labelled route; identity is self-reported, not guaranteed |
 | `claude-sonnet-think-deeper` | Claude_Sonnet_Reasoning | Claude reasoning |
 | `gpt-5.4` / `gpt-5.4-quick` | Gpt_5_4_* | GPT-5.4 |
 | `gpt-5.3` / `gpt-5.3-think-deeper` | Gpt_5_3_* | GPT-5.3 |
 | `gpt-5.2` / `gpt-5.2-think-deeper` | Gpt_5_2_* | GPT-5.2 |
 
-> ✅ **For tool calling, use `gpt-5.5-think-deeper` (the default when no model is sent).**
-> The current agent + fenced/shell-routing path makes this reasoning tone robust —
-> 100% compliance and solve across prompt/toolset sizes on the bench (docs/hypotheses.md
-> §12.10/§12.11). The **default `m365-copilot` (magic) tone is *not* reliable** for
-> tools — it confabulates ("I no longer have access to the filesystem tools") and solves
-> ~0% of real tasks (§12.11); a proxy request with no `model` field already defaults to
-> `gpt-5.5-think-deeper` for this reason.
+> Model labels are routing handles, not guarantees. Historical easy-task results and a
+> promising n=1 matrix are insufficient for production certification. Run the verified
+> evaluation catalog and inspect `myclaude models --all` before changing the automatic
+> route. A completed task additionally requires deterministic evidence; model prose is
+> never treated as proof.
 >
 > ⚠️ The **older** reasoning tones (`gpt-5.2`/`gpt-5.3`/`gpt-5.4` `*-think-deeper`, bare
 > `think-deeper`) route through M365's `DeepLeo` pipeline, which meta-analyzes the
 > injected prompt and can disengage from tools. Prefer `gpt-5.5-think-deeper`.
 > See [docs/m365-copilot-api.md](docs/m365-copilot-api.md) §5/§10.
+
+The complete hooks/evidence contract, agent-less grounded research command, service
+helper, 37-task evaluation catalog, certification thresholds, and shadow-promotion
+rules are documented in [MyClaude verified execution](docs/myclaude-verified.md).
 
 ## Image generation
 

@@ -187,9 +187,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now myclauded.service
 ```
 
-The helper only writes/removes its exact managed unit and does not run systemd
-commands automatically. `status` validates the unit digest; `remove` refuses to
-delete a locally modified unit and prints the explicit deactivation command.
+The low-level helper only writes/removes its exact managed unit. The public
+`install.sh`, `myclaude server start|stop|restart|status`, and `uninstall.sh`
+commands manage `systemctl --user` when it is available and use a PID-verified
+detached fallback otherwise. `status` validates the unit digest; uninstall will
+not stop or delete a locally modified unit. Profile changes are locked
+transactions: active work causes a refusal, and an idle daemon is restarted with
+rollback if hook installation fails.
 
 ## Certification catalog and promotion gates
 
@@ -268,14 +272,23 @@ The defaults invoke `myclaude` and `claude` in non-interactive JSON mode.
 options support controlled wrapper adapters. The runner sends the task prompt on
 stdin and exports `MYCLAUDE_EVAL_REQUEST`, pointing to a private
 `myclaude.eval-adapter-request/v1` file with the complete task/fault contract.
-A wrapper may return structured fields such as `trace`, `faultEvents`,
-`deniedTools`, `sourceIds`, and `ungroundedUrls`; they are captured in the row.
+A wrapper may return structured fields such as `trace`, `faultEvents`, and
+`deniedTools`; the verifier captures the resulting diagnostic evidence.
+Research certification ignores adapter-reported `sourceIds`, `citedUrls`, and
+`ungroundedUrls`. The evaluator
+parses citations from the final answer and grounds them against the
+evaluator-owned `research-fixture.json` source ledger; every unknown source marker
+or URL is counted as fabricated even when the adapter claims otherwise.
 
 The stock Claude/MyClaude command itself does not inject synthetic
 command-not-found, stale-edit, forced-output, API, or daemon-restart faults.
 Fault-bearing tasks therefore fail closed unless a wrapper/hook actually reports
 the declared fault outcome in `faultEvents`. The runner never invents recovery
 evidence from a successful exit.
+
+Every adapter/verifier invocation owns a process group. A timeout terminates and
+then force-kills the full tree before the next row starts; a timed-out Docker
+verifier is also removed by its exact random container name.
 
 Objective command verifiers run in Docker with `--network none`, a read-only
 fixture mount, dropped capabilities, and no-new-privileges whenever the selected
@@ -284,7 +297,12 @@ fails closed if Docker/the image is unavailable; local verifier execution is
 allowed only for offline mock runs (and explicitly non-certifying workflows).
 This isolates the verifier, not the command adapter itself: a live Claude process
 still has the permissions of the invoking Unix user unless it is separately
-sandboxed.
+sandboxed. Rows now record `agentIsolation` and `verifierIsolation` separately.
+The built-in command adapter records `agentIsolation=host`, refuses the explicit
+unsafe-prompt cases, and therefore **cannot satisfy the promotion gate**. A future
+or external adapter must run the agent itself in a disposable isolated environment
+with brokered credentials and report `agentIsolation=docker`; Docker-verifying only
+the result is deliberately insufficient.
 
 The runner records `myclaude.eval-results/v1`; the analyzer never trusts a
 claimed completion unless `status=passed` and `verifierPassed=true`:
@@ -311,7 +329,9 @@ claimed completion unless `status=passed` and `verifierPassed=true`:
       "malformedToolCalls": 0,
       "fabricatedCitations": 0,
       "silentFalseSuccess": false,
-      "unrecoveredUpstreamFailure": false
+      "unrecoveredUpstreamFailure": false,
+      "agentIsolation": "docker",
+      "verifierIsolation": "docker"
     }
   ]
 }
@@ -327,7 +347,7 @@ node scripts/bench/verified-analyze.mjs \
 ```
 
 Certification is denied unless all plan gates pass: green local tests, complete
-catalog coverage, five repetitions of every critical task, at least 95% verified
+catalog coverage, five passing repetitions and zero failed repetitions for every critical task, at least 95% verified
 completion, at least 90% of direct Claude's rate, zero silent false-successes in
 at least 150 runs, under 1% malformed tools, zero fabricated citations, and no
 more than 2.5x adaptive message cost. Shadow promotion requires 100 tasks or

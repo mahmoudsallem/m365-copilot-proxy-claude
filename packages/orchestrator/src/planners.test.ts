@@ -2,6 +2,8 @@ import { writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { ClaudePlannerAdapter, CodexPlannerAdapter } from "./planners.js";
 import type { ProcessRequest, ProcessResult, ProcessRunner } from "./runner.js";
+import { makePlan } from "./test-helpers.js";
+import { sha256 } from "./util.js";
 
 const seed = {
   taskId: "fb8ab233-a07f-4fb0-8361-f434670461a4",
@@ -59,6 +61,29 @@ describe("planner adapters", () => {
     expect(request.args).toContain("read-only");
     expect(request.args).toContain("--output-schema");
     expect(request.args.at(-1)).toBe("-");
+  });
+
+  it("binds structured reviews to the exact attempt and evidence instead of trusting model metadata", async () => {
+    const runner: ProcessRunner = { async run() {
+      return result(JSON.stringify({ structured_output: {
+        verdict: "approve", summary: "verified", findings: [], repairInstructions: [],
+        binding: { attemptId: "00000000-0000-4000-8000-000000000000", planSha256: "0".repeat(64), evidenceSha256: "0".repeat(64) },
+      } }));
+    } };
+    const plan = makePlan();
+    const evidence = {
+      taskId: plan.taskId,
+      state: "reviewing" as const,
+      attemptId: "d7424f0b-0000-4000-8000-000000000003",
+      planSha256: sha256(plan),
+      validation: [], reviews: [], unresolvedRisks: [],
+    };
+    const reviewed = await new ClaudePlannerAdapter(runner).review({ plan, evidence });
+    expect(reviewed.artifact.binding).toMatchObject({
+      attemptId: evidence.attemptId,
+      planSha256: evidence.planSha256,
+    });
+    expect(reviewed.artifact.binding.evidenceSha256).not.toBe("0".repeat(64));
   });
 });
 

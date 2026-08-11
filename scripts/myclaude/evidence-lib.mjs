@@ -11,6 +11,7 @@ const SECRET_TEXT_PATTERNS = [
   [/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [REDACTED]"],
   [/\b(?:sk|gh[opusr]|github_pat)_[A-Za-z0-9_\-]{12,}\b/g, "[REDACTED]"],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]"],
+  [/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi, "[REDACTED]"],
   [/((?:api[_-]?key|authorization|cookie|mfa|password|secret|token)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]"],
 ];
 

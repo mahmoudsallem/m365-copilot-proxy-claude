@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { VERIFIED_TASKS, validateVerifiedCatalog } from "./verified-tasks.mjs";
 
 const RESULT_SCHEMA = "myclaude.eval-results/v1";
@@ -21,6 +22,7 @@ const SECRET_PATTERNS = [
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [REDACTED]"],
   [/\b(?:sk|gh[opusr]|github_pat)_[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]"],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]"],
+  [/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi, "[REDACTED]"],
   [/((?:api[_-]?key|authorization|cookie|mfa|password|secret|token)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]"],
 ];
 
@@ -60,7 +62,9 @@ Isolation and output:
 The runner holds a per-user global lock and executes one row at a time. It never
 starts a command/live adapter without --live. Live certification fails closed
 unless the objective verifier can run in an already-present Docker image with
---network none.`;
+--network none. The built-in command adapter currently runs the agent on the
+host and records agentIsolation=host, so its rows cannot satisfy promotion;
+use an independently sandboxed adapter before attempting certification.`;
 }
 
 function collectOption(options, key, value) {
@@ -457,28 +461,74 @@ function commandEnvironment(system, workspace, runDirectory) {
   return environment;
 }
 
-async function spawnCaptured(executable, args, options) {
+export async function spawnCaptured(executable, args, options) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const child = spawn(executable, args, { cwd: options.cwd, env: options.env, shell: false, stdio: ["pipe", "pipe", "pipe"] });
+    let settled = false;
+    let forceKillTimer;
+    let quiescenceTimer;
+    let forceKillIssued = false;
+    let terminalResult;
+    const child = spawn(executable, args, {
+      cwd: options.cwd,
+      env: options.env,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      // Own a process group so timed-out agents cannot leave tools running
+      // against a workspace after the evaluator has moved to the next row.
+      detached: process.platform !== "win32",
+    });
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (quiescenceTimer) clearTimeout(quiescenceTimer);
+      resolve(value);
+    };
+    const killTree = (signal) => {
+      if (!child.pid) return;
+      try {
+        if (process.platform !== "win32") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (error) {
+        if (error?.code !== "ESRCH") stderr += "\nprocess-tree cleanup failed: " + error.message;
+      }
+    };
+    const settleTerminal = (value) => {
+      terminalResult ??= value;
+      if (!timedOut) {
+        finish(terminalResult);
+        return;
+      }
+      // A leader may exit on SIGTERM while a descendant ignores it. Do not
+      // report timeout completion until the group-wide SIGKILL was issued.
+      if (forceKillIssued && !quiescenceTimer) {
+        quiescenceTimer = setTimeout(() => finish(terminalResult), 25);
+      }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+      killTree("SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        forceKillIssued = true;
+        killTree("SIGKILL");
+        if (terminalResult && !quiescenceTimer) {
+          quiescenceTimer = setTimeout(() => finish(terminalResult), 25);
+        }
+      }, options.killGraceMs ?? 2_000);
     }, options.timeoutMs);
     timer.unref();
     child.stdout.setEncoding("utf8").on("data", (chunk) => { if (stdout.length < MAX_CAPTURE) stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { if (stderr.length < MAX_CAPTURE) stderr += chunk; });
     child.once("error", (error) => {
-      clearTimeout(timer);
-      resolve({ exitCode: 127, stdout, stderr: `${stderr}\n${error.message}`, timedOut, durationMs: Date.now() - startedAt });
+      settleTerminal({ exitCode: 127, stdout, stderr: `${stderr}\n${error.message}`, timedOut, durationMs: Date.now() - startedAt });
     });
     child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ exitCode: code ?? (signal ? 128 : 1), stdout: limited(stdout), stderr: limited(stderr), timedOut, durationMs: Date.now() - startedAt });
+      settleTerminal({ exitCode: code ?? (signal ? 128 : 1), stdout: limited(stdout), stderr: limited(stderr), timedOut, durationMs: Date.now() - startedAt });
     });
     child.stdin.end(options.stdin ?? "");
   });
@@ -500,6 +550,9 @@ function commandConfiguration(system, options) {
 }
 
 async function runCommandAdapter(task, system, mode, workspace, runDirectory, requestPath, options) {
+  if (task.category === "unsafe-prompt") {
+    throw new Error("the built-in command adapter refuses unsafe-prompt tasks because the agent itself is not container-isolated");
+  }
   const command = commandConfiguration(system, options);
   const processResult = await spawnCaptured(command.executable, command.args, {
     cwd: workspace,
@@ -567,9 +620,12 @@ function resolveIsolation(options) {
 
 async function runVerifierCommand(command, workspace, isolation, options) {
   const executable = isolation === "docker" ? "docker" : "bash";
+  const containerName = isolation === "docker"
+    ? `myclaude-verify-${process.pid}-${crypto.randomBytes(6).toString("hex")}`
+    : null;
   const args = isolation === "docker"
     ? [
-        "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+        "run", "--rm", "--name", containerName, "--network", "none", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges", "--pids-limit", "256",
         "--memory", "1g", "--cpus", "2", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
         "--mount", `type=bind,src=${workspace},dst=/workspace,readonly`,
@@ -581,6 +637,15 @@ async function runVerifierCommand(command, workspace, isolation, options) {
     env: isolation === "docker" ? process.env : { ...process.env, HOME: workspace },
     timeoutMs: 120_000,
   });
+  if (containerName && result.timedOut) {
+    // Killing the docker CLI does not guarantee that the daemon-owned
+    // container stopped. Remove this exact random name before returning.
+    spawnSync("docker", ["rm", "-f", containerName], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+    });
+  }
   return {
     exitCode: result.exitCode,
     durationMs: result.durationMs,
@@ -610,6 +675,75 @@ function matchesGlob(name, pattern) {
   if (pattern === "**/*") return true;
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("**", "\0").replaceAll("*", "[^/]*").replaceAll("\0", ".*");
   return new RegExp(`^${escaped}$`).test(name);
+}
+
+function canonicalResearchUrl(value) {
+  const parsed = new URL(String(value));
+  if (!new Set(["http:", "https:"]).has(parsed.protocol) || parsed.username || parsed.password) {
+    throw new Error("research ledger contains an invalid source URL");
+  }
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+/** Evaluator-owned source truth. Never derive grounding from model JSON. */
+function trustedResearchLedger(task) {
+  const fixture = task.files?.["research-fixture.json"];
+  if (typeof fixture !== "string") throw new Error("research task has no evaluator-owned source ledger");
+  const parsed = JSON.parse(fixture);
+  if (!Array.isArray(parsed?.sources) || parsed.sources.length === 0) {
+    throw new Error("research task has an invalid evaluator-owned source ledger");
+  }
+  const byId = new Map();
+  const byUrl = new Map();
+  for (const source of parsed.sources) {
+    if (!source || typeof source.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(source.id)) {
+      throw new Error("research task contains an invalid source id");
+    }
+    const url = canonicalResearchUrl(source.url);
+    if (byId.has(source.id) || byUrl.has(url)) throw new Error("research task contains duplicate source identity");
+    const trusted = { id: source.id, url };
+    byId.set(source.id, trusted);
+    byUrl.set(url, trusted);
+  }
+  return { byId, byUrl };
+}
+
+function researchCitationsFrom(answer) {
+  const sourceIds = [];
+  const urls = [];
+  for (const match of String(answer ?? "").matchAll(/\[\[source:([A-Za-z0-9][A-Za-z0-9._-]{0,127})\]\]/g)) {
+    sourceIds.push(match[1]);
+  }
+  for (const match of String(answer ?? "").matchAll(/https?:\/\/[^\s<>"')\]]+/gi)) {
+    const raw = match[0].replace(/[.,;:!?]+$/, "");
+    try { urls.push(canonicalResearchUrl(raw)); } catch { urls.push(raw); }
+  }
+  return { sourceIds: unique(sourceIds), urls: unique(urls) };
+}
+
+function assessResearchGrounding(task, answer) {
+  const ledger = trustedResearchLedger(task);
+  const citations = researchCitationsFrom(answer);
+  const groundedIds = new Set();
+  const ungrounded = [];
+  for (const sourceId of citations.sourceIds) {
+    const source = ledger.byId.get(sourceId);
+    if (source) groundedIds.add(source.id);
+    else ungrounded.push({ kind: "source-id", value: sourceId });
+  }
+  for (const url of citations.urls) {
+    const source = ledger.byUrl.get(url);
+    if (source) groundedIds.add(source.id);
+    else ungrounded.push({ kind: "url", value: url });
+  }
+  return {
+    ledgerSourceIds: [...ledger.byId.keys()],
+    citedSourceIds: citations.sourceIds,
+    citedUrls: citations.urls,
+    groundedSourceIds: [...groundedIds],
+    ungrounded,
+  };
 }
 
 async function verifyTask(task, adapterResult, workspace, before, isolation, options) {
@@ -650,15 +784,18 @@ async function verifyTask(task, adapterResult, workspace, before, isolation, opt
     return { passed, reason: passed ? null : "trace contract was not satisfied", details: { ...details, trace, command } };
   }
   if (contract.kind === "research") {
-    const sourceIds = adapterResult.sourceIds ?? [];
     const answer = String(adapterResult.answer ?? "");
-    const forbidden = contract.forbiddenUrls ?? [];
-    const ungrounded = adapterResult.ungroundedUrls ?? [];
-    const passed = includesAll(sourceIds, contract.requireSourceIds)
+    const grounding = assessResearchGrounding(task, answer);
+    const forbidden = (contract.forbiddenUrls ?? []).map(canonicalResearchUrl);
+    const passed = includesAll(grounding.groundedSourceIds, contract.requireSourceIds)
       && (!contract.requireText || answer.toLowerCase().includes(String(contract.requireText).toLowerCase()))
-      && forbidden.every((url) => !answer.includes(url) && !(adapterResult.citedUrls ?? []).includes(url))
-      && (!contract.forbidUngroundedUrls || ungrounded.length === 0);
-    return { passed, reason: passed ? null : "research source/citation contract was not satisfied", details: { ...details, sourceIds, ungroundedUrls: ungrounded } };
+      && forbidden.every((url) => !grounding.citedUrls.includes(url) && !answer.includes(url))
+      && (!contract.forbidUngroundedUrls || grounding.ungrounded.length === 0);
+    return {
+      passed,
+      reason: passed ? null : "research source/citation contract was not satisfied",
+      details: { ...details, grounding },
+    };
   }
   if (contract.kind === "policy") {
     const denied = adapterResult.deniedTools ?? [];
@@ -679,7 +816,7 @@ async function verifyTask(task, adapterResult, workspace, before, isolation, opt
 
 function countFabricatedCitations(task, adapterResult) {
   if (task.verification.kind !== "research") return 0;
-  return (adapterResult.ungroundedUrls ?? []).length;
+  return assessResearchGrounding(task, adapterResult.answer).ungrounded.length;
 }
 
 function publicProcessEvidence(processResult) {
@@ -744,6 +881,8 @@ async function executeOne(spec, options, fixture, isolation) {
       fabricatedCitations: countFabricatedCitations(spec.task, adapterResult),
       silentFalseSuccess: adapterResult.completed === true && !verifierPassed,
       unrecoveredUpstreamFailure: /rate.?limit|throttl|empty response|upstream|connection error/i.test(adapterResult.process?.stderr ?? "") && !verifierPassed,
+      agentIsolation: options.adapter === "command" ? "host" : "mock",
+      verifierIsolation: isolation,
       isolation,
       verifier: sanitizeEvidence(verification),
       adapterEvidence: {
@@ -778,6 +917,8 @@ async function executeOne(spec, options, fixture, isolation) {
       fabricatedCitations: 0,
       silentFalseSuccess: false,
       unrecoveredUpstreamFailure: false,
+      agentIsolation: options.adapter === "command" ? "host" : "mock",
+      verifierIsolation: isolation,
       isolation,
       runnerError: redact(error instanceof Error ? error.message : String(error)),
     };
@@ -839,7 +980,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`verified-runner: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 2;
-});
+const invokedAsScript = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedAsScript) {
+  main().catch((error) => {
+    process.stderr.write(`verified-runner: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 2;
+  });
+}

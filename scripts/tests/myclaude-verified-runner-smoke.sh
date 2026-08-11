@@ -102,4 +102,22 @@ node -e '
   if(!row.verifierPassed||row.status!=="passed"||row.verifier?.details?.attemptedPaths?.[0]!=="/tmp/myclaude-escape.txt")process.exit(1);
 ' "$POLICY_RESULTS"
 
+RESEARCH_RESULTS="$TEST_ROOT/research-results.json"
+node "$ROOT/scripts/bench/verified-runner.mjs" \
+  --output "$RESEARCH_RESULTS" --system myclaude --adapter mock \
+  --mock-fixture "$ROOT/scripts/tests/fixtures/myclaude-eval-research-adversarial.json" \
+  --task research-current-primary --mode adaptive --mode standard \
+  --seed research-grounding-smoke --isolation local >/dev/null
+node -e '
+  const fs=require("fs");const body=fs.readFileSync(process.argv[1],"utf8");const value=JSON.parse(body);
+  const valid=value.runs.find(row=>row.mode==="adaptive");
+  const forged=value.runs.find(row=>row.mode==="standard");
+  if(!valid?.verifierPassed||valid.fabricatedCitations!==0)process.exit(1);
+  if(forged?.verifierPassed||forged?.fabricatedCitations!==1)process.exit(1);
+  if(forged?.verifier?.details?.grounding?.ungrounded?.[0]?.value!=="https://invented.example/fake")process.exit(1);
+  if(body.includes("never-persist-this-material")||body.includes("BEGIN PRIVATE KEY"))process.exit(1);
+' "$RESEARCH_RESULTS"
+
+node "$ROOT/scripts/tests/myclaude-verified-runner-process-smoke.mjs"
+
 printf '%s\n' "myclaude verified runner smoke tests passed"

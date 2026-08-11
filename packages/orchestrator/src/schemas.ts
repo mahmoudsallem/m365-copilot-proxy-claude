@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
+import { sha256 } from "./util.js";
 
 export const TASK_STATES = [
   "draft",
@@ -136,6 +137,11 @@ export const MyClaudeReviewSchema = z.object({
     model: z.string().min(1).optional(),
     sessionId: z.string().min(1).optional(),
   }),
+  binding: z.object({
+    attemptId: z.string().uuid(),
+    planSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
   verdict: z.enum(["approve", "request_changes", "blocked"]),
   summary: z.string().min(1).max(50_000),
   findings: z.array(z.object({
@@ -172,11 +178,26 @@ export interface TaskRecord {
   cancellationRequested?: boolean;
 }
 
+/** Durable, cumulative executor budget accounting for one immutable task plan. */
+export interface ExecutionBudgetUsage {
+  /** First executor start; it never resets for repairs or daemon recovery. */
+  startedAt: string;
+  /** Derived from startedAt and the immutable plan timeout. */
+  deadlineAt: string;
+  turnsUsed: number;
+  messagesUsed: number;
+  /** Turn usage is isolated per initial/repair cycle to enforce each cycle cap. */
+  cycleTurns: Record<string, number>;
+}
+
 export interface ExecutionEvidence {
   taskId: string;
   state: TaskState;
+  attemptId?: string;
+  planSha256?: string;
   startedAt?: string;
   completedAt?: string;
+  budgetUsage?: ExecutionBudgetUsage;
   executor?: {
     exitCode: number;
     stdout: string;
@@ -186,8 +207,16 @@ export interface ExecutionEvidence {
     changedFiles: string[];
     upstreamSignals: Array<"throttle" | "empty-response">;
     sessionId?: string;
+    workspaceFingerprintBefore?: string;
+    workspaceFingerprintAfter?: string;
+    continuations?: number;
+    truncated?: boolean;
+    checkpointFiles?: string[];
   };
   executorSessionId?: string;
+  workspaceCanonicalPath?: string;
+  workspaceFingerprintBeforeValidation?: string;
+  workspaceFingerprintAfterValidation?: string;
   validation: Array<{
     command: string;
     exitCode: number;
@@ -225,6 +254,8 @@ export interface TaskEvent {
 const SENSITIVE_KEY = /(?:api[-_]?key|auth(?:orization)?|password|passwd|secret|token|credential|cookie)/i;
 const SENSITIVE_VALUE_PATTERNS = [
   /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi,
+  /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi,
   /\b(?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*["']?[^\s"',}]{4,}/gi,
   /\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{16,})\b/g,
 ];
@@ -275,6 +306,11 @@ export function redactArtifact(value: unknown, seen = new WeakMap<object, unknow
     object[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : redactArtifact(child, seen);
   }
   return object;
+}
+
+/** Stable digest used to bind a review to one exact execution attempt. */
+export function reviewEvidenceSha256(evidence: ExecutionEvidence): string {
+  return sha256(redactArtifact(evidence));
 }
 
 export function parsePlan(value: unknown): MyClaudePlan {

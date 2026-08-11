@@ -26,6 +26,10 @@ export interface ClientOptions {
   requestTimeoutMs?: number;
 }
 
+export interface ClientCallOptions {
+  signal?: AbortSignal;
+}
+
 export class MyClaudeClient {
   readonly socketPath: string;
   private readonly requestTimeoutMs: number;
@@ -47,8 +51,8 @@ export class MyClaudeClient {
     return this.call("task_start", { taskId });
   }
 
-  waitTask(taskId: string, timeoutMs = 30_000): Promise<TaskRecord> {
-    return this.call("task_wait", { taskId, timeoutMs });
+  waitTask(taskId: string, timeoutMs = 30_000, options: ClientCallOptions = {}): Promise<TaskRecord> {
+    return this.call("task_wait", { taskId, timeoutMs }, options);
   }
 
   getTask(taskId: string): Promise<TaskRecord> {
@@ -95,27 +99,59 @@ export class MyClaudeClient {
     }
   }
 
-  call<T>(method: string, params: unknown): Promise<T> {
+  call<T>(method: string, params: unknown, options: ClientCallOptions = {}): Promise<T> {
     const id = randomUUID();
     return new Promise<T>((resolve, reject) => {
       const socket = createConnection(this.socketPath);
       let body = "";
-      const timer = setTimeout(() => socket.destroy(new Error(`orchestrator RPC timed out: ${method}`)), this.requestTimeoutMs);
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener("abort", onAbort);
+      };
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const onAbort = () => {
+        const error = options.signal?.reason instanceof Error
+          ? options.signal.reason
+          : Object.assign(new Error(`orchestrator RPC cancelled: ${method}`), { name: "AbortError" });
+        socket.destroy();
+        fail(error);
+      };
+      const timer = setTimeout(() => {
+        const error = new Error(`orchestrator RPC timed out: ${method}`);
+        socket.destroy();
+        fail(error);
+      }, this.requestTimeoutMs);
       timer.unref();
       socket.setEncoding("utf8");
       socket.once("connect", () => socket.write(`${JSON.stringify({ id, method, params })}\n`));
       socket.on("data", (chunk: string) => { body += chunk; });
-      socket.once("error", (error) => { clearTimeout(timer); reject(error); });
+      socket.once("error", fail);
       socket.once("end", () => {
-        clearTimeout(timer);
+        if (settled) return;
         try {
           const response = JSON.parse(body) as { id: string; result?: T; error?: { message: string } };
-          if (response.error) reject(new Error(response.error.message));
-          else resolve(response.result as T);
+          if (response.error) {
+            fail(new Error(response.error.message));
+          } else {
+            settled = true;
+            cleanup();
+            resolve(response.result as T);
+          }
         } catch (error) {
-          reject(error);
+          fail(error);
         }
       });
+      if (options.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      options.signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 }

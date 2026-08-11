@@ -68,12 +68,20 @@ function certification(value) {
   const missingStandardTasks = [...supportedIds].filter((id) => !standardIds.has(id));
   const missingDirectTasks = [...supportedIds].filter((id) => !directIds.has(id));
   const insufficientCritical = VERIFIED_TASKS.filter((item) => item.critical).flatMap((item) => {
-    const repetitions = new Set(adaptive.filter((run) => run.taskId === item.id).map((run) => run.repetition));
-    return repetitions.size >= 5 ? [] : [{ taskId: item.id, repetitions: repetitions.size }];
+    const rows = adaptive.filter((run) => run.taskId === item.id);
+    const passingRepetitions = new Set(rows.filter(passed).map((run) => run.repetition));
+    const failedRepetitions = [...new Set(rows.filter((run) => !passed(run)).map((run) => run.repetition))];
+    return passingRepetitions.size >= 5 && failedRepetitions.length === 0
+      ? []
+      : [{ taskId: item.id, passingRepetitions: passingRepetitions.size, failedRepetitions }];
   });
   const insufficientDirectCritical = VERIFIED_TASKS.filter((item) => item.critical).flatMap((item) => {
-    const repetitions = new Set(direct.filter((run) => run.taskId === item.id).map((run) => run.repetition));
-    return repetitions.size >= 5 ? [] : [{ taskId: item.id, repetitions: repetitions.size }];
+    const rows = direct.filter((run) => run.taskId === item.id);
+    const passingRepetitions = new Set(rows.filter(passed).map((run) => run.repetition));
+    const failedRepetitions = [...new Set(rows.filter((run) => !passed(run)).map((run) => run.repetition))];
+    return passingRepetitions.size >= 5 && failedRepetitions.length === 0
+      ? []
+      : [{ taskId: item.id, passingRepetitions: passingRepetitions.size, failedRepetitions }];
   });
   const silentFalseSuccesses = adaptive.filter((run) => run.silentFalseSuccess === true
     || (run.status === "passed" && run.verifierPassed !== true)).length;
@@ -90,16 +98,18 @@ function certification(value) {
   const standardCost = average(standard, "messages");
   const costRatio = standardCost > 0 ? adaptiveCost / standardCost : Number.POSITIVE_INFINITY;
   const certificationRows = [...adaptive, ...standard, ...direct];
-  const nonLiveOrUnisolated = certificationRows.filter((run) => run.adapter !== "command" || run.isolation !== "docker");
+  const nonLiveOrUnisolated = certificationRows.filter((run) => run.adapter !== "command"
+    || run.agentIsolation !== "docker"
+    || (run.verifierIsolation ?? run.isolation) !== "docker");
   const gates = [
     gate("catalog-valid", validateVerifiedCatalog().valid, validateVerifiedCatalog().taskCount, ">=30 tasks and all required categories"),
     gate("unit-integration-green", Number(value.unitIntegrationFailures ?? -1) === 0, Number(value.unitIntegrationFailures ?? -1), "0 failures"),
     gate("sequential-randomized", value.execution?.sequential === true && value.execution?.randomized === true && value.execution?.maxConcurrent === 1, value.execution ?? null, "sequential=true, randomized=true, maxConcurrent=1"),
-    gate("live-isolated-evidence", certificationRows.length > 0 && nonLiveOrUnisolated.length === 0, { rows: certificationRows.length, rejectedRows: nonLiveOrUnisolated.length }, "every certification row uses adapter=command and isolation=docker"),
+    gate("live-isolated-evidence", certificationRows.length > 0 && nonLiveOrUnisolated.length === 0, { rows: certificationRows.length, rejectedRows: nonLiveOrUnisolated.length }, "every certification row uses adapter=command, agentIsolation=docker, and verifierIsolation=docker"),
     gate("catalog-coverage", missingTasks.length === 0, { covered: adaptiveIds.size, missingTasks }, `all ${VERIFIED_TASKS.length} tasks`),
-    gate("critical-repeat", insufficientCritical.length === 0, insufficientCritical, "at least 5 distinct repetitions for every critical task"),
+    gate("critical-repeat", insufficientCritical.length === 0, insufficientCritical, "at least 5 passing repetitions and zero failed repetitions for every critical MyClaude task"),
     gate("standard-coverage", missingStandardTasks.length === 0, { covered: standardIds.size, missingTasks: missingStandardTasks }, `all ${VERIFIED_TASKS.length} tasks`),
-    gate("reference-coverage", missingDirectTasks.length === 0 && insufficientDirectCritical.length === 0, { covered: directIds.size, missingTasks: missingDirectTasks, insufficientCritical: insufficientDirectCritical }, "all tasks and 5 repetitions for every critical task"),
+    gate("reference-coverage", missingDirectTasks.length === 0 && insufficientDirectCritical.length === 0, { covered: directIds.size, missingTasks: missingDirectTasks, insufficientCritical: insufficientDirectCritical }, "all tasks plus 5 passing and zero failed repetitions for every critical reference task"),
     gate("verified-completion", adaptiveRate >= 0.95, adaptiveRate, ">=0.95"),
     gate("direct-claude-relative", direct.length > 0 && relativeRate >= 0.90, { myclaude: adaptiveRate, directClaude: directRate, ratio: relativeRate, referenceRuns: direct.length }, ">=0.90 of direct Claude pass rate"),
     gate("silent-false-success", adaptive.length >= 150 && silentFalseSuccesses === 0, { runs: adaptive.length, silentFalseSuccesses }, ">=150 runs and 0 silent false-successes"),
@@ -125,9 +135,9 @@ function shadow(value) {
     || (run.status === "passed" && run.verifierPassed !== true)).length;
   const upstreamFailures = runs.filter((run) => run.unrecoveredUpstreamFailure === true).length;
   const upstreamFailureRate = runs.length ? upstreamFailures / runs.length : 1;
-  const nonLiveRows = runs.filter((run) => run.adapter !== "command");
+  const nonLiveRows = runs.filter((run) => run.adapter !== "command" || run.agentIsolation !== "docker");
   const gates = [
-    gate("shadow-live-evidence", runs.length > 0 && nonLiveRows.length === 0, { rows: runs.length, rejectedRows: nonLiveRows.length }, "every shadow row uses adapter=command"),
+    gate("shadow-live-evidence", runs.length > 0 && nonLiveRows.length === 0, { rows: runs.length, rejectedRows: nonLiveRows.length }, "every shadow row uses adapter=command and agentIsolation=docker"),
     gate("shadow-volume", runs.length >= 100 || durationDays >= 7, { runs: runs.length, durationDays }, ">=100 tasks or >=7 days"),
     gate("shadow-silent-false-success", silentFalseSuccesses === 0, silentFalseSuccesses, "0"),
     gate("shadow-upstream-recovery", runs.length > 0 && upstreamFailureRate < 0.05, { upstreamFailures, runs: runs.length, rate: upstreamFailureRate }, "<0.05"),

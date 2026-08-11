@@ -20,6 +20,10 @@ interface RpcResponse {
   error?: { code: number; message: string };
 }
 
+interface DispatchOptions {
+  signal?: AbortSignal;
+}
+
 export interface OrchestratorDaemonOptions {
   socketPath: string;
   store: TaskStore;
@@ -87,7 +91,7 @@ export class OrchestratorDaemon {
 
   waitClosed(): Promise<void> { return this.closedPromise; }
 
-  async dispatch(method: string, params: unknown = {}): Promise<unknown> {
+  async dispatch(method: string, params: unknown = {}, options: DispatchOptions = {}): Promise<unknown> {
     if (this.lifecycle !== "running") {
       throw Object.assign(new Error(`orchestrator daemon is ${this.lifecycle}; RPC is not available`), { rpcCode: -32002 });
     }
@@ -103,7 +107,11 @@ export class OrchestratorDaemon {
       case "task_start":
         return this.options.scheduler.enqueue(z.string().uuid().parse(object.taskId));
       case "task_wait":
-        return this.waitTask(z.string().uuid().parse(object.taskId), z.number().int().min(0).max(300_000).default(30_000).parse(object.timeoutMs));
+        return this.waitTask(
+          z.string().uuid().parse(object.taskId),
+          z.number().int().min(0).max(300_000).default(30_000).parse(object.timeoutMs),
+          options.signal,
+        );
       case "task_status":
         return this.options.store.getTask(z.string().uuid().parse(object.taskId));
       case "task_plan":
@@ -171,45 +179,71 @@ export class OrchestratorDaemon {
   private async respond(socket: Socket, line: string): Promise<void> {
     let request: RpcRequest | undefined;
     let response: RpcResponse;
+    const controller = new AbortController();
+    const abortOnDisconnect = () => controller.abort(new Error("orchestrator RPC client disconnected"));
+    socket.once("close", abortOnDisconnect);
     try {
       request = JSON.parse(line) as RpcRequest;
       if (request.id === undefined || typeof request.method !== "string") throw Object.assign(new Error("invalid RPC request"), { rpcCode: -32600 });
-      response = { id: request.id, result: await this.dispatch(request.method, request.params) };
+      response = { id: request.id, result: await this.dispatch(request.method, request.params, { signal: controller.signal }) };
     } catch (error) {
       response = {
         id: request?.id ?? null,
         error: { code: (error as { rpcCode?: number }).rpcCode ?? -32000, message: errorMessage(error) },
       };
+    } finally {
+      socket.removeListener("close", abortOnDisconnect);
     }
     socket.end(`${JSON.stringify(response)}\n`);
   }
 
-  private async waitTask(taskId: string, timeoutMs: number): Promise<unknown> {
+  private async waitTask(taskId: string, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) throw abortError(signal.reason);
     const initial = await this.options.store.getTask(taskId);
     if (TERMINAL_TASK_STATES.has(initial.state) || timeoutMs === 0) return initial;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(async () => {
+      let settledResult = false;
+      const finish = (operation: () => void) => {
+        if (settledResult) return;
+        settledResult = true;
         cleanup();
-        try { resolve(await this.options.store.getTask(taskId)); } catch (error) { reject(error); }
+        operation();
+      };
+      const timer = setTimeout(async () => {
+        try {
+          const task = await this.options.store.getTask(taskId);
+          finish(() => resolve(task));
+        } catch (error) {
+          finish(() => reject(error));
+        }
       }, timeoutMs);
       const settled = async (settledId: string) => {
         if (settledId !== taskId) return;
-        cleanup();
-        try { resolve(await this.options.store.getTask(taskId)); } catch (error) { reject(error); }
+        try {
+          const task = await this.options.store.getTask(taskId);
+          finish(() => resolve(task));
+        } catch (error) {
+          finish(() => reject(error));
+        }
       };
+      const onAbort = () => finish(() => reject(abortError(signal?.reason)));
       const cleanup = () => {
         clearTimeout(timer);
         this.options.scheduler.removeListener("settled", settled);
+        signal?.removeEventListener("abort", onAbort);
       };
       this.options.scheduler.on("settled", settled);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       void this.options.store.getTask(taskId).then((latest) => {
         if (TERMINAL_TASK_STATES.has(latest.state) || latest.state === "reviewing") {
-          cleanup();
-          resolve(latest);
+          finish(() => resolve(latest));
         }
       }, (error) => {
-        cleanup();
-        reject(error);
+        finish(() => reject(error));
       });
     });
   }
@@ -254,6 +288,11 @@ export class OrchestratorDaemon {
     for (const socket of this.connections) socket.destroy();
     await closing;
   }
+}
+
+function abortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  return Object.assign(new Error("orchestrator RPC cancelled"), { name: "AbortError" });
 }
 
 interface DaemonLockOwner {

@@ -178,6 +178,27 @@ describe("daemon and SDK", () => {
     await daemon.close();
   });
 
+  it("releases daemon task_wait listeners when the RPC client disconnects", async () => {
+    const root = await mkdtemp(join(tmpdir(), "myclaude-daemon-wait-cancel-test-"));
+    roots.push(root);
+    const socketPath = join(root, "daemon.sock");
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const store = new TaskStore(join(root, "state"));
+    const scheduler = new TaskScheduler(store, executor, validator);
+    const daemon = new OrchestratorDaemon({ socketPath, store, scheduler });
+    await daemon.start();
+    const client = new MyClaudeClient({ socketPath, requestTimeoutMs: 310_000 });
+    const task = await client.createTask({ objective: "Wait without executing", workspace });
+    const controller = new AbortController();
+    const waiting = client.waitTask(task.id, 300_000, { signal: controller.signal });
+    await vi.waitFor(() => expect(scheduler.listenerCount("settled")).toBe(1));
+    controller.abort(new Error("cancel test wait"));
+    await expect(waiting).rejects.toThrow("cancel test wait");
+    await vi.waitFor(() => expect(scheduler.listenerCount("settled")).toBe(0));
+    await daemon.close();
+  });
+
   it("recovers an interrupted executing task back into the queue", async () => {
     const root = await mkdtemp(join(tmpdir(), "myclaude-recovery-test-"));
     roots.push(root);
