@@ -1,11 +1,12 @@
-import { chmod, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { createServer, createConnection, type Server, type Socket } from "node:net";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { TaskStore } from "./store.js";
 import { TaskScheduler } from "./scheduler.js";
 import { parsePlan, parseReview, TERMINAL_TASK_STATES } from "./schemas.js";
-import { errorMessage, secureDirectory } from "./util.js";
+import { atomicWriteJson, errorMessage, secureDirectory } from "./util.js";
 
 interface RpcRequest {
   id: string | number;
@@ -28,6 +29,11 @@ export interface OrchestratorDaemonOptions {
 export class OrchestratorDaemon {
   private server?: Server;
   private shuttingDown = false;
+  private ownsSocket = false;
+  private daemonLock?: DaemonLock;
+  private readonly connections = new Set<Socket>();
+  private lifecycle: "idle" | "starting" | "running" | "closing" | "closed" = "idle";
+  private closeOperation?: Promise<void>;
   private readonly closedPromise: Promise<void>;
   private resolveClosed!: () => void;
 
@@ -36,41 +42,55 @@ export class OrchestratorDaemon {
   }
 
   async start(): Promise<void> {
-    await this.options.store.initialize();
-    await secureDirectory(dirname(this.options.socketPath));
-    await removeStaleSocket(this.options.socketPath);
-    this.server = createServer((socket) => this.handleSocket(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(this.options.socketPath, () => {
-        this.server!.removeListener("error", reject);
-        resolve();
-      });
-    });
-    await chmod(this.options.socketPath, 0o600);
-    await this.options.scheduler.recover();
+    if (this.lifecycle !== "idle") throw new Error(`orchestrator daemon cannot start while ${this.lifecycle}`);
+    this.lifecycle = "starting";
+    try {
+      await this.options.store.initialize();
+      this.daemonLock = await acquireDaemonLock(this.options.store.stateRoot, this.options.socketPath);
+      await this.options.store.reconcile();
+      await secureDirectory(dirname(this.options.socketPath));
+      await removeStaleSocket(this.options.socketPath);
+      this.server = createServer((socket) => this.handleSocket(socket));
+      await listenOnSocket(this.server, this.options.socketPath);
+      this.ownsSocket = true;
+      await chmod(this.options.socketPath, 0o600);
+      await this.options.scheduler.recover();
+      this.lifecycle = "running";
+    } catch (error) {
+      try {
+        await this.cleanupFailedStart();
+        this.lifecycle = "idle";
+      } catch (cleanupError) {
+        this.lifecycle = "closing";
+        throw new AggregateError([error, cleanupError], `daemon startup failed and cleanup was incomplete: ${errorMessage(error)}`);
+      }
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
-    if (this.shuttingDown) return;
-    this.shuttingDown = true;
-    try {
-      await this.options.scheduler.shutdown();
-      await new Promise<void>((resolve) => {
-        if (!this.server) return resolve();
-        this.server.close(() => resolve());
-      });
-      await rm(this.options.socketPath, { force: true });
+    if (this.lifecycle === "closed") return;
+    if (this.closeOperation) return this.closeOperation;
+    if (this.lifecycle === "starting") throw new Error("orchestrator daemon cannot close while it is starting");
+    if (this.lifecycle === "idle") {
+      this.lifecycle = "closed";
       this.resolveClosed();
-    } catch (error) {
-      this.shuttingDown = false;
-      throw error;
+      return;
+    }
+    this.closeOperation = this.performClose();
+    try {
+      await this.closeOperation;
+    } finally {
+      this.closeOperation = undefined;
     }
   }
 
   waitClosed(): Promise<void> { return this.closedPromise; }
 
   async dispatch(method: string, params: unknown = {}): Promise<unknown> {
+    if (this.lifecycle !== "running") {
+      throw Object.assign(new Error(`orchestrator daemon is ${this.lifecycle}; RPC is not available`), { rpcCode: -32002 });
+    }
     const object = z.record(z.string(), z.unknown()).parse(params);
     switch (method) {
       case "task_create":
@@ -126,6 +146,8 @@ export class OrchestratorDaemon {
   }
 
   private handleSocket(socket: Socket): void {
+    this.connections.add(socket);
+    socket.once("close", () => this.connections.delete(socket));
     socket.on("error", () => {
       // A client may disconnect after cancellation/timeout; never crash the daemon on EPIPE.
     });
@@ -191,6 +213,150 @@ export class OrchestratorDaemon {
       });
     });
   }
+
+  private async performClose(): Promise<void> {
+    this.lifecycle = "closing";
+    this.shuttingDown = true;
+    try {
+      await this.options.scheduler.shutdown();
+      await this.closeOwnedServer();
+      this.server = undefined;
+      if (this.ownsSocket) await rm(this.options.socketPath, { force: true });
+      this.ownsSocket = false;
+      await this.daemonLock?.release();
+      this.daemonLock = undefined;
+      this.lifecycle = "closed";
+      this.resolveClosed();
+    } catch (error) {
+      // Retain the lifetime lock when shutdown is incomplete. A successor must
+      // never race a worker or unlink a socket that this daemon may still own.
+      this.lifecycle = this.server?.listening ? "running" : "closing";
+      this.shuttingDown = this.lifecycle !== "running";
+      throw error;
+    }
+  }
+
+  private async cleanupFailedStart(): Promise<void> {
+    // Cleanup is deliberately ownership-aware: a failed contender must not
+    // unlink the active daemon's socket or release somebody else's lock.
+    await this.closeOwnedServer().catch(() => {});
+    this.server = undefined;
+    if (this.ownsSocket) await rm(this.options.socketPath, { force: true }).catch(() => {});
+    this.ownsSocket = false;
+    if (this.daemonLock) {
+      await this.daemonLock.release();
+      this.daemonLock = undefined;
+    }
+  }
+
+  private async closeOwnedServer(): Promise<void> {
+    const closing = closeServer(this.server);
+    for (const socket of this.connections) socket.destroy();
+    await closing;
+  }
+}
+
+interface DaemonLockOwner {
+  schema: "myclaude.daemon-lock/v1";
+  token: string;
+  pid: number;
+  createdAt: string;
+  socketPath: string;
+}
+
+interface DaemonLock {
+  release(): Promise<void>;
+}
+
+const LOCK_DIRECTORY_NAME = ".myclauded.lock";
+
+async function acquireDaemonLock(stateRoot: string, socketPath: string): Promise<DaemonLock> {
+  const lockPath = join(stateRoot, LOCK_DIRECTORY_NAME);
+  for (;;) {
+    const token = randomUUID();
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      await chmod(lockPath, 0o700);
+      const owner: DaemonLockOwner = {
+        schema: "myclaude.daemon-lock/v1",
+        token,
+        pid: process.pid,
+        createdAt: new Date().toISOString(),
+        socketPath,
+      };
+      try {
+        await atomicWriteJson(join(lockPath, "owner.json"), owner);
+      } catch (error) {
+        // Do not remove by pathname after ownership metadata failed: an
+        // operator could have replaced that path, and deleting it would create
+        // the same split-brain race the lifetime lock is meant to prevent.
+        throw new Error(`daemon lock metadata could not be written; inspect ${lockPath} before removing it: ${errorMessage(error)}`);
+      }
+      return {
+        release: async () => {
+          const current = await readLockOwner(lockPath);
+          if (!current || current.token !== token) {
+            throw new Error("refusing to release a daemon lock owned by another process");
+          }
+          await rm(lockPath, { recursive: true, force: true });
+        },
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+
+    const existing = await readLockOwner(lockPath);
+    if (existing && isProcessAlive(existing.pid)) {
+      throw new Error(`orchestrator daemon is already running for state root ${stateRoot} (pid ${existing.pid})`);
+    }
+    // There is no portable inode-CAS primitive in Node's fs API. Automatic
+    // path-based stale reclamation can delete a replacement lock under two
+    // racing contenders, so fail closed and require explicit operator cleanup.
+    const detail = existing ? `left by dead pid ${existing.pid}` : "with incomplete owner metadata";
+    throw new Error(`stale orchestrator daemon lock ${detail} at ${lockPath}; remove it only after confirming no daemon is running`);
+  }
+}
+
+async function readLockOwner(lockPath: string): Promise<DaemonLockOwner | undefined> {
+  try {
+    const value = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as Partial<DaemonLockOwner>;
+    if (value.schema !== "myclaude.daemon-lock/v1"
+      || typeof value.token !== "string"
+      || !Number.isSafeInteger(value.pid)
+      || (value.pid ?? 0) <= 0
+      || typeof value.createdAt !== "string"
+      || typeof value.socketPath !== "string") return undefined;
+    return value as DaemonLockOwner;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function listenOnSocket(server: Server, socketPath: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      server.removeListener("error", reject);
+      resolve();
+    });
+  });
+}
+
+async function closeServer(server: Server | undefined): Promise<void> {
+  if (!server?.listening) return;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
 }
 
 async function removeStaleSocket(socketPath: string): Promise<void> {
