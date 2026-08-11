@@ -132,6 +132,79 @@ describe("Anthropic Messages compatibility", () => {
     ]);
   });
 
+  it("preserves only the safe M365 diagnostics in non-stream and final SSE usage", async () => {
+    const message = fromOpenAIChatResponse({
+      id: "chatcmpl-telemetry",
+      model: "quick",
+      choices: [{ finish_reason: "stop", message: { content: "done" } }],
+      usage: {
+        prompt_tokens: 2,
+        completion_tokens: 3,
+        x_m365_requested_model: "quick",
+        x_m365_resolved_model: "quick",
+        x_m365_tone: "Gpt_Quick",
+        x_m365_agent_route: "agentless",
+        x_m365_certification: "experimental",
+        x_m365_upstream_attempts: 2,
+        x_m365_recovery_events: ["empty_response_retry"],
+        x_m365_conversation_messages: 18,
+        x_m365_conversation_max: 600,
+        x_m365_conversation_pct: 3,
+        x_m365_conversation_remaining: 582,
+        x_m365_latency_ms: 99,
+        x_m365_output_chars: 4,
+        x_m365_output_bytes: 4,
+        x_m365_tool_calls: 0,
+        x_m365_last_tested_service: "M365 BizChat/Sydney observed 2026-07-07",
+        x_m365_classifier_scores: { private: 1 },
+        x_m365_content_origin: "https://private.example/source",
+        authorization: "Bearer secret",
+      },
+    }, "quick");
+
+    expect(message.usage).toMatchObject({
+      x_m365_requested_model: "quick",
+      x_m365_resolved_model: "quick",
+      x_m365_tone: "Gpt_Quick",
+      x_m365_agent_route: "agentless",
+      x_m365_certification: "experimental",
+      x_m365_upstream_attempts: 2,
+      x_m365_recovery_events: ["empty_response_retry"],
+      x_m365_conversation_messages: 18,
+      x_m365_conversation_max: 600,
+      x_m365_conversation_remaining: 582,
+      x_m365_latency_ms: 99,
+      x_m365_output_chars: 4,
+      x_m365_output_bytes: 4,
+      x_m365_tool_calls: 0,
+      x_m365_last_tested_service: "M365 BizChat/Sydney observed 2026-07-07",
+    });
+    expect(message.usage).not.toHaveProperty("x_m365_classifier_scores");
+    expect(message.usage).not.toHaveProperty("x_m365_content_origin");
+    expect(message.usage).not.toHaveProperty("authorization");
+
+    // anthropicSse is also public; sanitize again in case a caller constructs a
+    // message object instead of using fromOpenAIChatResponse.
+    (message.usage as any).x_m365_content_origin = "https://private.example/source";
+    (message.usage as any).authorization = "Bearer secret";
+    const stream = await anthropicSse(message).text();
+    const deltaLine = stream.split("\n").find((line, index, all) =>
+      all[index - 1] === "event: message_delta" && line.startsWith("data: "));
+    expect(deltaLine).toBeTruthy();
+    const delta = JSON.parse(deltaLine!.slice(6));
+    expect(delta.usage).toMatchObject({
+      output_tokens: 3,
+      x_m365_requested_model: "quick",
+      x_m365_upstream_attempts: 2,
+      x_m365_conversation_remaining: 582,
+      x_m365_last_tested_service: "M365 BizChat/Sydney observed 2026-07-07",
+    });
+    expect(JSON.stringify(delta)).not.toContain("private.example");
+    expect(JSON.stringify(delta)).not.toContain("Bearer secret");
+    expect(stream).not.toContain("private.example");
+    expect(stream).not.toContain("Bearer secret");
+  });
+
   it("maps Claude-only picker models to the stable M365 default", () => {
     expect(resolveM365Model("claude-opus-5")).toBe("gpt-5.5-think-deeper");
     expect(resolveM365Model("opus[1m]")).toBe("gpt-5.5-think-deeper");

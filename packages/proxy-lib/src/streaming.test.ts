@@ -1,5 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Handler telemetry has dedicated filesystem/record tests; keep streaming unit
+// tests from writing into the developer's real XDG state directory.
+process.env.M365_TELEMETRY = "0";
 
 // Replace core's ModelSession with a scripted fake so we can exercise the handler's
 // streaming path with no auth/WebSocket. Everything else in core stays real.
@@ -7,6 +14,7 @@ const scripted: {
   deltas: string[];
   fullText?: string;
   sources?: unknown[];
+  error?: Error;
   calls: Array<{ text: string; conversationId: string }>;
 } = { deltas: [], calls: [] };
 
@@ -19,6 +27,7 @@ vi.mock("@m365-copilot/core", async (importActual) => {
     newConversation() { this.conversationId = `conv-test-${crypto.randomUUID()}`; this.turnCount = 0; }
     async refreshAgent() { return false; }
     async run(text: string) {
+      if (scripted.error) throw scripted.error;
       scripted.calls.push({ text, conversationId: this.conversationId });
       this.turnCount++;
       const deltas = scripted.deltas;
@@ -48,13 +57,14 @@ vi.mock("@m365-copilot/core", async (importActual) => {
   return { ...actual, ModelSession: FakeModelSession };
 });
 
-const { handleChatCompletion, SessionPool, ChatCompletionRequest } = await import("./index.js");
+const { handleChatCompletion, SessionPool, ChatCompletionRequest, flushProxyTelemetry } = await import("./index.js");
 
 /** Drive one streaming request and collect the ordered content-delta strings. */
 async function streamContents(deltas: string[], fullText?: string): Promise<string[]> {
   scripted.deltas = deltas;
   scripted.fullText = fullText;
   scripted.sources = [];
+  scripted.error = undefined;
   const body = ChatCompletionRequest.parse({
     model: "m365-copilot",
     stream: true,
@@ -125,7 +135,9 @@ describe("incremental streaming (non-tool path)", () => {
       x_m365_upstream_attempts: 1,
       x_m365_recovery_events: [],
       x_m365_output_chars: "grounded answer".length,
+      x_m365_output_bytes: "grounded answer".length,
       x_m365_tool_calls: 0,
+      x_m365_last_tested_service: "M365 BizChat/Sydney observed 2026-07-07",
     });
     expect(JSON.stringify(payload.usage)).not.toContain("fresh fact");
   });
@@ -171,5 +183,85 @@ describe("incremental streaming (non-tool path)", () => {
     expect(contents.join("")).toBe("Hello world");
     // No duplicated prefix.
     expect(contents.join("").match(/Hello/g)?.length).toBe(1);
+  });
+
+  it("writes exactly one terminal record for non-stream, failure, and streaming requests", async () => {
+    const root = await mkdtemp(join(tmpdir(), "m365-handler-telemetry-"));
+    const path = join(root, "private", "telemetry.jsonl");
+    process.env.M365_TELEMETRY_PATH = path;
+    delete process.env.M365_TELEMETRY;
+    const sessionId = randomUUID();
+    try {
+      scripted.error = undefined;
+      scripted.deltas = ["héllo"];
+      scripted.fullText = "héllo";
+      scripted.sources = [{ url: "https://source.example/private", title: "Secret source snippet" }];
+      const success = ChatCompletionRequest.parse({
+        model: "quick",
+        messages: [{ role: "user", content: "Bearer private-prompt-secret" }],
+      });
+      expect((await handleChatCompletion(success, new SessionPool(), { sessionId })).status).toBe(200);
+
+      scripted.error = new Error("https://upstream.example/?token=private-response-secret");
+      const failure = ChatCompletionRequest.parse({
+        model: "gpt-5.5-think-deeper",
+        messages: [{ role: "user", content: "another private prompt" }],
+      });
+      expect((await handleChatCompletion(failure, new SessionPool(), { sessionId: randomUUID() })).status).toBe(502);
+
+      scripted.error = undefined;
+      scripted.deltas = ["streamed"];
+      scripted.fullText = "streamed";
+      const streaming = ChatCompletionRequest.parse({
+        model: "quick",
+        stream: true,
+        messages: [{ role: "user", content: "private streaming prompt" }],
+      });
+      const streamingResponse = await handleChatCompletion(streaming, new SessionPool(), { sessionId: randomUUID() });
+      await streamingResponse.text();
+      await flushProxyTelemetry();
+
+      const text = await readFile(path, "utf8");
+      const records = text.trim().split("\n").map((line) => JSON.parse(line));
+      expect(records).toHaveLength(3);
+      expect(records[0]).toMatchObject({
+        requested_model: "quick",
+        resolved_model: "quick",
+        tone: "Gpt_Quick",
+        route: "agentless",
+        certification: "experimental",
+        upstream_attempts: 1,
+        tool_call_count: 0,
+        throttle: { current: 1, max: 600, remaining: 599 },
+        output_chars: 5,
+        output_bytes: 6,
+        terminal_outcome: "completed_text",
+        http_status: 200,
+      });
+      expect(records[1]).toMatchObject({
+        requested_model: "gpt-5.5-think-deeper",
+        upstream_attempts: 1,
+        terminal_outcome: "upstream_error",
+        http_status: 502,
+        error_type: "upstream_error",
+      });
+      expect(records[2]).toMatchObject({
+        requested_model: "quick",
+        stream: true,
+        terminal_outcome: "completed_text",
+        http_status: 200,
+      });
+      expect(records[0].client_session_hash).toMatch(/^hmac-sha256:/);
+      expect(text).not.toContain(sessionId);
+      expect(text).not.toContain("private-prompt-secret");
+      expect(text).not.toContain("private-response-secret");
+      expect(text).not.toContain("source.example");
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+    } finally {
+      scripted.error = undefined;
+      process.env.M365_TELEMETRY = "0";
+      delete process.env.M365_TELEMETRY_PATH;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

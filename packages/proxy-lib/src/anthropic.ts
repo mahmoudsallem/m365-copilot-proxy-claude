@@ -6,6 +6,7 @@ import {
 } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { handleChatCompletion, type SessionPool } from "./handler.js";
+import { safeTelemetryLabel } from "./telemetry.js";
 
 const TextBlock = z.object({
   type: z.literal("text"),
@@ -236,7 +237,71 @@ export interface AnthropicMessageResponse {
     input_tokens: number;
     output_tokens: number;
     x_m365_source_attributions?: unknown[];
+    x_m365_requested_model?: string;
+    x_m365_resolved_model?: string;
+    x_m365_tone?: string;
+    x_m365_agent_route?: string;
+    x_m365_certification?: string;
+    x_m365_upstream_attempts?: number;
+    x_m365_recovery_events?: string[];
+    x_m365_conversation_messages?: number;
+    x_m365_conversation_max?: number;
+    x_m365_conversation_pct?: number;
+    x_m365_conversation_remaining?: number;
+    x_m365_latency_ms?: number;
+    x_m365_output_chars?: number;
+    x_m365_output_bytes?: number;
+    x_m365_tool_calls?: number;
+    x_m365_last_tested_service?: string;
   };
+}
+
+type SafeM365Usage = Omit<AnthropicMessageResponse["usage"], "input_tokens" | "output_tokens" | "x_m365_source_attributions">;
+
+const SAFE_STRING_USAGE_KEYS = [
+  "x_m365_requested_model",
+  "x_m365_resolved_model",
+  "x_m365_tone",
+  "x_m365_agent_route",
+  "x_m365_certification",
+  "x_m365_last_tested_service",
+] as const;
+
+const SAFE_NUMBER_USAGE_KEYS = [
+  "x_m365_upstream_attempts",
+  "x_m365_conversation_messages",
+  "x_m365_conversation_max",
+  "x_m365_conversation_pct",
+  "x_m365_conversation_remaining",
+  "x_m365_latency_ms",
+  "x_m365_output_chars",
+  "x_m365_output_bytes",
+  "x_m365_tool_calls",
+] as const;
+
+/** Copy only explicitly non-secret diagnostics from the OpenAI bridge. */
+export function pickSafeM365Usage(value: unknown): SafeM365Usage {
+  if (!value || typeof value !== "object") return {};
+  const input = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const key of SAFE_STRING_USAGE_KEYS) {
+    const candidate = input[key];
+    if (typeof candidate === "string") output[key] = safeTelemetryLabel(candidate);
+  }
+  for (const key of SAFE_NUMBER_USAGE_KEYS) {
+    const candidate = input[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) {
+      output[key] = candidate;
+    }
+  }
+  const recovery = input.x_m365_recovery_events;
+  if (Array.isArray(recovery)) {
+    output.x_m365_recovery_events = recovery
+      .filter((item): item is string => typeof item === "string")
+      .slice(0, 32)
+      .map((item) => safeTelemetryLabel(item, 96));
+  }
+  return output as SafeM365Usage;
 }
 
 function parseToolInput(raw: string): unknown {
@@ -276,6 +341,7 @@ export function fromOpenAIChatResponse(payload: any, requestedModel: string): An
     usage: {
       input_tokens: Number(payload?.usage?.prompt_tokens ?? 0),
       output_tokens: Number(payload?.usage?.completion_tokens ?? 0),
+      ...pickSafeM365Usage(payload?.usage),
       ...(Array.isArray(payload?.usage?.x_m365_source_attributions)
         ? { x_m365_source_attributions: payload.usage.x_m365_source_attributions }
         : {}),
@@ -300,9 +366,17 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
   return new Response(new ReadableStream({
     start(controller) {
       const send = (name: string, data: unknown) => controller.enqueue(encoder.encode(event(name, data)));
+      const safeUsage = {
+        input_tokens: Number.isFinite(message.usage.input_tokens) ? Math.max(0, message.usage.input_tokens) : 0,
+        output_tokens: Number.isFinite(message.usage.output_tokens) ? Math.max(0, message.usage.output_tokens) : 0,
+        ...pickSafeM365Usage(message.usage),
+        ...(Array.isArray(message.usage.x_m365_source_attributions)
+          ? { x_m365_source_attributions: message.usage.x_m365_source_attributions }
+          : {}),
+      };
       send("message_start", {
         type: "message_start",
-        message: { ...message, content: [], stop_reason: null, stop_sequence: null },
+        message: { ...message, usage: safeUsage, content: [], stop_reason: null, stop_sequence: null },
       });
       message.content.forEach((block, index) => {
         if (block.type === "text") {
@@ -325,7 +399,13 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
       send("message_delta", {
         type: "message_delta",
         delta: { stop_reason: message.stop_reason, stop_sequence: null },
-        usage: { output_tokens: message.usage.output_tokens },
+        usage: {
+          output_tokens: safeUsage.output_tokens,
+          ...pickSafeM365Usage(safeUsage),
+          ...(Array.isArray(safeUsage.x_m365_source_attributions)
+            ? { x_m365_source_attributions: safeUsage.x_m365_source_attributions }
+            : {}),
+        },
       });
       send("message_stop", { type: "message_stop" });
       controller.close();

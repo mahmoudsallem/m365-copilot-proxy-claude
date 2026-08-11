@@ -17,7 +17,9 @@ import {
   type CapturedSourceAttribution,
 } from "@m365-copilot/core";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { Buffer } from "node:buffer";
 import { ChatCompletionRequest } from "./schemas.js";
+import { recordProxyTelemetry } from "./telemetry.js";
 import type { z } from "zod/v4";
 
 const log = createLogger("handler");
@@ -77,6 +79,105 @@ function outputFinishReason(text: string): "stop" | "length" {
 
 type ChatBody = z.infer<typeof ChatCompletionRequest>;
 type ParsedMessage = ChatBody["messages"][number];
+
+interface RequestTelemetryContext {
+  requestedModel: string;
+  resolvedModel: string;
+  tone: string;
+  route: string;
+  certification: string;
+  serviceVersion: string;
+  startedAt: number;
+  upstreamAttempts: number;
+  recoveryEvents: string[];
+  toolCallCount: number;
+  throttle: { current: number; max: number } | null;
+  outputChars: number;
+  outputBytes: number;
+  clientSessionId?: string;
+  stream: boolean;
+  terminalRecorded: boolean;
+}
+
+function requestTelemetryContext(body: ChatBody): RequestTelemetryContext {
+  const capability = resolveModelCapability(body.model);
+  const hasTools = !!body.tools?.length && body.tool_choice !== "none";
+  const useToolAgent = hasTools && (
+    process.env.M365_FORCE_AGENT === "1" || capability.route.tools === "declarative-agent"
+  );
+  return {
+    requestedModel: body.model,
+    resolvedModel: capability.id,
+    tone: capability.tone,
+    route: useToolAgent ? "declarative-agent" : "agentless",
+    certification: capability.certification,
+    serviceVersion: capability.lastTestedServiceVersion,
+    startedAt: Date.now(),
+    upstreamAttempts: 0,
+    recoveryEvents: [],
+    toolCallCount: 0,
+    throttle: null,
+    outputChars: 0,
+    outputBytes: 0,
+    stream: body.stream,
+    terminalRecorded: false,
+  };
+}
+
+function setTelemetryOutput(context: RequestTelemetryContext, text: string): void {
+  context.outputChars = text.length;
+  context.outputBytes = Buffer.byteLength(text, "utf8");
+}
+
+async function recordTerminalTelemetry(
+  context: RequestTelemetryContext,
+  terminalOutcome: string,
+  httpStatus: number,
+  errorType?: string,
+): Promise<void> {
+  if (context.terminalRecorded) return;
+  context.terminalRecorded = true;
+  await recordProxyTelemetry({
+    requestedModel: context.requestedModel,
+    resolvedModel: context.resolvedModel,
+    tone: context.tone,
+    route: context.route,
+    certification: context.certification,
+    serviceVersion: context.serviceVersion,
+    upstreamAttempts: context.upstreamAttempts,
+    recoveryEvents: context.recoveryEvents,
+    toolCallCount: context.toolCallCount,
+    throttle: context.throttle,
+    latencyMs: Date.now() - context.startedAt,
+    outputChars: context.outputChars,
+    outputBytes: context.outputBytes,
+    clientSessionId: context.clientSessionId,
+    stream: context.stream,
+    terminalOutcome,
+    httpStatus,
+    errorType,
+  });
+}
+
+function terminalOutcome(errorType: string | undefined, signal?: AbortSignal): string {
+  if (signal?.aborted) return "cancelled";
+  if (errorType === "rate_limit_error") return "rate_limited";
+  if (errorType === "disengaged") return "disengaged";
+  if (errorType === "upstream_empty_response") return "empty_response";
+  if (errorType === "invalid_request_error") return "invalid_request";
+  return "upstream_error";
+}
+
+async function responseErrorDetails(response: Response): Promise<{ message: string; type?: string }> {
+  let message = "upstream error";
+  let type: string | undefined;
+  try {
+    const payload = await response.clone().json() as any;
+    if (typeof payload?.error?.message === "string") message = payload.error.message;
+    if (typeof payload?.error?.type === "string") type = payload.error.type;
+  } catch {}
+  return { message, type };
+}
 
 /**
  * Turn a first-turn false refusal into one harmless, real local action without
@@ -397,18 +498,28 @@ export async function handleChatCompletion(
   pool: SessionPool,
   opts: { signal?: AbortSignal; sessionId?: string } = {},
 ): Promise<Response> {
+  const telemetry = requestTelemetryContext(body);
   let lease: SessionLease;
   try {
     lease = await pool.acquire(body.messages, opts.sessionId, `openai:${body.model}`);
   } catch (error: any) {
+    telemetry.clientSessionId = opts.sessionId;
+    await recordTerminalTelemetry(telemetry, "invalid_session", 400, "invalid_request_error");
     return jsonResponse(400, {
       error: { message: error?.message ?? "Invalid M365 session", type: "invalid_request_error" },
     });
   }
+  telemetry.clientSessionId = lease.state.clientSessionId;
 
   try {
-    return await handleChatCompletionLocked(body, lease.state, lease.release, opts.signal);
+    return await handleChatCompletionLocked(body, lease.state, lease.release, telemetry, opts.signal);
   } catch (error) {
+    await recordTerminalTelemetry(
+      telemetry,
+      opts.signal?.aborted ? "cancelled" : "internal_error",
+      opts.signal?.aborted ? 499 : 500,
+      opts.signal?.aborted ? "request_aborted" : "internal_error",
+    );
     lease.release();
     throw error;
   }
@@ -418,6 +529,7 @@ async function handleChatCompletionLocked(
   body: ChatBody,
   conv: ConversationState,
   release: () => void,
+  telemetry: RequestTelemetryContext,
   signal?: AbortSignal,
 ): Promise<Response> {
   const { session } = conv;
@@ -444,11 +556,6 @@ async function handleChatCompletionLocked(
   const useToolAgent = !!hasTools && (
     process.env.M365_FORCE_AGENT === "1" || capability.route.tools === "declarative-agent"
   );
-  const requestStartedAt = Date.now();
-  let upstreamAttempts = 0;
-  const recoveryEvents: string[] = [];
-  let producedToolCalls = 0;
-  let producedOutputChars = 0;
 
   // Format message: full prompt on first turn, delta on follow-ups.
   // M365 is stateful — it remembers everything from prior turns,
@@ -513,7 +620,7 @@ async function handleChatCompletionLocked(
     // detection profile. A single long pi thread never trips the trigger.
     await awaitDegradationBackoff();
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      upstreamAttempts++;
+      telemetry.upstreamAttempts++;
       let copilotStream;
       try {
         // Only attach the tool-calling agent when the request actually has tools.
@@ -535,6 +642,7 @@ async function handleChatCompletionLocked(
           fullText = copilotStream.fullText;
         }
       } catch (err: any) {
+        setTelemetryOutput(telemetry, fullText);
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
       }
 
@@ -553,11 +661,13 @@ async function handleChatCompletionLocked(
       }
 
       lastThrottle = copilotStream.throttle;
+      telemetry.throttle = lastThrottle;
       lastContentOrigin = copilotStream.contentOrigin;
       lastMessageType = copilotStream.messageType;
       lastScores = copilotStream.scores;
       lastTurnCount = copilotStream.turnCount;
       lastSourceAttributions = copilotStream.sourceAttributions ?? [];
+      setTelemetryOutput(telemetry, fullText);
 
       if (copilotStream.hasContent || fullText.length > 0) {
         noteRequestOutcome(false, convId); // clean response → degradation has lifted
@@ -579,7 +689,7 @@ async function handleChatCompletionLocked(
         if (hasTools && !disengageRetried && !process.env.M365_NO_DISENGAGE_RETRY) {
           disengageRetried = true;
           session.newConversation();
-          recoveryEvents.push("disengaged_conversation_rotation");
+          telemetry.recoveryEvents.push("disengaged_conversation_rotation");
           text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, "softened");
           log.info("Upstream Disengaged — retrying once with 'softened' framing in a fresh conversation (F22)");
           attempt--; // free retry; bounded — disengageRetried flips once
@@ -613,7 +723,7 @@ async function handleChatCompletionLocked(
           agentRefreshed = true;
           const agentChanged = await session.refreshAgent();
           if (agentChanged) {
-            recoveryEvents.push("agent_refresh");
+            telemetry.recoveryEvents.push("agent_refresh");
             // The cached agent was stale/deleted and has been re-resolved.
             // Resend the original prompt to the fresh agent — a bare "continue"
             // would have no context since the dead agent processed nothing.
@@ -624,7 +734,7 @@ async function handleChatCompletionLocked(
           }
         }
         log.info(`Empty upstream response, quick retry in ${SHORT_RETRY_DELAY_MS / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
-        recoveryEvents.push("empty_response_retry");
+        telemetry.recoveryEvents.push("empty_response_retry");
         await new Promise(r => setTimeout(r, SHORT_RETRY_DELAY_MS));
         text = "Please continue."; // M365 already has context
       } else {
@@ -660,7 +770,7 @@ async function handleChatCompletionLocked(
     if ("error" in result) return { kind: "error", resp: result.error };
     markMessagesSent(conv, body.messages);
     let fullText = result.fullText;
-    producedOutputChars = fullText.length;
+    setTelemetryOutput(telemetry, fullText);
 
       log.debug(`Raw response (tool mode) chars=${fullText.length}`);
     let parsed = parseToolCalls(fullText, body.tools);
@@ -694,11 +804,13 @@ async function handleChatCompletionLocked(
         if (orientationCall) {
           log.info("First-turn confabulation detected — returning a read-only bash orientation call");
           parsed = { hasToolCalls: true, toolCalls: [orientationCall], textContent: null };
+          telemetry.recoveryEvents.push("orientation_tool_recovery");
           break;
         }
       }
 
       log.info(`${confab ? "Confabulation" : "Hallucinated completion"} detected (no tool call) — forcing retry ${attempt + 1}/${maxConfabRetries}`);
+      telemetry.recoveryEvents.push(confab ? "confabulation_retry" : "hallucinated_completion_retry");
       text = confab ? CONFAB_FORCE_PROMPT : HALLUCINATION_FORCE_PROMPT;
       const retry = await runBuffered();
       if ("error" in retry) return { kind: "error", resp: retry.error };
@@ -707,7 +819,7 @@ async function handleChatCompletionLocked(
       parsed = parseToolCalls(fullText, body.tools);
       log.info(`After forcing retry: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
     }
-    producedOutputChars = fullText.length;
+    setTelemetryOutput(telemetry, fullText);
 
     // Document guard: the shell-routing parser turns every ```bash block into a
     // tool call, so a model that ANSWERS with a markdown document full of code
@@ -764,11 +876,12 @@ async function handleChatCompletionLocked(
         log.info(`One-call-per-turn: keeping ${selected.calls[0].function.name}, dropping ${parsed.toolCalls.length - 1} batched call(s)`);
         parsed.toolCalls = selected.calls;
         conv.pendingRuntimeNotice = selected.runtimeNotice;
+        telemetry.recoveryEvents.push("multi_tool_call_trimmed");
       }
     }
 
     if (parsed.hasToolCalls && parsed.toolCalls.length > 0) {
-      producedToolCalls = parsed.toolCalls.length;
+      telemetry.toolCallCount = parsed.toolCalls.length;
       return { kind: "tools", toolCalls: parsed.toolCalls };
     }
     return { kind: "text", text: fullText };
@@ -777,7 +890,7 @@ async function handleChatCompletionLocked(
     const result = await runBuffered(onDelta);
     if ("error" in result) return { kind: "error", resp: result.error };
     markMessagesSent(conv, body.messages);
-    producedOutputChars = result.fullText.length;
+    setTelemetryOutput(telemetry, result.fullText);
     return { kind: "text", text: result.fullText };
   }
   } // end produce()
@@ -797,30 +910,53 @@ async function handleChatCompletionLocked(
       tone,
       agentRoute: useToolAgent ? "declarative-agent" : "agentless",
       certification: capability.certification,
-      upstreamAttempts,
-      recoveryEvents,
-      latencyMs: Date.now() - requestStartedAt,
-      outputChars: producedOutputChars,
-      toolCalls: producedToolCalls,
+      serviceVersion: capability.lastTestedServiceVersion,
+      upstreamAttempts: telemetry.upstreamAttempts,
+      recoveryEvents: telemetry.recoveryEvents,
+      latencyMs: Date.now() - telemetry.startedAt,
+      outputChars: telemetry.outputChars,
+      outputBytes: telemetry.outputBytes,
+      toolCalls: telemetry.toolCallCount,
     },
   );
 
   if (!body.stream) {
     try {
       const p = await produce();
-      if (p.kind === "error") return withClientSessionHeader(p.resp, conv.clientSessionId);
+      if (p.kind === "error") {
+        const details = await responseErrorDetails(p.resp);
+        await recordTerminalTelemetry(
+          telemetry,
+          terminalOutcome(details.type, signal),
+          signal?.aborted ? 499 : p.resp.status,
+          signal?.aborted ? "request_aborted" : details.type,
+        );
+        return withClientSessionHeader(p.resp, conv.clientSessionId);
+      }
       if (p.kind === "tools") {
-        return withClientSessionHeader(jsonResponse(200, {
+        const response = withClientSessionHeader(jsonResponse(200, {
           id: completionId, object: "chat.completion", created, model,
           choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: p.toolCalls }, finish_reason: "tool_calls" }],
           usage: usage(),
         }), conv.clientSessionId);
+        await recordTerminalTelemetry(telemetry, "completed_tool_calls", 200);
+        return response;
       }
-      return withClientSessionHeader(jsonResponse(200, {
+      const response = withClientSessionHeader(jsonResponse(200, {
         id: completionId, object: "chat.completion", created, model,
         choices: [{ index: 0, message: { role: "assistant", content: p.text }, finish_reason: outputFinishReason(p.text) }],
         usage: usage(),
       }), conv.clientSessionId);
+      await recordTerminalTelemetry(telemetry, "completed_text", 200);
+      return response;
+    } catch (error) {
+      await recordTerminalTelemetry(
+        telemetry,
+        signal?.aborted ? "cancelled" : "internal_error",
+        signal?.aborted ? 499 : 500,
+        signal?.aborted ? "request_aborted" : "internal_error",
+      );
+      throw error;
     } finally {
       release();
     }
@@ -857,12 +993,12 @@ async function handleChatCompletionLocked(
       try { p = await produce(liveDelta); }
       catch (err: any) { p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) }; }
       clearInterval(hb);
+      const errorDetails = p.kind === "error" ? await responseErrorDetails(p.resp) : null;
+      let deliveryFailed = false;
       try {
         if (p.kind === "error") {
-          let message = "upstream error";
-          try { message = (JSON.parse(await p.resp.text())?.error?.message) || message; } catch {}
           // HTTP 200 is already committed, so surface the failure as an in-stream error chunk.
-          send({ ...base, error: { message, type: "upstream_error" } });
+          send({ ...base, error: { message: errorDetails?.message ?? "upstream error", type: "upstream_error" } });
         } else if (p.kind === "tools") {
           p.toolCalls.forEach((tc, i) =>
             send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] }));
@@ -879,9 +1015,31 @@ async function handleChatCompletionLocked(
           send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: outputFinishReason(p.text) }], ...(includeUsage ? { usage: usage() } : {}) });
         }
       } catch {
+        deliveryFailed = true;
         // client likely disconnected mid-emit — nothing more to do
       } finally {
         try { controller.enqueue(enc.encode("data: [DONE]\n\n")); controller.close(); } catch {}
+        if (p.kind === "error") {
+          await recordTerminalTelemetry(
+            telemetry,
+            terminalOutcome(errorDetails?.type, signal),
+            signal?.aborted ? 499 : p.resp.status,
+            signal?.aborted ? "request_aborted" : errorDetails?.type,
+          );
+        } else if (deliveryFailed || signal?.aborted) {
+          await recordTerminalTelemetry(
+            telemetry,
+            signal?.aborted ? "cancelled" : "client_disconnected",
+            499,
+            signal?.aborted ? "request_aborted" : "client_disconnect",
+          );
+        } else {
+          await recordTerminalTelemetry(
+            telemetry,
+            p.kind === "tools" ? "completed_tool_calls" : "completed_text",
+            200,
+          );
+        }
         release();
       }
     },
@@ -913,10 +1071,12 @@ function buildUsage(
     tone: string;
     agentRoute: string;
     certification: string;
+    serviceVersion: string;
     upstreamAttempts: number;
     recoveryEvents: string[];
     latencyMs: number;
     outputChars: number;
+    outputBytes: number;
     toolCalls: number;
   },
 ): Record<string, unknown> {
@@ -943,10 +1103,12 @@ function buildUsage(
     base.x_m365_tone = telemetry.tone;
     base.x_m365_agent_route = telemetry.agentRoute;
     base.x_m365_certification = telemetry.certification;
+    base.x_m365_last_tested_service = telemetry.serviceVersion;
     base.x_m365_upstream_attempts = telemetry.upstreamAttempts;
     base.x_m365_recovery_events = telemetry.recoveryEvents;
     base.x_m365_latency_ms = telemetry.latencyMs;
     base.x_m365_output_chars = telemetry.outputChars;
+    base.x_m365_output_bytes = telemetry.outputBytes;
     base.x_m365_tool_calls = telemetry.toolCalls;
   }
   // Disengaged-classifier scores. Empirically: clean tool calls sit at

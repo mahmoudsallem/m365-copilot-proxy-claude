@@ -8,12 +8,23 @@ import { SessionPool, handleChatCompletion } from "./handler.js";
 export { SessionPool, handleChatCompletion } from "./handler.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
 export {
+  flushProxyTelemetry,
+  getProxyTelemetryPath,
+  hashTelemetrySessionId,
+  recordProxyTelemetry,
+  safeTelemetryLabel,
+  sanitizeProxyTelemetry,
+  type ProxyTelemetryInput,
+  type ProxyTelemetryRecord,
+} from "./telemetry.js";
+export {
   AnthropicMessagesRequest,
   CLAUDE_GATEWAY_MODEL_PREFIX,
   resolveM365Model,
   toClaudeGatewayModelId,
   toOpenAIChatRequest,
   fromOpenAIChatResponse,
+  pickSafeM365Usage,
   anthropicSse,
   handleAnthropicMessages,
   estimateAnthropicInputTokens,
