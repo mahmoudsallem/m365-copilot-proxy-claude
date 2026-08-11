@@ -1,0 +1,16 @@
+[Unit]
+Description=MyClaude verified executor daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__MYCLAUDED_EXECUTABLE__ server run
+Restart=on-failure
+RestartSec=5
+UMask=0077
+Environment=MYCLAUDE_SOCKET=__MYCLAUDE_SOCKET__
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

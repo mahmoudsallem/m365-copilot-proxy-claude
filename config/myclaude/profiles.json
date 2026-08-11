@@ -1,0 +1,16 @@
+{
+  "schema": "myclaude.execution-profiles/v1",
+  "default": "guarded",
+  "profiles": {
+    "guarded": {
+      "description": "Workspace-scoped file access with deterministic denials for destructive, credential-store, and external-write commands.",
+      "preToolUse": "enforce",
+      "stopVerificationGate": true
+    },
+    "host-unrestricted": {
+      "description": "Observe and audit the guarded rules without changing Claude Code's own permission decision.",
+      "preToolUse": "observe-only",
+      "stopVerificationGate": true
+    }
+  }
+}
