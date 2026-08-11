@@ -1,8 +1,7 @@
 import { getToken } from "./auth.js";
 import { getOrCreateAgent, getOrCreateAgentSingleFlight } from "./agent.js";
 import { CopilotSession } from "./session.js";
-import { createLogger, trunc } from "./log.js";
-import { resolveModel } from "./copilot.js";
+import { createLogger } from "./log.js";
 import type { CopilotStream } from "./copilot.js";
 
 const log = createLogger("model");
@@ -12,6 +11,8 @@ export interface ModelSessionOptions {
   getToken?: () => Promise<string>;
   /** Whether to attempt agent resolution. Default: true. */
   useAgent?: boolean;
+  /** Stable, caller-generated UUID propagated to M365 as X-SessionId. */
+  sessionId?: string;
 }
 
 /**
@@ -32,7 +33,7 @@ export class ModelSession {
   private sessionCreationPromise: Promise<CopilotSession> | null = null;
 
   /** Stable IDs reused across CopilotSession reconnections. */
-  readonly sessionId: string = crypto.randomUUID();
+  readonly sessionId: string;
   private _conversationId: string = crypto.randomUUID();
   /** Current M365 ConversationId (the throttle/Disengage state keys on this). */
   get conversationId(): string {
@@ -53,6 +54,7 @@ export class ModelSession {
   constructor(options: ModelSessionOptions = {}) {
     this.resolveToken = options.getToken ?? getToken;
     this.useAgent = options.useAgent !== false;
+    this.sessionId = options.sessionId ?? crypto.randomUUID();
   }
 
   /** Number of turns completed in this session */
@@ -93,13 +95,12 @@ export class ModelSession {
    * Send text to M365 Copilot and stream back the response.
    *
    * `useAgent` decides whether THIS turn attaches the tool-calling Copilot Studio
-   * agent (`threadLevelGptId`). `useAgent` is ONLY enabled if the resolved model
-   * explicitly supports agent attachment (`config.supportsAgent`).
+   * agent (`threadLevelGptId`). The handler derives this from the capability
+   * registry and may explicitly override it with M365_FORCE_AGENT.
    */
   async run(text: string, model: string = "m365-copilot", signal?: AbortSignal, useAgent: boolean = true): Promise<CopilotStream> {
     const token = await this.resolveToken();
-    const resolvedModel = resolveModel(model);
-    const wantAgent = this.useAgent && useAgent && resolvedModel.config.supportsAgent;
+    const wantAgent = this.useAgent && useAgent;
 
     // Resolve agent ID lazily (persists across resets), single-flighted across concurrent calls
     if (wantAgent && this.cachedAgentId === undefined) {
@@ -129,24 +130,18 @@ export class ModelSession {
     }
 
     const currentSession = this.copilotSession!;
-    log.info(
-      `run: model=${resolvedModel.canonicalModel}, tone=${resolvedModel.config.tone}, agent=${
-        agentForTurn ?? "none"
-      }, turn=${currentSession.turnCount}, sid=${this.sessionId}, cid=${this.conversationId}, text=${JSON.stringify(
-        trunc(text, 200),
-      )}`,
-    );
+    log.info(`run: model=${model}, agent=${agentForTurn ?? "none"}, turn=${currentSession.turnCount}, sid=${this.sessionId}, cid=${this.conversationId}, promptChars=${text.length}`);
 
     const turnOpts = { generateImages: !agentForTurn && !process.env.M365_NO_IMAGE_GEN };
 
     try {
-      return await currentSession.chat(token, text, resolvedModel.config.tone, signal, turnOpts);
+      return await currentSession.chat(token, text, model, signal, turnOpts);
     } catch (err: any) {
       // Session might be stale — reconnect with same IDs
       log.info("Session error, reconnecting:", err.message);
       this.copilotSession = this.createCopilotSession(agentForTurn);
       this.currentAgentId = agentForTurn;
-      return await this.copilotSession.chat(token, text, resolvedModel.config.tone, signal, turnOpts);
+      return await this.copilotSession.chat(token, text, model, signal, turnOpts);
     }
   }
 
@@ -158,6 +153,7 @@ export class ModelSession {
         log.info(`Agent ID refreshed: ${this.cachedAgentId ?? "none"} -> ${fresh ?? "none"}`);
         this.cachedAgentId = fresh;
         this.copilotSession = null;
+        this.currentAgentId = undefined;
         return true;
       }
     } catch (err: any) {
@@ -168,6 +164,7 @@ export class ModelSession {
 
   reset(): void {
     this.copilotSession = null;
+    this.cachedAgentId = undefined;
     this.currentAgentId = undefined;
   }
 }

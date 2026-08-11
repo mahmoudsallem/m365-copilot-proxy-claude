@@ -1,5 +1,8 @@
 import { AnthropicMessagesRequest, handleAnthropicMessages } from "@m365-copilot/proxy-lib";
+import { createLogger } from "@m365-copilot/core";
 import { pool } from "../../server-pool";
+
+const log = createLogger("anthropic-route");
 
 /** Anthropic Messages compatibility endpoint for Claude Code and Anthropic SDK clients. */
 export default defineEventHandler(async (event) => {
@@ -25,9 +28,14 @@ export default defineEventHandler(async (event) => {
   }
 
   try {
-    return await handleAnthropicMessages(body, pool, controller.signal);
+    return await handleAnthropicMessages(
+      body,
+      pool,
+      controller.signal,
+      getHeader(event, "x-m365-session-id") || undefined,
+    );
   } catch (err: any) {
-    console.error("[messages.post error]", err.stack || err);
+    log.warn("Anthropic messages request failed:", err?.message ?? "unknown error");
     throw err;
   }
 });

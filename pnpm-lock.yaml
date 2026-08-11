@@ -10,7 +10,7 @@ importers:
     devDependencies:
       '@earendil-works/pi-coding-agent':
         specifier: ^0.83.0
-        version: 0.83.0(ws@8.21.1)(zod@4.3.6)
+        version: 0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)
       tsdown:
         specifier: ^0.21.5
         version: 0.21.5(typescript@6.0.2)
@@ -58,6 +58,16 @@ importers:
         specifier: ^0.12.5
         version: 0.12.5
 
+  packages/orchestrator:
+    dependencies:
+      zod:
+        specifier: ^4.3.6
+        version: 4.3.6
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.15
+
   packages/proxy:
     dependencies:
       '@m365-copilot/core':
@@ -72,7 +82,7 @@ importers:
         version: 22.19.15
       nitropack:
         specifier: ^2.10.4
-        version: 2.13.4(rolldown@1.0.0-rc.11)
+        version: 2.13.4(rolldown@1.0.0-rc.11)(supports-color@10.2.2)
 
   packages/proxy-lib:
     dependencies:
@@ -114,6 +124,9 @@ packages:
   '@aws-sdk/core@3.977.4':
     resolution: {integrity: sha512-CEkcQlMOQJCvul60U7wdAOACjtdgFWDsfJI+6wUOGdhGNV2lGbuJpi/R50QLpFG3Tp+sQxa/RmzC3X7KHbhuTA==}
     engines: {node: '>=20.0.0'}
+    deprecated: |-
+      Deprecated due to Document number parsing bug in JSON, see
+        https://github.com/aws/aws-sdk-js-v3/issues/8246. Newer version available.
 
   '@aws-sdk/credential-provider-env@3.972.65':
     resolution: {integrity: sha512-lJT2aRw9wCV8jPHyFJjdZLD4HTydL6/22AnCSOB8e/LqOc55nEJGLHkJQeSxhn8QiqyjFwPKQFtMw0ovjRUY/g==}
@@ -3444,9 +3457,9 @@ snapshots:
 
   '@cloudflare/kv-asset-handler@0.4.2': {}
 
-  '@earendil-works/pi-agent-core@0.83.0(ws@8.21.1)(zod@4.3.6)':
+  '@earendil-works/pi-agent-core@0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)':
     dependencies:
-      '@earendil-works/pi-ai': 0.83.0(ws@8.21.1)(zod@4.3.6)
+      '@earendil-works/pi-ai': 0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)
       diff: 8.0.4
       ignore: 7.0.5
       typebox: 1.3.7
@@ -3459,16 +3472,16 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-ai@0.83.0(ws@8.21.1)(zod@4.3.6)':
+  '@earendil-works/pi-ai@0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)':
     dependencies:
       '@anthropic-ai/sdk': 0.91.1(zod@4.3.6)
       '@aws-sdk/client-bedrock-runtime': 3.1048.0
-      '@google/genai': 1.52.0
+      '@google/genai': 1.52.0(supports-color@10.2.2)
       '@mistralai/mistralai': 2.2.6(@opentelemetry/api@1.9.0)
       '@opentelemetry/api': 1.9.0
       '@smithy/node-http-handler': 4.7.3
-      http-proxy-agent: 7.0.2
-      https-proxy-agent: 7.0.6
+      http-proxy-agent: 7.0.2(supports-color@10.2.2)
+      https-proxy-agent: 7.0.6(supports-color@10.2.2)
       openai: 6.26.0(ws@8.21.1)(zod@4.3.6)
       partial-json: 0.1.7
       typebox: 1.3.7
@@ -3480,10 +3493,10 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-coding-agent@0.83.0(ws@8.21.1)(zod@4.3.6)':
+  '@earendil-works/pi-coding-agent@0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)':
     dependencies:
-      '@earendil-works/pi-agent-core': 0.83.0(ws@8.21.1)(zod@4.3.6)
-      '@earendil-works/pi-ai': 0.83.0(ws@8.21.1)(zod@4.3.6)
+      '@earendil-works/pi-agent-core': 0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)
+      '@earendil-works/pi-ai': 0.83.0(supports-color@10.2.2)(ws@8.21.1)(zod@4.3.6)
       '@earendil-works/pi-tui': 0.83.0
       '@silvia-odwyer/photon-node': 0.3.4
       chalk: 5.6.2
@@ -3687,9 +3700,9 @@ snapshots:
   '@esbuild/win32-x64@0.28.0':
     optional: true
 
-  '@google/genai@1.52.0':
+  '@google/genai@1.52.0(supports-color@10.2.2)':
     dependencies:
-      google-auth-library: 10.9.1
+      google-auth-library: 10.9.1(supports-color@10.2.2)
       p-retry: 4.6.2
       protobufjs: 7.6.5
       ws: 8.21.1
@@ -3737,11 +3750,11 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@mapbox/node-pre-gyp@2.0.3':
+  '@mapbox/node-pre-gyp@2.0.3(supports-color@10.2.2)':
     dependencies:
       consola: 3.4.2
       detect-libc: 2.1.2
-      https-proxy-agent: 7.0.6
+      https-proxy-agent: 7.0.6(supports-color@10.2.2)
       node-fetch: 2.7.0
       nopt: 8.1.0
       semver: 7.7.4
@@ -4270,9 +4283,9 @@ snapshots:
     dependencies:
       '@types/node': 25.5.0
 
-  '@vercel/nft@1.10.2(rollup@4.61.1)':
+  '@vercel/nft@1.10.2(rollup@4.61.1)(supports-color@10.2.2)':
     dependencies:
-      '@mapbox/node-pre-gyp': 2.0.3
+      '@mapbox/node-pre-gyp': 2.0.3(supports-color@10.2.2)
       '@rollup/pluginutils': 5.4.0(rollup@4.61.1)
       acorn: 8.16.0
       acorn-import-attributes: 1.9.5(acorn@8.16.0)
@@ -4576,9 +4589,11 @@ snapshots:
 
   db0@0.3.4: {}
 
-  debug@4.4.3:
+  debug@4.4.3(supports-color@10.2.2):
     dependencies:
       ms: 2.1.3
+    optionalDependencies:
+      supports-color: 10.2.2
 
   deepmerge@4.3.1: {}
 
@@ -4775,17 +4790,17 @@ snapshots:
 
   function-bind@1.1.2: {}
 
-  gaxios@7.3.0:
+  gaxios@7.3.0(supports-color@10.2.2):
     dependencies:
       extend: 3.0.2
-      https-proxy-agent: 7.0.6
+      https-proxy-agent: 7.0.6(supports-color@10.2.2)
       node-fetch: 3.3.2
     transitivePeerDependencies:
       - supports-color
 
-  gcp-metadata@8.1.2:
+  gcp-metadata@8.1.2(supports-color@10.2.2):
     dependencies:
-      gaxios: 7.3.0
+      gaxios: 7.3.0(supports-color@10.2.2)
       google-logging-utils: 1.1.3
       json-bigint: 1.0.0
     transitivePeerDependencies:
@@ -4831,12 +4846,12 @@ snapshots:
       slash: 5.1.0
       unicorn-magic: 0.4.0
 
-  google-auth-library@10.9.1:
+  google-auth-library@10.9.1(supports-color@10.2.2):
     dependencies:
       base64-js: 1.5.1
       ecdsa-sig-formatter: 1.0.11
-      gaxios: 7.3.0
-      gcp-metadata: 8.1.2
+      gaxios: 7.3.0(supports-color@10.2.2)
+      gcp-metadata: 8.1.2(supports-color@10.2.2)
       google-logging-utils: 1.1.3
       jws: 4.0.1
     transitivePeerDependencies:
@@ -4884,19 +4899,19 @@ snapshots:
       statuses: 2.0.2
       toidentifier: 1.0.1
 
-  http-proxy-agent@7.0.2:
+  http-proxy-agent@7.0.2(supports-color@10.2.2):
     dependencies:
       agent-base: 7.1.4
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
     transitivePeerDependencies:
       - supports-color
 
   http-shutdown@1.2.2: {}
 
-  https-proxy-agent@7.0.6:
+  https-proxy-agent@7.0.6(supports-color@10.2.2):
     dependencies:
       agent-base: 7.1.4
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
     transitivePeerDependencies:
       - supports-color
 
@@ -4910,11 +4925,11 @@ snapshots:
 
   inherits@2.0.4: {}
 
-  ioredis@5.11.1:
+  ioredis@5.11.1(supports-color@10.2.2):
     dependencies:
       '@ioredis/commands': 1.10.0
       cluster-key-slot: 1.1.1
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       denque: 2.1.0
       redis-errors: 1.2.0
       redis-parser: 3.0.0
@@ -5173,7 +5188,7 @@ snapshots:
 
   nanoid@3.3.11: {}
 
-  nitropack@2.13.4(rolldown@1.0.0-rc.11):
+  nitropack@2.13.4(rolldown@1.0.0-rc.11)(supports-color@10.2.2):
     dependencies:
       '@cloudflare/kv-asset-handler': 0.4.2
       '@rollup/plugin-alias': 6.0.0(rollup@4.61.1)
@@ -5183,7 +5198,7 @@ snapshots:
       '@rollup/plugin-node-resolve': 16.0.3(rollup@4.61.1)
       '@rollup/plugin-replace': 6.0.3(rollup@4.61.1)
       '@rollup/plugin-terser': 1.0.0(rollup@4.61.1)
-      '@vercel/nft': 1.10.2(rollup@4.61.1)
+      '@vercel/nft': 1.10.2(rollup@4.61.1)(supports-color@10.2.2)
       archiver: 7.0.1
       c12: 3.3.4(magicast@0.5.3)
       chokidar: 5.0.0
@@ -5207,7 +5222,7 @@ snapshots:
       h3: 1.15.11
       hookable: 5.5.3
       httpxy: 0.5.3
-      ioredis: 5.11.1
+      ioredis: 5.11.1(supports-color@10.2.2)
       jiti: 2.7.0
       klona: 2.0.6
       knitwork: 1.3.0
@@ -5230,7 +5245,7 @@ snapshots:
       scule: 1.3.0
       semver: 7.7.4
       serve-placeholder: 2.0.2
-      serve-static: 2.2.1
+      serve-static: 2.2.1(supports-color@10.2.2)
       source-map: 0.7.6
       std-env: 4.1.0
       ufo: 1.6.4
@@ -5240,7 +5255,7 @@ snapshots:
       unenv: 2.0.0-rc.24
       unimport: 6.3.0(rolldown@1.0.0-rc.11)
       unplugin-utils: 0.3.1
-      unstorage: 1.17.5(db0@0.3.4)(ioredis@5.11.1)
+      unstorage: 1.17.5(db0@0.3.4)(ioredis@5.11.1(supports-color@10.2.2))
       untyped: 2.0.0
       unwasm: 0.5.3
       youch: 4.1.1
@@ -5606,9 +5621,9 @@ snapshots:
 
   semver@7.8.0: {}
 
-  send@1.2.1:
+  send@1.2.1(supports-color@10.2.2):
     dependencies:
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       encodeurl: 2.0.0
       escape-html: 1.0.3
       etag: 1.8.1
@@ -5628,12 +5643,12 @@ snapshots:
     dependencies:
       defu: 6.1.7
 
-  serve-static@2.2.1:
+  serve-static@2.2.1(supports-color@10.2.2):
     dependencies:
       encodeurl: 2.0.0
       escape-html: 1.0.3
       parseurl: 1.3.3
-      send: 1.2.1
+      send: 1.2.1(supports-color@10.2.2)
     transitivePeerDependencies:
       - supports-color
 
@@ -5915,7 +5930,7 @@ snapshots:
     dependencies:
       rolldown: 1.0.0-rc.11
 
-  unstorage@1.17.5(db0@0.3.4)(ioredis@5.11.1):
+  unstorage@1.17.5(db0@0.3.4)(ioredis@5.11.1(supports-color@10.2.2)):
     dependencies:
       anymatch: 3.1.3
       chokidar: 5.0.0
@@ -5927,7 +5942,7 @@ snapshots:
       ufo: 1.6.4
     optionalDependencies:
       db0: 0.3.4
-      ioredis: 5.11.1
+      ioredis: 5.11.1(supports-color@10.2.2)
 
   untun@0.1.3:
     dependencies:

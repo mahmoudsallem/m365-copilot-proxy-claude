@@ -10,7 +10,14 @@ import {
   CompletionFrame,
   CloseFrame,
 } from "./schemas.js";
-import { decodeJwt, getToneForModel, type CopilotStream, type CapturedImage } from "./copilot.js";
+import {
+  decodeJwt,
+  getToneForModel,
+  normalizeSourceAttribution,
+  type CopilotStream,
+  type CapturedImage,
+  type CapturedSourceAttribution,
+} from "./copilot.js";
 import {
   parseActionConfirmation,
   buildResumeInvokeAction,
@@ -223,7 +230,7 @@ export class CopilotSession {
     this._turnCount++;
     const wantImages = opts?.generateImages ?? false;
 
-    log.info(`Chat turn ${this._turnCount - 1}: model=${model}, isFirst=${isFirst}, text=${JSON.stringify(trunc(text, 200))}`);
+    log.info(`Chat turn ${this._turnCount - 1}: model=${model}, isFirst=${isFirst}, promptChars=${text.length}`);
 
     const claims = decodeJwt(token);
     const requestId = crypto.randomUUID();
@@ -267,6 +274,7 @@ export class CopilotSession {
       // Generated images captured this turn (§14). Keyed by fileToken so the
       // repeated progress snapshots for one image collapse to a single entry.
       const imagesByToken = new Map<string, CapturedImage>();
+      const sourceAttributions = new Map<string, CapturedSourceAttribution>();
       // Native-action round-trip state (H-NATIVE-6). `baseArgs` is the sent chat
       // envelope's arguments[0], reused verbatim (minus `message`) to resume an
       // action. `sawAction` records that the model triggered a custom action this
@@ -338,6 +346,15 @@ export class CopilotSession {
         }
       };
 
+      const captureAttributions = (values: unknown) => {
+        if (!Array.isArray(values)) return;
+        for (const raw of values) {
+          const attribution = normalizeSourceAttribution(raw);
+          if (!attribution) continue;
+          sourceAttributions.set(attribution.url, attribution);
+        }
+      };
+
       // Fold a token delta OR a full-text snapshot into `answer` and stream the
       // newly-appended suffix (see foldStreamText for the prefix-safe rules).
       const advance = (next: string) => {
@@ -379,6 +396,9 @@ export class CopilotSession {
         },
         get images() {
           return [...imagesByToken.values()];
+        },
+        get sourceAttributions() {
+          return [...sourceAttributions.values()];
         },
         get sawAction() {
           return sawAction;
@@ -713,6 +733,7 @@ export class CopilotSession {
             for (const m of item.messages ?? []) {
               if (m.author !== "bot") continue;
               captureImages(m);
+              captureAttributions(m.sourceAttributions);
               if (m.contentOrigin) contentOrigin = m.contentOrigin;
               if (m.messageType) messageType = m.messageType;
               if (m.messageId) messageId = m.messageId;
@@ -740,6 +761,7 @@ export class CopilotSession {
           for (const arg of base.arguments) {
             const delta = DeltaUpdate.safeParse(arg);
             if (delta.success) {
+              captureAttributions(delta.data.sourceAttributions);
               advance(answer + delta.data.writeAtCursor);
               continue;
             }
@@ -752,6 +774,7 @@ export class CopilotSession {
                 // `3PDeclarativeAgent` and surface `Disengaged` cleanly.
                 if (m.author === "bot") {
                   captureImages(m);
+                  captureAttributions(m.sourceAttributions);
                   if (m.contentOrigin) contentOrigin = m.contentOrigin;
                   if (m.messageType) messageType = m.messageType;
                   if (m.messageId) messageId = m.messageId;

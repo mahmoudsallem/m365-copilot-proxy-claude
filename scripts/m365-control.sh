@@ -12,7 +12,14 @@ CONNECTION_FILE="$STATE_DIR/claude-connection.env"
 BACKEND_FILE="$STATE_DIR/proxy.backend"
 CLAUDE_WRAPPER="$USER_BIN_DIR/claude"
 CLAUDE_DIRECT_WRAPPER="$USER_BIN_DIR/claude-direct"
+MYCLAUDE_WRAPPER="$USER_BIN_DIR/myclaude"
+MYCLAUDE_RESEARCH_WRAPPER="$USER_BIN_DIR/myclaude-research"
 CONTROL_BIN="$ROOT/bin/m365-copilot"
+MYCLAUDE_BIN="$ROOT/bin/myclaude"
+MYCLAUDE_RESEARCH_BIN="$ROOT/bin/myclaude-research"
+MYCLAUDE_HOOK_SETTINGS="$CONFIG_DIR/myclaude-hooks.json"
+MYCLAUDE_SERVER_MANAGER="$ROOT/scripts/myclaude-server.sh"
+MYCLAUDE_PROFILE_LOCK="$CONFIG_DIR/myclaude-profile.lock"
 PROXY_PORT="${PORT:-4141}"
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 SYSTEMD_UNIT_NAME="m365-copilot-proxy.service"
@@ -37,12 +44,19 @@ Proxy:
   restart             Restart the managed proxy
   status              Show proxy and Claude connection status
   logs [--follow]     Show the proxy log
-  models              List the proxy's M365 model catalog
+  models [--all] [--json]
+                       List the proxy's M365 model catalog
 
 Claude Code:
-  connect-claude      Make the plain `claude` command use this proxy
-  disconnect-claude   Restore the original Claude command
-  claude [args...]    Internal connected-Claude launcher
+  install-myclaude    Install `myclaude` while leaving `claude` direct
+  remove-myclaude     Remove only the managed `myclaude` launcher
+  install-research    Install the grounded `myclaude-research` command
+  remove-research     Remove only the managed research launcher
+  profile <name>      Set guarded or host-unrestricted execution hooks
+  myclaude [args...]  Start Claude Code through the localhost proxy
+  connect-claude      Legacy migration: restore `claude`, install `myclaude`
+  disconnect-claude   Restore a legacy managed `claude` wrapper
+  claude [args...]    Legacy connected-Claude launcher
   claude-direct [...] Internal original-Claude launcher
 
 Removal:
@@ -109,7 +123,9 @@ validate_managed_pid() {
 }
 
 systemd_user_available() {
-  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+  [[ "${MYCLAUDE_FORCE_DETACHED:-0}" != "1" ]] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user show-environment >/dev/null 2>&1
 }
 
 unit_quote() {
@@ -153,18 +169,53 @@ install_all() {
   require_command curl
   ensure_private_dirs
 
-  note "[1/4] Preparing the private Node.js runtime..."
+  note "[1/6] Preparing the private Node.js runtime..."
   bash "$ROOT/scripts/setup-local.sh"
-  note "[2/4] Installing locked dependencies..."
-  bash "$ROOT/scripts/local.sh" install --frozen-lockfile
-  note "[3/4] Building all packages..."
-  bash "$ROOT/scripts/local.sh" build
-  note "[4/4] Installing the m365-copilot command..."
+  if [[ "${M365_INSTALL_USE_EXISTING_BUILD:-0}" == "1" ]]; then
+    note "[2/6] Using the existing locked dependency installation (test/developer mode)."
+    [[ -d "$ROOT/node_modules" ]] || die "Existing dependencies are unavailable. Run install without M365_INSTALL_USE_EXISTING_BUILD."
+    note "[3/6] Using the existing package build (test/developer mode)."
+    [[ -f "$ROOT/packages/orchestrator/dist/cli.mjs" ]] \
+      || die "Existing MyClaude build is unavailable. Run install without M365_INSTALL_USE_EXISTING_BUILD."
+  else
+    note "[2/6] Installing locked dependencies..."
+    bash "$ROOT/scripts/local.sh" install --frozen-lockfile
+    note "[3/6] Building all packages..."
+    bash "$ROOT/scripts/local.sh" build
+  fi
+  note "[4/6] Installing verified-execution hooks..."
+  local hook_settings="$CONFIG_DIR/myclaude-hooks.json"
+  local hook_profile=guarded
+  if [[ -f "$hook_settings.managed" ]]; then
+    hook_profile="$("$ROOT/.runtime/node/node_modules/node/bin/node" -e '
+      const fs = require("node:fs");
+      try {
+        const marker = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        if (["guarded", "host-unrestricted"].includes(marker.profile)) process.stdout.write(marker.profile);
+      } catch {}
+    ' "$hook_settings.managed")"
+    [[ -n "$hook_profile" ]] || hook_profile=guarded
+  fi
+  set_myclaude_profile "$hook_profile" >/dev/null
+  if [[ "$hook_profile" == "host-unrestricted" ]]; then
+    note "Warning: preserving host-unrestricted hooks; they can access every file and credential available to your Unix user."
+  fi
+  note "[5/6] Installing the m365-copilot, myclaude, and research commands..."
   ln -sfn "$CONTROL_BIN" "$USER_BIN_DIR/m365-copilot"
+  install_myclaude true
+  install_myclaude_research true
+  note "[6/6] Preparing the MyClaude task orchestrator..."
+  if systemd_user_available; then
+    bash "$MYCLAUDE_SERVER_MANAGER" start >/dev/null
+    note "MyClaude task orchestrator installed, enabled, and started with user systemd."
+  else
+    note "User systemd is unavailable; run 'myclaude server start' for the detached fallback when needed."
+  fi
 
   note ""
   note "Installation complete."
   note "Next: $USER_BIN_DIR/m365-copilot login"
+  note "After login: $USER_BIN_DIR/myclaude"
   if [[ ":$PATH:" != *":$USER_BIN_DIR:"* ]]; then
     note "Add this directory to PATH before using the short command: $USER_BIN_DIR"
   fi
@@ -308,9 +359,19 @@ status_all() {
     note "Proxy: stopped or unhealthy at $PROXY_URL"
   fi
   if claude_is_connected; then
-    note "Claude: connected to M365 through the managed wrapper"
+    note "Claude: legacy managed wrapper detected (run connect-claude to migrate)"
   else
     note "Claude: normal/direct mode"
+  fi
+  if [[ -L "$MYCLAUDE_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_WRAPPER")" == "$MYCLAUDE_BIN" ]]; then
+    note "MyClaude: installed at $MYCLAUDE_WRAPPER"
+  else
+    note "MyClaude: not installed"
+  fi
+  if [[ -L "$MYCLAUDE_RESEARCH_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_RESEARCH_WRAPPER")" == "$MYCLAUDE_RESEARCH_BIN" ]]; then
+    note "MyClaude research: installed at $MYCLAUDE_RESEARCH_WRAPPER"
+  else
+    note "MyClaude research: not installed"
   fi
   note "Config: $ENV_FILE"
   note "Log: $LOG_FILE"
@@ -328,8 +389,300 @@ list_models() {
   require_command curl
   load_proxy_env
   proxy_health || die "Proxy is not running. Run: m365-copilot start"
+  local json=false argument output_mode=human
+  for argument in "$@"; do
+    case "$argument" in
+      --json) json=true ;;
+      --all) ;;
+      *) die "Unknown models option: $argument" ;;
+    esac
+  done
+  [[ "$json" == true ]] && output_mode=json
+  local node_bin="$ROOT/.runtime/node/node_modules/node/bin/node"
+  [[ -x "$node_bin" ]] || node_bin="$(command -v node 2>/dev/null || true)"
+  [[ -n "$node_bin" ]] || die "Node.js is unavailable. Run: m365-copilot install"
   curl -fsS -H "Authorization: Bearer ${M365_PROXY_API_KEY}" "$PROXY_URL/v1/models" \
-    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const m of JSON.parse(s).data??[])console.log(`${m.id}${m.name?`\t${m.name}`:""}`)})'
+    | "$node_bin" -e '
+      let source = "";
+      process.stdin.on("data", (chunk) => { source += chunk; });
+      process.stdin.on("end", () => {
+        const models = JSON.parse(source).data ?? [];
+        if (process.argv[1] === "json") {
+          process.stdout.write(`${JSON.stringify(models, null, 2)}\n`);
+          return;
+        }
+        process.stdout.write("MODEL\tSTATUS\tTONE\tINPUT\tOUTPUT\n");
+        for (const model of models) {
+          process.stdout.write([
+            model.id,
+            model.x_m365_certification ?? "unknown",
+            model.x_m365_tone ?? "unknown",
+            model.max_input_tokens ?? model.context_window ?? "unknown",
+            model.max_output_tokens ?? "unknown",
+          ].join("\t") + "\n");
+        }
+      });
+    ' "$output_mode"
+}
+
+install_myclaude() {
+  local quiet="${1:-false}"
+  ensure_private_dirs
+  [[ -x "$MYCLAUDE_BIN" ]] || die "MyClaude launcher is not executable: $MYCLAUDE_BIN"
+
+  if [[ -L "$MYCLAUDE_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_WRAPPER")" == "$MYCLAUDE_BIN" ]]; then
+    [[ "$quiet" == true ]] || note "myclaude is already installed. The ordinary claude command is unchanged."
+    return 0
+  fi
+
+  if [[ -e "$MYCLAUDE_WRAPPER" || -L "$MYCLAUDE_WRAPPER" ]]; then
+    if [[ -f "$MYCLAUDE_WRAPPER" ]] && grep -Eq 'claude-local\.sh|M365_COPILOT_MANAGED_MYCLAUDE=1' "$MYCLAUDE_WRAPPER"; then
+      local migrated="$STATE_DIR/myclaude.legacy.$(date +%s)"
+      mv "$MYCLAUDE_WRAPPER" "$migrated"
+      chmod 600 "$migrated"
+      [[ "$quiet" == true ]] || note "Saved the previous local MyClaude wrapper at $migrated"
+    else
+      die "Refusing to replace an unmanaged command: $MYCLAUDE_WRAPPER"
+    fi
+  fi
+
+  ln -s "$MYCLAUDE_BIN" "$MYCLAUDE_WRAPPER"
+  [[ "$quiet" == true ]] || note "Installed myclaude. The ordinary claude command remains direct Anthropic Claude."
+}
+
+remove_myclaude() {
+  local preserve_unmanaged="${1:-false}"
+  if [[ -L "$MYCLAUDE_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_WRAPPER")" == "$MYCLAUDE_BIN" ]]; then
+    rm -f "$MYCLAUDE_WRAPPER"
+    note "Removed the managed myclaude launcher. The ordinary claude command was not changed."
+    return 0
+  fi
+  if [[ -e "$MYCLAUDE_WRAPPER" || -L "$MYCLAUDE_WRAPPER" ]]; then
+    if [[ "$preserve_unmanaged" == true ]]; then
+      note "Preserved unmanaged command: $MYCLAUDE_WRAPPER" >&2
+      return 0
+    fi
+    die "Refusing to remove an unmanaged command: $MYCLAUDE_WRAPPER"
+  fi
+  note "myclaude is not installed."
+}
+
+install_myclaude_research() {
+  local quiet="${1:-false}"
+  ensure_private_dirs
+  [[ -x "$MYCLAUDE_RESEARCH_BIN" ]] || die "Research launcher is not executable: $MYCLAUDE_RESEARCH_BIN"
+  if [[ -L "$MYCLAUDE_RESEARCH_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_RESEARCH_WRAPPER")" == "$MYCLAUDE_RESEARCH_BIN" ]]; then
+    [[ "$quiet" == true ]] || note "myclaude-research is already installed."
+    return 0
+  fi
+  if [[ -e "$MYCLAUDE_RESEARCH_WRAPPER" || -L "$MYCLAUDE_RESEARCH_WRAPPER" ]]; then
+    die "Refusing to replace an unmanaged command: $MYCLAUDE_RESEARCH_WRAPPER"
+  fi
+  ln -s "$MYCLAUDE_RESEARCH_BIN" "$MYCLAUDE_RESEARCH_WRAPPER"
+  [[ "$quiet" == true ]] || note "Installed myclaude-research at $MYCLAUDE_RESEARCH_WRAPPER"
+}
+
+remove_myclaude_research() {
+  local preserve_unmanaged="${1:-false}"
+  if [[ -L "$MYCLAUDE_RESEARCH_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_RESEARCH_WRAPPER")" == "$MYCLAUDE_RESEARCH_BIN" ]]; then
+    rm -f "$MYCLAUDE_RESEARCH_WRAPPER"
+    note "Removed the managed myclaude-research launcher."
+    return 0
+  fi
+  if [[ -e "$MYCLAUDE_RESEARCH_WRAPPER" || -L "$MYCLAUDE_RESEARCH_WRAPPER" ]]; then
+    if [[ "$preserve_unmanaged" == true ]]; then
+      note "Preserved unmanaged command: $MYCLAUDE_RESEARCH_WRAPPER" >&2
+      return 0
+    fi
+    die "Refusing to remove an unmanaged command: $MYCLAUDE_RESEARCH_WRAPPER"
+  fi
+  note "myclaude-research is not installed."
+}
+
+remove_managed_hook_settings() {
+  local node_bin="$ROOT/.runtime/node/node_modules/node/bin/node"
+  [[ -x "$node_bin" ]] || {
+    note "Preserved hook settings because the private Node.js runtime is unavailable: $MYCLAUDE_HOOK_SETTINGS" >&2
+    return 0
+  }
+  if [[ ! -e "$MYCLAUDE_HOOK_SETTINGS" && ! -e "$MYCLAUDE_HOOK_SETTINGS.managed" ]]; then
+    return 0
+  fi
+  if ! "$node_bin" "$ROOT/scripts/myclaude/install-hooks.mjs" status --output "$MYCLAUDE_HOOK_SETTINGS" \
+      | "$node_bin" -e '
+        let body = "";
+        process.stdin.on("data", (chunk) => { body += chunk; });
+        process.stdin.on("end", () => {
+          const status = JSON.parse(body);
+          process.exit(status.managed && status.intact ? 0 : 1);
+        });
+      '; then
+    note "Preserved unmanaged or locally modified hook settings: $MYCLAUDE_HOOK_SETTINGS" >&2
+    return 0
+  fi
+  "$node_bin" "$ROOT/scripts/myclaude/install-hooks.mjs" remove --output "$MYCLAUDE_HOOK_SETTINGS" >/dev/null
+}
+
+set_myclaude_profile() {
+  local profile="${1:-}"
+  case "$profile" in
+    guarded|host-unrestricted) ;;
+    *) die "Profile must be guarded or host-unrestricted." ;;
+  esac
+  ensure_private_dirs
+  ensure_runtime
+  require_command flock
+  [[ -x "$MYCLAUDE_SERVER_MANAGER" ]] || die "MyClaude server manager is unavailable: $MYCLAUDE_SERVER_MANAGER"
+  local node_bin="$ROOT/.runtime/node/node_modules/node/bin/node"
+  local profile_lock_fd
+  exec {profile_lock_fd}>"$MYCLAUDE_PROFILE_LOCK"
+  chmod 600 "$MYCLAUDE_PROFILE_LOCK"
+  if ! flock -n "$profile_lock_fd"; then
+    exec {profile_lock_fd}>&-
+    die "Another MyClaude profile change is already in progress."
+  fi
+  local previous_status previous_profile previous_kind previous_was_managed=false
+  previous_status="$("$node_bin" "$ROOT/scripts/myclaude/install-hooks.mjs" \
+    status --output "$MYCLAUDE_HOOK_SETTINGS")"
+  previous_kind="$(printf '%s' "$previous_status" | "$node_bin" -e '
+    let body = "";
+    process.stdin.on("data", (chunk) => { body += chunk; });
+    process.stdin.on("end", () => {
+      const value = JSON.parse(body);
+      if (value.installed && value.managed && value.intact && ["guarded", "host-unrestricted"].includes(value.profile)) {
+        process.stdout.write(`managed:${value.profile}`);
+      } else if (!value.installed && !value.managed) {
+        process.stdout.write("absent");
+      } else {
+        process.stdout.write("unsafe");
+      }
+    });
+  ')"
+  case "$previous_kind" in
+    managed:*)
+      previous_profile="${previous_kind#managed:}"
+      previous_was_managed=true
+      ;;
+    absent) previous_profile="" ;;
+    *)
+      flock -u "$profile_lock_fd" || true
+      exec {profile_lock_fd}>&-
+      die "Refusing to change unmanaged, modified, or incomplete hook settings: $MYCLAUDE_HOOK_SETTINGS"
+      ;;
+  esac
+
+  # This must happen before the hook file is written.  It pauses an idle
+  # managed daemon and rejects active, queued, or unmanaged daemons.
+  local preflight_output
+  if ! preflight_output="$(bash "$MYCLAUDE_SERVER_MANAGER" profile-preflight "$profile" 2>&1)"; then
+    flock -u "$profile_lock_fd" || true
+    exec {profile_lock_fd}>&-
+    printf '%s\n' "$preflight_output" >&2
+    return 1
+  fi
+  [[ -z "$preflight_output" ]] || printf '%s\n' "$preflight_output"
+
+  local install_output abort_output
+  if ! install_output="$("$node_bin" "$ROOT/scripts/myclaude/install-hooks.mjs" \
+      install --profile "$profile" --output "$MYCLAUDE_HOOK_SETTINGS" 2>&1)"; then
+    if ! abort_output="$(bash "$MYCLAUDE_SERVER_MANAGER" profile-abort 2>&1)"; then
+      flock -u "$profile_lock_fd" || true
+      exec {profile_lock_fd}>&-
+      printf '%s\n' "$install_output" >&2
+      printf 'Error: hook installation failed and the previous daemon could not be restored: %s\n' "$abort_output" >&2
+      return 1
+    fi
+    flock -u "$profile_lock_fd" || true
+    exec {profile_lock_fd}>&-
+    printf '%s\n' "$install_output" >&2
+    return 1
+  fi
+  printf '%s\n' "$install_output"
+
+  local apply_output rollback_output rollback_ok=true quiesce_output
+  if ! apply_output="$(bash "$MYCLAUDE_SERVER_MANAGER" profile-applied "$profile" 2>&1)"; then
+    # Stop any partially started new-profile daemon before restoring the old
+    # hook file, so executor settings and daemon policy never diverge.
+    if ! quiesce_output="$(bash "$MYCLAUDE_SERVER_MANAGER" profile-quiesce 2>&1)"; then
+      flock -u "$profile_lock_fd" || true
+      exec {profile_lock_fd}>&-
+      printf '%s\n' "$apply_output" >&2
+      printf 'Error: profile application failed and the partial daemon could not be stopped: %s\n' "$quiesce_output" >&2
+      return 1
+    fi
+    if [[ "$previous_was_managed" == true ]]; then
+      if ! rollback_output="$("$node_bin" "$ROOT/scripts/myclaude/install-hooks.mjs" \
+          install --profile "$previous_profile" --output "$MYCLAUDE_HOOK_SETTINGS" 2>&1)"; then
+        rollback_ok=false
+      fi
+    elif ! rollback_output="$("$node_bin" "$ROOT/scripts/myclaude/install-hooks.mjs" \
+        remove --output "$MYCLAUDE_HOOK_SETTINGS" 2>&1)"; then
+      rollback_ok=false
+    fi
+    if [[ "$rollback_ok" != true ]]; then
+      flock -u "$profile_lock_fd" || true
+      exec {profile_lock_fd}>&-
+      printf '%s\n' "$apply_output" >&2
+      printf 'Error: profile application failed and hook rollback failed; the daemon remains stopped: %s\n' "$rollback_output" >&2
+      return 1
+    fi
+    if ! abort_output="$(bash "$MYCLAUDE_SERVER_MANAGER" profile-abort 2>&1)"; then
+      flock -u "$profile_lock_fd" || true
+      exec {profile_lock_fd}>&-
+      printf '%s\n' "$apply_output" >&2
+      printf 'Error: hooks were rolled back, but the previous daemon could not be restored: %s\n' "$abort_output" >&2
+      return 1
+    fi
+    flock -u "$profile_lock_fd" || true
+    exec {profile_lock_fd}>&-
+    printf '%s\n' "$apply_output" >&2
+    printf '%s\n' "Error: profile change failed and was rolled back to $previous_profile." >&2
+    return 1
+  fi
+  [[ -z "$apply_output" ]] || printf '%s\n' "$apply_output"
+  flock -u "$profile_lock_fd" || true
+  exec {profile_lock_fd}>&-
+  if [[ "$profile" == "host-unrestricted" ]]; then
+    note "Warning: host-unrestricted can access any file and credential available to your Unix user."
+  fi
+}
+
+resolve_direct_claude() {
+  if [[ -n "${CLAUDE_BIN:-}" && -x "$CLAUDE_BIN" ]]; then
+    printf '%s' "$CLAUDE_BIN"
+    return 0
+  fi
+  if [[ -f "$CONNECTION_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONNECTION_FILE"
+    if [[ -x "${ORIGINAL_CLAUDE:-}" ]]; then
+      printf '%s' "$ORIGINAL_CLAUDE"
+      return 0
+    fi
+  fi
+  if [[ -x "$USER_BIN_DIR/claude-anthropic" ]]; then
+    printf '%s' "$USER_BIN_DIR/claude-anthropic"
+    return 0
+  fi
+  local candidate
+  candidate="$(command -v claude 2>/dev/null || true)"
+  [[ -n "$candidate" && -x "$candidate" ]] || return 1
+  if [[ "$candidate" == "$CLAUDE_WRAPPER" ]] && claude_is_connected; then
+    return 1
+  fi
+  printf '%s' "$candidate"
+}
+
+run_myclaude() {
+  if [[ "${MYCLAUDE_MANAGED_HOOKS_VERIFIED:-0}" != "1" ]]; then
+    exec "$MYCLAUDE_BIN" "$@"
+  fi
+  local direct_claude
+  direct_claude="$(resolve_direct_claude)" || die "Direct Claude Code is not installed or could not be resolved."
+  if ! proxy_health; then
+    start_proxy
+  fi
+  exec env CLAUDE_BIN="$direct_claude" bash "$ROOT/scripts/claude-local.sh" "$@"
 }
 
 write_claude_wrapper() {
@@ -344,44 +697,16 @@ connect_claude() {
   ensure_private_dirs
   ensure_runtime
 
-  if claude_is_connected && [[ -f "$CONNECTION_FILE" ]]; then
-    note "Claude is already connected to the M365 proxy."
-    return 0
+  # Older releases replaced ~/.local/bin/claude. Restore that command first so
+  # provider selection is explicit forever: `claude` is direct, `myclaude` is M365.
+  if claude_is_connected || [[ -f "$CONNECTION_FILE" ]]; then
+    disconnect_claude
   fi
-
-  local original_claude=""
-  local restore_mode="shadow"
-  local backup_path="$STATE_DIR/claude.original"
-
-  if [[ -x "$USER_BIN_DIR/claude-anthropic" ]] && [[ -f "$CLAUDE_WRAPPER" ]] \
-    && grep -Fq 'scripts/claude-local.sh' "$CLAUDE_WRAPPER"; then
-    original_claude="$USER_BIN_DIR/claude-anthropic"
-    restore_mode="symlink"
-    rm -f "$CLAUDE_WRAPPER"
-  else
-    original_claude="$(command -v claude 2>/dev/null || true)"
-    [[ -n "$original_claude" ]] || die "Claude Code is not installed or is not on PATH. Install Claude Code first."
-    if [[ "$original_claude" == "$CLAUDE_WRAPPER" ]]; then
-      [[ ! -e "$backup_path" && ! -L "$backup_path" ]] || die "Claude backup already exists: $backup_path"
-      mv "$CLAUDE_WRAPPER" "$backup_path"
-      original_claude="$backup_path"
-      restore_mode="moved"
-    fi
-  fi
-
-  printf 'ORIGINAL_CLAUDE=%q\nRESTORE_MODE=%q\nBACKUP_PATH=%q\n' \
-    "$original_claude" "$restore_mode" "$backup_path" > "$CONNECTION_FILE"
-  chmod 600 "$CONNECTION_FILE"
-
-  node "$ROOT/scripts/claude-settings.mjs" clean-legacy "$STATE_DIR" || {
-    rm -f "$CONNECTION_FILE"
+  resolve_direct_claude >/dev/null || die "Claude Code is not installed or is not on PATH. Install Claude Code first."
+  node "$ROOT/scripts/claude-settings.mjs" clean-legacy "$STATE_DIR" || \
     die "Could not safely migrate legacy Claude proxy settings."
-  }
-  write_claude_wrapper "$CLAUDE_WRAPPER" claude
-  write_claude_wrapper "$CLAUDE_DIRECT_WRAPPER" claude-direct
-
-  note "Claude is connected. Start the proxy, then run: claude"
-  note "Use claude-direct anytime to bypass the proxy."
+  install_myclaude
+  note "Migration complete: claude is direct; myclaude uses the M365 proxy."
 }
 
 load_claude_connection() {
@@ -426,30 +751,16 @@ disconnect_claude() {
 }
 
 run_claude_proxy() {
-  load_claude_connection
-  load_proxy_env
-  proxy_health || die "Proxy is not running. Run in another terminal: m365-copilot start"
-  local selected_model="${MODEL:-gpt-5.5-think-deeper}"
-
-  export ANTHROPIC_BASE_URL="$PROXY_URL"
-  export ANTHROPIC_AUTH_TOKEN="$M365_PROXY_API_KEY"
-  export ANTHROPIC_MODEL="$selected_model"
-  export ANTHROPIC_SMALL_FAST_MODEL="$selected_model"
-  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-  export DISABLE_TELEMETRY=1
-  export DISABLE_ERROR_REPORTING=1
-  export DISABLE_BUG_COMMAND=1
-  unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
-
-  printf '[claude-m365] proxy=%s model=%s\n' "$PROXY_URL" "$selected_model" >&2
-  exec "$ORIGINAL_CLAUDE" --model "$selected_model" --tools=Bash,Read,Edit,Write,Glob,Grep "$@"
+  note "[deprecated] Use myclaude. The ordinary claude command remains direct." >&2
+  run_myclaude "$@"
 }
 
 run_claude_direct() {
-  load_claude_connection
+  local direct_claude
+  direct_claude="$(resolve_direct_claude)" || die "Direct Claude Code is not installed."
   unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL
   unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
-  exec "$ORIGINAL_CLAUDE" "$@"
+  exec "$direct_claude" "$@"
 }
 
 doctor() {
@@ -485,11 +796,16 @@ doctor() {
     note "[info] proxy is not running or is unhealthy"
   fi
   if claude_is_connected; then
-    note "[ok] Claude is connected to the proxy"
+    note "[warning] legacy Claude proxy wrapper is active; run connect-claude to migrate"
   elif command -v claude >/dev/null 2>&1; then
-    note "[info] Claude is installed in normal/direct mode"
+    note "[ok] Claude is installed in normal/direct mode"
   else
     note "[info] Claude Code is not installed"
+  fi
+  if [[ -L "$MYCLAUDE_WRAPPER" ]] && [[ "$(readlink "$MYCLAUDE_WRAPPER")" == "$MYCLAUDE_BIN" ]]; then
+    note "[ok] myclaude launcher is installed"
+  else
+    note "[info] myclaude launcher is not installed; run install-myclaude"
   fi
   if [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
     note "[warning] both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY are set in this shell"
@@ -504,8 +820,14 @@ doctor() {
 
 uninstall_all() {
   local purge="${1:-}"
+  if [[ -x "$MYCLAUDE_SERVER_MANAGER" ]]; then
+    bash "$MYCLAUDE_SERVER_MANAGER" remove-service
+  fi
   stop_proxy || true
   disconnect_claude || true
+  remove_myclaude true || true
+  remove_myclaude_research true || true
+  remove_managed_hook_settings || true
   if [[ -L "$USER_BIN_DIR/m365-copilot" ]] && [[ "$(readlink "$USER_BIN_DIR/m365-copilot")" == "$CONTROL_BIN" ]]; then
     rm -f "$USER_BIN_DIR/m365-copilot"
   fi
@@ -536,6 +858,12 @@ case "$command_name" in
   status) status_all "$@" ;;
   logs) show_logs "$@" ;;
   models) list_models "$@" ;;
+  install-myclaude) install_myclaude "$@" ;;
+  remove-myclaude) remove_myclaude "$@" ;;
+  install-research) install_myclaude_research "$@" ;;
+  remove-research) remove_myclaude_research "$@" ;;
+  profile) set_myclaude_profile "$@" ;;
+  myclaude) run_myclaude "$@" ;;
   connect-claude) connect_claude "$@" ;;
   disconnect-claude) disconnect_claude "$@" ;;
   claude) run_claude_proxy "$@" ;;

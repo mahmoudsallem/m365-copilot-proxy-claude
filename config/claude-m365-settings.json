@@ -1,0 +1,29 @@
+{
+  "model": "claude-m365--gpt-5.5-think-deeper",
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": ""
+  },
+  "availableModels": [
+    "claude-m365--m365-copilot",
+    "claude-m365--auto",
+    "claude-m365--quick",
+    "claude-m365--think-deeper",
+    "claude-m365--claude",
+    "claude-m365--claude-sonnet",
+    "claude-m365--claude-sonnet-4.5",
+    "claude-m365--claude-sonnet-think-deeper",
+    "claude-m365--claude-opus",
+    "claude-m365--gpt-5.5",
+    "claude-m365--gpt-5.5-quick",
+    "claude-m365--gpt-5.5-think-deeper",
+    "claude-m365--gpt-5.4",
+    "claude-m365--gpt-5.4-quick",
+    "claude-m365--gpt-5.4-think-deeper",
+    "claude-m365--gpt-5.3",
+    "claude-m365--gpt-5.3-quick",
+    "claude-m365--gpt-5.3-think-deeper",
+    "claude-m365--gpt-5.2",
+    "claude-m365--gpt-5.2-quick",
+    "claude-m365--gpt-5.2-think-deeper"
+  ]
+}

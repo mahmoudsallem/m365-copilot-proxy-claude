@@ -1,7 +1,12 @@
 import { z } from "zod/v4";
-import { getAvailableModels, resolveModel } from "@m365-copilot/core";
+import {
+  CONSERVATIVE_MODEL_LIMITS,
+  getAvailableModels,
+  getDefaultModel,
+} from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { handleChatCompletion, type SessionPool } from "./handler.js";
+import { safeTelemetryLabel } from "./telemetry.js";
 
 const TextBlock = z.object({
   type: z.literal("text"),
@@ -18,18 +23,38 @@ const ToolUseBlock = z.object({
 const ToolResultBlock = z.object({
   type: z.literal("tool_result"),
   tool_use_id: z.string(),
-  content: z.unknown().optional().default(""),
+  // Image/document blocks cannot currently be forwarded to M365 faithfully.
+  // Reject them at the boundary instead of silently reducing them to empty text.
+  content: z.union([z.string(), z.array(TextBlock)]).optional().default(""),
   is_error: z.boolean().optional(),
 }).passthrough();
 
-const IgnoredBlock = z.object({ type: z.string() }).passthrough();
-const ContentBlock = z.union([TextBlock, ToolUseBlock, ToolResultBlock, IgnoredBlock]);
+// Fail closed on thinking, redacted_thinking, image, document, server_tool_use,
+// and future block types. Silently discarding one corrupts the transcript and can
+// make a coding agent act on a result it never actually received.
+const ContentBlock = z.discriminatedUnion("type", [TextBlock, ToolUseBlock, ToolResultBlock]);
 
 const AnthropicMessage = z.object({
   // Accept 'system' role in the messages array — some clients (Cursor, older Claude Code)
   // send system instructions as a message rather than in the top-level `system` field.
   role: z.enum(["user", "assistant", "system"]),
   content: z.union([z.string(), z.array(ContentBlock)]),
+}).superRefine((message, ctx) => {
+  if (!Array.isArray(message.content)) return;
+  message.content.forEach((block, index) => {
+    const allowed = message.role === "assistant"
+      ? block.type === "text" || block.type === "tool_use"
+      : message.role === "system"
+        ? block.type === "text"
+        : block.type === "text" || block.type === "tool_result";
+    if (!allowed) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["content", index, "type"],
+        message: `${block.type} is not supported in an Anthropic ${message.role} message`,
+      });
+    }
+  });
 });
 
 const AnthropicTool = z.object({
@@ -47,7 +72,7 @@ const AnthropicToolChoice = z.union([
 
 export const AnthropicMessagesRequest = z.object({
   model: z.string().min(1),
-  max_tokens: z.number().int().positive().optional().default(8192),
+  max_tokens: z.number().int().positive().optional().default(CONSERVATIVE_MODEL_LIMITS.maxOutputTokens),
   messages: z.array(AnthropicMessage).min(1),
   system: z.union([z.string(), z.array(TextBlock)]).optional(),
   tools: z.array(AnthropicTool).optional(),
@@ -72,42 +97,20 @@ type OpenAIMessage = {
   name?: string;
 };
 
-function textFromUnknown(value: unknown): string {
+function toolResultText(value: z.infer<typeof ToolResultBlock>["content"]): string {
   if (typeof value === "string") return value;
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => {
-        if (item && typeof item === "object" && "text" in item && typeof item.text === "string") {
-          return item.text;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (value == null) return "";
-  try { return JSON.stringify(value); } catch { return String(value); }
+  return value.map((item) => item.text).join("\n");
 }
 
 function systemText(system: AnthropicBody["system"]): string {
   if (!system) return "";
   if (typeof system === "string") return system;
-  if (Array.isArray(system)) {
-    return system
-      .map((block: any) => (typeof block === "string" ? block : block?.text ?? ""))
-      .filter(Boolean)
-      .join("\n\n");
-  }
-  if (typeof system === "object" && system !== null) {
-    const s = system as any;
-    if (typeof s.text === "string") return s.text;
-    try { return JSON.stringify(system); } catch { return String(system); }
-  }
-  return String(system);
+  return system.map((block) => block.text).join("\n\n");
 }
 
 function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
+  const toolNames = new Map<string, string>();
 
   // Collect system content from both the top-level `system` field and any
   // system-role messages in the messages array (sent by Cursor / older clients).
@@ -117,8 +120,13 @@ function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
 
   // Extract system-role messages so they don't pollute the turn array.
   const nonSystemMessages = body.messages.filter((m) => {
-    if ((m as any).role === "system") {
-      const text = typeof m.content === "string" ? m.content : textFromUnknown(m.content);
+    if (m.role === "system") {
+      const text = typeof m.content === "string"
+        ? m.content
+        : m.content
+          .map((block) => block.type === "text" ? block.text : "")
+          .filter(Boolean)
+          .join("\n\n");
       if (text) systemParts.push(text);
       return false;
     }
@@ -141,11 +149,14 @@ function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
         .join("\n");
       const toolCalls = message.content
         .filter((block): block is z.infer<typeof ToolUseBlock> => block.type === "tool_use")
-        .map((block) => ({
-          id: block.id,
-          type: "function" as const,
-          function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
-        }));
+        .map((block) => {
+          toolNames.set(block.id, block.name);
+          return {
+            id: block.id,
+            type: "function" as const,
+            function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+          };
+        });
       messages.push({
         role: "assistant",
         content: text || null,
@@ -166,10 +177,11 @@ function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
         pendingText.push(block.text);
       } else if (block.type === "tool_result") {
         flushText();
-        const result = textFromUnknown(block.content);
+        const result = toolResultText(block.content);
         messages.push({
           role: "tool",
           tool_call_id: block.tool_use_id,
+          ...(toolNames.get(block.tool_use_id) ? { name: toolNames.get(block.tool_use_id) } : {}),
           content: block.is_error ? `[tool error]\n${result}` : result,
         });
       }
@@ -188,17 +200,30 @@ function mapToolChoice(choice: AnthropicBody["tool_choice"]) {
   return { type: "function" as const, function: { name: choice.name } };
 }
 
+const M365_MODEL_IDS = new Set(getAvailableModels());
+
+/**
+ * Claude Code only accepts gateway-discovered model IDs beginning with `claude`
+ * or `anthropic`. Keep that transport-only prefix out of the M365 model catalog.
+ */
+export const CLAUDE_GATEWAY_MODEL_PREFIX = "claude-m365--";
+
+export function toClaudeGatewayModelId(model: string): string {
+  return `${CLAUDE_GATEWAY_MODEL_PREFIX}${model}`;
+}
+
 /**
  * Claude Code's /model picker sends Anthropic model names or custom model aliases.
  * Resolve against our centralized capability-aware model registry.
  */
 export function resolveM365Model(requested: string): string {
-  try {
-    const resolved = resolveModel(requested);
-    return resolved.canonicalModel;
-  } catch {
-    return process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5";
+  if (requested.startsWith(CLAUDE_GATEWAY_MODEL_PREFIX)) {
+    const model = requested.slice(CLAUDE_GATEWAY_MODEL_PREFIX.length);
+    if (M365_MODEL_IDS.has(model)) return model;
   }
+  if (M365_MODEL_IDS.has(requested)) return requested;
+  const configured = process.env.M365_CLAUDE_CODE_MODEL;
+  return configured && M365_MODEL_IDS.has(configured) ? configured : getDefaultModel();
 }
 
 /** Translate Claude's Messages API request into the proxy's OpenAI Chat request. */
@@ -233,7 +258,75 @@ export interface AnthropicMessageResponse {
   content: AnthropicContent[];
   stop_reason: "end_turn" | "tool_use" | "max_tokens";
   stop_sequence: null;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    x_m365_source_attributions?: unknown[];
+    x_m365_requested_model?: string;
+    x_m365_resolved_model?: string;
+    x_m365_tone?: string;
+    x_m365_agent_route?: string;
+    x_m365_certification?: string;
+    x_m365_upstream_attempts?: number;
+    x_m365_recovery_events?: string[];
+    x_m365_conversation_messages?: number;
+    x_m365_conversation_max?: number;
+    x_m365_conversation_pct?: number;
+    x_m365_conversation_remaining?: number;
+    x_m365_latency_ms?: number;
+    x_m365_output_chars?: number;
+    x_m365_output_bytes?: number;
+    x_m365_tool_calls?: number;
+    x_m365_last_tested_service?: string;
+  };
+}
+
+type SafeM365Usage = Omit<AnthropicMessageResponse["usage"], "input_tokens" | "output_tokens" | "x_m365_source_attributions">;
+
+const SAFE_STRING_USAGE_KEYS = [
+  "x_m365_requested_model",
+  "x_m365_resolved_model",
+  "x_m365_tone",
+  "x_m365_agent_route",
+  "x_m365_certification",
+  "x_m365_last_tested_service",
+] as const;
+
+const SAFE_NUMBER_USAGE_KEYS = [
+  "x_m365_upstream_attempts",
+  "x_m365_conversation_messages",
+  "x_m365_conversation_max",
+  "x_m365_conversation_pct",
+  "x_m365_conversation_remaining",
+  "x_m365_latency_ms",
+  "x_m365_output_chars",
+  "x_m365_output_bytes",
+  "x_m365_tool_calls",
+] as const;
+
+/** Copy only explicitly non-secret diagnostics from the OpenAI bridge. */
+export function pickSafeM365Usage(value: unknown): SafeM365Usage {
+  if (!value || typeof value !== "object") return {};
+  const input = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const key of SAFE_STRING_USAGE_KEYS) {
+    const candidate = input[key];
+    if (typeof candidate === "string") output[key] = safeTelemetryLabel(candidate);
+  }
+  for (const key of SAFE_NUMBER_USAGE_KEYS) {
+    const candidate = input[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) {
+      output[key] = candidate;
+    }
+  }
+  const recovery = input.x_m365_recovery_events;
+  if (Array.isArray(recovery)) {
+    output.x_m365_recovery_events = recovery
+      .filter((item): item is string => typeof item === "string")
+      .slice(0, 32)
+      .map((item) => safeTelemetryLabel(item, 96));
+  }
+  return output as SafeM365Usage;
 }
 
 function parseToolInput(raw: string): unknown {
@@ -271,7 +364,7 @@ export function fromOpenAIChatResponse(payload: any, requestedModel: string): An
     });
   }
 
-  if (content.length === 0) content.push({ type: "text", text: "Okay." });
+  if (content.length === 0) content.push({ type: "text", text: "" });
 
   const finish = choice.finish_reason;
   const stopReason = finish === "tool_calls"
@@ -288,6 +381,10 @@ export function fromOpenAIChatResponse(payload: any, requestedModel: string): An
     usage: {
       input_tokens: Number(payload?.usage?.prompt_tokens ?? 0),
       output_tokens: Number(payload?.usage?.completion_tokens ?? 0),
+      ...pickSafeM365Usage(payload?.usage),
+      ...(Array.isArray(payload?.usage?.x_m365_source_attributions)
+        ? { x_m365_source_attributions: payload.usage.x_m365_source_attributions }
+        : {}),
     },
   };
 }
@@ -309,15 +406,22 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
   return new Response(new ReadableStream({
     start(controller) {
       const send = (name: string, data: unknown) => controller.enqueue(encoder.encode(event(name, data)));
+      const safeUsage = {
+        input_tokens: Number.isFinite(message.usage.input_tokens) ? Math.max(0, message.usage.input_tokens) : 0,
+        output_tokens: Number.isFinite(message.usage.output_tokens) ? Math.max(0, message.usage.output_tokens) : 0,
+        ...pickSafeM365Usage(message.usage),
+        ...(Array.isArray(message.usage.x_m365_source_attributions)
+          ? { x_m365_source_attributions: message.usage.x_m365_source_attributions }
+          : {}),
+      };
       send("message_start", {
         type: "message_start",
-        message: { ...message, content: [], stop_reason: null, stop_sequence: null },
+        message: { ...message, usage: safeUsage, content: [], stop_reason: null, stop_sequence: null },
       });
       (message?.content ?? []).forEach((block, index) => {
         if (block.type === "text") {
-          const textVal = block.text?.trim() ? block.text : "Okay.";
           send("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
-          send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: textVal } });
+          if (block.text) send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } });
         } else {
           send("content_block_start", {
             type: "content_block_start",
@@ -335,7 +439,13 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
       send("message_delta", {
         type: "message_delta",
         delta: { stop_reason: message.stop_reason, stop_sequence: null },
-        usage: { output_tokens: message.usage.output_tokens },
+        usage: {
+          output_tokens: safeUsage.output_tokens,
+          ...pickSafeM365Usage(safeUsage),
+          ...(Array.isArray(safeUsage.x_m365_source_attributions)
+            ? { x_m365_source_attributions: safeUsage.x_m365_source_attributions }
+            : {}),
+        },
       });
       send("message_stop", { type: "message_stop" });
       controller.close();
@@ -347,9 +457,14 @@ async function produceAnthropic(
   body: AnthropicBody,
   pool: SessionPool,
   signal?: AbortSignal,
+  sessionId?: string,
 ): Promise<AnthropicMessageResponse | Response> {
   const openai = toOpenAIChatRequest(body);
-  const upstream = await handleChatCompletion(openai, pool, { signal });
+  const upstream = await handleChatCompletion(openai, pool, {
+    signal,
+    sessionId,
+    requestedModel: body.model,
+  });
   if (!upstream.ok) {
     let message = `M365 upstream returned HTTP ${upstream.status}`;
     let upstreamType = "upstream_error";
@@ -370,11 +485,19 @@ async function produceAnthropic(
     const type = nonRetryable
       ? "invalid_request_error"
       : upstream.status === 429 ? "rate_limit_error" : "api_error";
-    return anthropicError(status, message, type);
+    const response = anthropicError(status, message, type);
+    const effectiveSessionId = upstream.headers.get("x-m365-session-id");
+    if (effectiveSessionId) response.headers.set("X-M365-Session-ID", effectiveSessionId);
+    return response;
   }
   let payload: unknown;
   try { payload = await upstream.json(); }
-  catch { return anthropicError(502, "M365 upstream returned invalid JSON"); }
+  catch {
+    const response = anthropicError(502, "M365 upstream returned invalid JSON");
+    const effectiveSessionId = sessionId ?? upstream.headers.get("x-m365-session-id");
+    if (effectiveSessionId) response.headers.set("X-M365-Session-ID", effectiveSessionId);
+    return response;
+  }
   return fromOpenAIChatResponse(payload, body.model);
 }
 
@@ -383,11 +506,26 @@ export async function handleAnthropicMessages(
   body: AnthropicBody,
   pool: SessionPool,
   signal?: AbortSignal,
+  requestedSessionId?: string,
 ): Promise<Response> {
+  let sessionId: string;
+  try {
+    const openai = toOpenAIChatRequest(body);
+    sessionId = pool.getEffectiveSessionId(
+      openai.messages,
+      requestedSessionId,
+      `anthropic:${openai.model}`,
+    );
+  } catch (error: any) {
+    return anthropicError(400, error?.message ?? "Invalid M365 session", "invalid_request_error");
+  }
+
   if (!body.stream) {
-    const result = await produceAnthropic(body, pool, signal);
+    const result = await produceAnthropic(body, pool, signal, sessionId);
     if (result instanceof Response) return result;
-    return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify(result), {
+      headers: { "Content-Type": "application/json", "X-M365-Session-ID": sessionId },
+    });
   }
 
   const encoder = new TextEncoder();
@@ -397,7 +535,7 @@ export async function handleAnthropicMessages(
         try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch {}
       }, 15_000);
       try {
-        const result = await produceAnthropic(body, pool, signal);
+        const result = await produceAnthropic(body, pool, signal, sessionId);
         if (result instanceof Response) {
           let error = { type: "api_error", message: "M365 upstream error" };
           try {
@@ -421,7 +559,13 @@ export async function handleAnthropicMessages(
         try { controller.close(); } catch {}
       }
     },
-  }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+  }), {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "X-M365-Session-ID": sessionId,
+    },
+  });
 }
 
 /** Approximation only: M365 exposes no tokenizer compatible with all routed models. */

@@ -111,6 +111,24 @@ describe("parseFencedToolCalls", () => {
     expect(args).toEqual({ path: "f.py", content });
   });
 
+  it("uses a longer CommonMark fence when a file body contains triple backticks", () => {
+    const content = "# Guide\n\n```bash\necho nested\n```\n";
+    const rendered = renderFencedCall(deriveFencedSpec(writeFile), { path: "README.md", content });
+    expect(rendered.startsWith("````write_file\n")).toBe(true);
+    expect(rendered.endsWith("\n````")).toBe(true);
+    const { args } = argsOf(rendered);
+    expect(args).toEqual({ path: "README.md", content });
+  });
+
+  it("accepts a longer closing fence and keeps shorter nested fences in the body", () => {
+    const rendered = "````write_file\npath: README.md\n\n```js\nconsole.log(1)\n```\n`````";
+    const { args } = argsOf(rendered);
+    expect(args).toEqual({
+      path: "README.md",
+      content: "```js\nconsole.log(1)\n```",
+    });
+  });
+
   it("round-trips an edit_file SEARCH/REPLACE", () => {
     const rendered = renderFencedCall(deriveFencedSpec(editFile), {
       path: "app.py",

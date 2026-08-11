@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { foldStreamText } from "./session.js";
+import { normalizeSourceAttribution } from "./copilot.js";
 import { MessageUpdate } from "./schemas.js";
 
 /** Replay a sequence of raw M365 frames (deltas as {d}, snapshots as {s}) through
@@ -109,5 +110,37 @@ describe("GraphicArt image frame parsing (§14)", () => {
     expect(parsed.success).toBe(true);
     const m = parsed.data!.messages[0] as any;
     expect(m.contentGenerationProgressList).toBeUndefined();
+  });
+});
+
+describe("source attribution normalization", () => {
+  it("normalizes nested Bing attribution fields without inventing a URL", () => {
+    expect(normalizeSourceAttribution({
+      citationId: "7",
+      attribution: {
+        seeMoreUrl: "https://example.test/article",
+        displayName: "Example article",
+        description: "Grounded excerpt",
+        providerDisplayName: "Bing",
+      },
+    })).toEqual({
+      sourceId: "7",
+      url: "https://example.test/article",
+      title: "Example article",
+      excerpt: "Grounded excerpt",
+      provider: "Bing",
+    });
+  });
+
+  it("rejects attribution-like objects with no real http(s) URL", () => {
+    expect(normalizeSourceAttribution({ title: "model-written citation" })).toBeNull();
+    expect(normalizeSourceAttribution({ url: "javascript:alert(1)" })).toBeNull();
+    expect(normalizeSourceAttribution({ url: "https://user:password@example.test/private" })).toBeNull();
+  });
+
+  it("redacts secret-bearing URL parameters before surfacing telemetry", () => {
+    expect(normalizeSourceAttribution({
+      url: "https://example.test/source?topic=ai&token=secret&sig=signed",
+    })?.url).toBe("https://example.test/source?topic=ai");
   });
 });
