@@ -42,6 +42,11 @@ function passRate(runs) {
   return runs.length ? runs.filter(passed).length / runs.length : 0;
 }
 
+function taskBalancedPassRate(runs, taskIds) {
+  const rates = [...taskIds].map((taskId) => passRate(runs.filter((run) => run.taskId === taskId)));
+  return rates.length ? rates.reduce((sum, rate) => sum + rate, 0) / rates.length : 0;
+}
+
 function average(runs, field) {
   return runs.length ? runs.reduce((sum, run) => sum + Number(run[field] ?? 0), 0) / runs.length : 0;
 }
@@ -76,16 +81,21 @@ function certification(value) {
   const totalToolCalls = adaptive.reduce((sum, run) => sum + Number(run.toolCalls ?? 0), 0);
   const malformedRate = totalToolCalls > 0 ? malformedToolCalls / totalToolCalls : (malformedToolCalls ? 1 : 0);
   const fabricatedCitations = adaptive.reduce((sum, run) => sum + Number(run.fabricatedCitations ?? 0), 0);
-  const adaptiveRate = passRate(adaptive);
-  const directRate = passRate(direct);
+  // Compare systems per task rather than by raw row count: critical tasks have
+  // more repetitions and must not accidentally dominate either pass rate.
+  const adaptiveRate = taskBalancedPassRate(adaptive, supportedIds);
+  const directRate = taskBalancedPassRate(direct, supportedIds);
   const relativeRate = directRate > 0 ? adaptiveRate / directRate : 0;
   const adaptiveCost = average(adaptive, "messages");
   const standardCost = average(standard, "messages");
   const costRatio = standardCost > 0 ? adaptiveCost / standardCost : Number.POSITIVE_INFINITY;
+  const certificationRows = [...adaptive, ...standard, ...direct];
+  const nonLiveOrUnisolated = certificationRows.filter((run) => run.adapter !== "command" || run.isolation !== "docker");
   const gates = [
     gate("catalog-valid", validateVerifiedCatalog().valid, validateVerifiedCatalog().taskCount, ">=30 tasks and all required categories"),
     gate("unit-integration-green", Number(value.unitIntegrationFailures ?? -1) === 0, Number(value.unitIntegrationFailures ?? -1), "0 failures"),
     gate("sequential-randomized", value.execution?.sequential === true && value.execution?.randomized === true && value.execution?.maxConcurrent === 1, value.execution ?? null, "sequential=true, randomized=true, maxConcurrent=1"),
+    gate("live-isolated-evidence", certificationRows.length > 0 && nonLiveOrUnisolated.length === 0, { rows: certificationRows.length, rejectedRows: nonLiveOrUnisolated.length }, "every certification row uses adapter=command and isolation=docker"),
     gate("catalog-coverage", missingTasks.length === 0, { covered: adaptiveIds.size, missingTasks }, `all ${VERIFIED_TASKS.length} tasks`),
     gate("critical-repeat", insufficientCritical.length === 0, insufficientCritical, "at least 5 distinct repetitions for every critical task"),
     gate("standard-coverage", missingStandardTasks.length === 0, { covered: standardIds.size, missingTasks: missingStandardTasks }, `all ${VERIFIED_TASKS.length} tasks`),
@@ -115,7 +125,9 @@ function shadow(value) {
     || (run.status === "passed" && run.verifierPassed !== true)).length;
   const upstreamFailures = runs.filter((run) => run.unrecoveredUpstreamFailure === true).length;
   const upstreamFailureRate = runs.length ? upstreamFailures / runs.length : 1;
+  const nonLiveRows = runs.filter((run) => run.adapter !== "command");
   const gates = [
+    gate("shadow-live-evidence", runs.length > 0 && nonLiveRows.length === 0, { rows: runs.length, rejectedRows: nonLiveRows.length }, "every shadow row uses adapter=command"),
     gate("shadow-volume", runs.length >= 100 || durationDays >= 7, { runs: runs.length, durationDays }, ">=100 tasks or >=7 days"),
     gate("shadow-silent-false-success", silentFalseSuccesses === 0, silentFalseSuccesses, "0"),
     gate("shadow-upstream-recovery", runs.length > 0 && upstreamFailureRate < 0.05, { upstreamFailures, runs: runs.length, rate: upstreamFailureRate }, "<0.05"),

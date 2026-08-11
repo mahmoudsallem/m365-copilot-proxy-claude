@@ -9,6 +9,8 @@ if (!kind || !outputPath) process.exit(2);
 function run(system, mode, taskId, repetition, extra = {}) {
   return {
     system,
+    adapter: "command",
+    isolation: "docker",
     mode,
     taskId,
     repetition,

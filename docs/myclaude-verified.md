@@ -43,17 +43,20 @@ node scripts/myclaude/install-hooks.mjs remove
 
 ### Profiles
 
-- `guarded` is the public default. It restricts file tools to the selected
-  workspace and deterministically denies recognized destructive operations,
-  credential-store access, publishing, and force pushes.
+- `guarded` is the public default. Built-in file tools (`Read`, `Write`, `Edit`,
+  and related tools) are restricted to the selected workspace. Bash is covered
+  only by a best-effort denylist and Claude Code's normal permission behavior;
+  recognized destructive operations, credential-store access, publishing, and
+  force pushes are denied.
 - `host-unrestricted` evaluates and records the same rules but emits no
   permission decision. Claude Code's selected permission mode remains in
   control. This is the observation-only profile for the owner's trusted host.
 
-The guarded rules are defense in depth, not a shell sandbox. Bash syntax is too
-expressive for regular-expression policy to form a security boundary. Use a
-container or worktree with restricted credentials when strong isolation is
-required. `host-unrestricted` provides auditing only.
+The guarded rules are defense in depth, not a shell sandbox or security
+boundary. Under normal OS permissions, Bash can express paths and operations
+that a regular-expression denylist cannot reliably contain. Use a container or
+worktree with restricted credentials when strong isolation is required.
+`host-unrestricted` provides auditing only.
 
 ### Evidence and the Stop gate
 
@@ -197,13 +200,91 @@ The 37-task catalog in `scripts/bench/verified-tasks.mjs` covers:
 - Clarification/correction behavior and plan dependency execution.
 - Unsafe prompts, output truncation/checkpointing, and daemon/API recovery.
 
-Validate or export it without consuming M365 quota:
+Validate or export the catalog without consuming M365 quota:
 
 ```bash
 node scripts/bench/verified-catalog.mjs validate
 node scripts/bench/verified-catalog.mjs list
 node scripts/bench/verified-catalog.mjs json
 ```
+
+### Sequential evaluation runner
+
+`verified-runner.mjs` materializes every selected fixture in a new mode-0700
+temporary Git repository, invokes exactly one adapter at a time, runs its
+objective verifier, and atomically checkpoints `myclaude.eval-results/v1` after
+every row. A per-user process lock prevents two runner instances from consuming
+quota concurrently. Order is randomized from a recorded seed and `--resume`
+skips completed `(phase, system, mode, task, repetition)` keys.
+
+An offline smoke/evaluation uses the deterministic mock adapter:
+
+```bash
+node scripts/bench/verified-runner.mjs \
+  --output /absolute/mock-results.json \
+  --system myclaude \
+  --adapter mock \
+  --mock-fixture /absolute/myclaude.eval-mock.json \
+  --task mf-cache-key \
+  --repetitions 2 \
+  --isolation local \
+  --seed review-1
+```
+
+Mock fixtures use `myclaude.eval-mock/v1`. Each `tasks.<id>` record may provide
+replacement `files`, `answer`, `trace`, policy/citation evidence, and metrics.
+Mock rows exercise the fixture/verifier machinery but the analyzer explicitly
+rejects them as certification or shadow evidence.
+
+Live command adapters are never selected implicitly and require `--live`:
+
+```bash
+node scripts/bench/verified-runner.mjs \
+  --output /absolute/certification.json \
+  --system myclaude \
+  --adapter command \
+  --live \
+  --mode adaptive \
+  --task mf-cache-key \
+  --repetitions 1 \
+  --isolation docker \
+  --unit-integration-failures 0
+
+node scripts/bench/verified-runner.mjs \
+  --output /absolute/certification.json \
+  --system direct-claude \
+  --adapter command \
+  --live \
+  --mode adaptive \
+  --task mf-cache-key \
+  --repetitions 1 \
+  --isolation docker \
+  --unit-integration-failures 0 \
+  --resume
+```
+
+The defaults invoke `myclaude` and `claude` in non-interactive JSON mode.
+`--myclaude-command`, `--direct-claude-command`, and their repeatable `--*-arg`
+options support controlled wrapper adapters. The runner sends the task prompt on
+stdin and exports `MYCLAUDE_EVAL_REQUEST`, pointing to a private
+`myclaude.eval-adapter-request/v1` file with the complete task/fault contract.
+A wrapper may return structured fields such as `trace`, `faultEvents`,
+`deniedTools`, `sourceIds`, and `ungroundedUrls`; they are captured in the row.
+
+The stock Claude/MyClaude command itself does not inject synthetic
+command-not-found, stale-edit, forced-output, API, or daemon-restart faults.
+Fault-bearing tasks therefore fail closed unless a wrapper/hook actually reports
+the declared fault outcome in `faultEvents`. The runner never invents recovery
+evidence from a successful exit.
+
+Objective command verifiers run in Docker with `--network none`, a read-only
+fixture mount, dropped capabilities, and no-new-privileges whenever the selected
+image is already present. The runner never pulls an image. Live certification
+fails closed if Docker/the image is unavailable; local verifier execution is
+allowed only for offline mock runs (and explicitly non-certifying workflows).
+This isolates the verifier, not the command adapter itself: a live Claude process
+still has the permissions of the invoking Unix user unless it is separately
+sandboxed.
 
 The runner records `myclaude.eval-results/v1`; the analyzer never trusts a
 claimed completion unless `status=passed` and `verifierPassed=true`:
@@ -253,7 +334,8 @@ more than 2.5x adaptive message cost. Shadow promotion requires 100 tasks or
 seven days, zero silent false-successes, and under 5% unrecovered upstream
 failures.
 
-The catalog and analyzer do not spend quota or claim certification by
-themselves. A separate sequential runner must execute the task contracts in an
-isolated environment, randomize order, collect direct-Claude reference rows, and
-feed the resulting artifact to the analyzer.
+The catalog, offline mock adapter, and analyzer do not spend quota or claim
+certification by themselves. Only explicit `--adapter command --live` runs call
+MyClaude or direct Claude. Certification still requires the full randomized
+sequential matrix and the later shadow rollout; a small runner smoke is not a
+production claim.
