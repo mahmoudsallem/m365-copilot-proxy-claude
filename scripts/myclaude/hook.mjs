@@ -237,6 +237,7 @@ function handleStop(input, directory) {
   const external = readExternalVerification(directory);
   const state = mutateState(directory, (current) => {
     const externallyVerified = externalVerificationPasses(external, current);
+    const locallyVerified = current.lastVerification?.status === "passed";
     const needsVerification = Boolean(current.changedSinceVerification) && !externallyVerified;
     const previousBlocks = Number(current.stopBlocks ?? 0);
     const mayBlock = needsVerification && previousBlocks < maximumBlocks;
@@ -251,7 +252,9 @@ function handleStop(input, directory) {
         outcome: mayBlock ? "blocked-for-verification" : needsVerification ? "allowed-unverified-after-limit" : "allowed",
         stopHookActive: Boolean(input.stop_hook_active),
       },
-      finalStatus: needsVerification && !mayBlock ? "partial" : (!needsVerification ? "verified" : current.finalStatus),
+      finalStatus: needsVerification && !mayBlock
+        ? "partial"
+        : (!needsVerification ? (externallyVerified || locallyVerified ? "verified" : "clean") : current.finalStatus),
     };
   });
   const shouldBlock = state.lastStop?.outcome === "blocked-for-verification";

@@ -75,6 +75,11 @@ done
 wait
 node "$ROOT/scripts/myclaude/evidence-status.mjs" "$RUN_SIX" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s);if(!v.ledger.valid||v.ledger.records!==8)process.exit(1)})'
 
+RUN_SEVEN="$TEST_ROOT/run-seven"
+export MYCLAUDE_RUN_DIR="$RUN_SEVEN"
+[[ -z "$(hook '{"session_id":"session-7","cwd":"'"$MYCLAUDE_WORKSPACE"'","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"read-only result"}')" ]]
+[[ "$(node -e 'const s=require(process.argv[1]); process.stdout.write(s.finalStatus)' "$RUN_SEVEN/hook-state.json")" == "clean" ]]
+
 SETTINGS="$TEST_ROOT/config/myclaude-hooks.json"
 node "$ROOT/scripts/myclaude/install-hooks.mjs" install --profile guarded --output "$SETTINGS" >/dev/null
 node -e 'const s=require(process.argv[1]); if(s.env.MYCLAUDE_EXECUTION_PROFILE!=="guarded"||!s.hooks.StopFailure)process.exit(1)' "$SETTINGS"
