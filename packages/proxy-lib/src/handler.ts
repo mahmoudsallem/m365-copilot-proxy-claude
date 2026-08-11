@@ -2,8 +2,6 @@ import {
   ModelSession,
   type ModelSessionOptions,
   createLogger,
-  trunc,
-  getToneForModel,
   formatMessages,
   parseToolCalls,
   looksLikeConfabulation,
@@ -14,8 +12,11 @@ import {
   awaitDegradationBackoff,
   getImageArtifactToken,
   fetchImageBytes,
+  resolveModelCapability,
   type CapturedImage,
+  type CapturedSourceAttribution,
 } from "@m365-copilot/core";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { ChatCompletionRequest } from "./schemas.js";
 import type { z } from "zod/v4";
 
@@ -104,65 +105,201 @@ export function makeOrientationToolCall(body: ChatBody): ReturnType<typeof parse
 // --- Per-conversation state ---
 
 interface ConversationState {
+  clientSessionId: string;
   session: ModelSession;
   sentMessageCount: number;
+  sentTranscriptDigest: string | null;
+  pendingRuntimeNotice: string | null;
   lastAccessedAt: number;
+  mutex: AsyncMutex;
 }
 
-// --- Session pool: maps conversation fingerprint → M365 session ---
+// --- Session pool: maps explicit/salted client session ids → M365 session ---
 
 const MAX_IDLE_MS = 30 * 60 * 1000; // evict after 30 min idle
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LEGACY_SESSION_SALT = randomBytes(32);
+
+class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+  private pending = 0;
+
+  get busy(): boolean { return this.pending > 0; }
+
+  async acquire(): Promise<() => void> {
+    this.pending++;
+    let unlock!: () => void;
+    const gate = new Promise<void>((resolve) => { unlock = resolve; });
+    const previous = this.tail;
+    this.tail = previous.then(() => gate);
+    await previous;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.pending--;
+      unlock();
+    };
+  }
+}
+
+class Semaphore {
+  private active = 0;
+  private waiters: Array<(release: () => void) => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.active < this.limit) {
+      this.active++;
+      return this.makeRelease();
+    }
+    return new Promise<() => void>((resolve) => this.waiters.push(resolve));
+  }
+
+  private makeRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiters.shift();
+      if (next) {
+        // Transfer this exact slot to the next waiter. Keeping `active` unchanged
+        // prevents a newly arriving request from overtaking a queued one.
+        next(this.makeRelease());
+      } else {
+        this.active--;
+      }
+    };
+  }
+}
+
+function transcriptDigest(messages: ParsedMessage[]): string {
+  return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+}
+
+/**
+ * Compatibility-only identity for generic OpenAI clients that cannot echo
+ * X-M365-Session-ID. The HMAC is process-local and non-predictable, unlike the
+ * old public 32-bit first-prompt hash. MyClaude/Claude workers must send an
+ * explicit random UUID and never use this path.
+ */
+function legacySessionId(messages: ParsedMessage[], scope: string): string {
+  const firstUser = messages.find((message) => message.role === "user");
+  const digest = createHmac("sha256", LEGACY_SESSION_SALT)
+    .update(scope)
+    .update("\0")
+    .update(firstUser ? getMessageContent(firstUser) : "")
+    .digest();
+  digest[6] = (digest[6] & 0x0f) | 0x40;
+  digest[8] = (digest[8] & 0x3f) | 0x80;
+  const hex = digest.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+function schedulerLimit(value: number | undefined): number {
+  const requested = value ?? Number(process.env.M365_MAX_CONCURRENCY ?? 1);
+  if (!Number.isFinite(requested)) return 1;
+  return Math.max(1, Math.min(4, Math.trunc(requested)));
+}
+
+export interface SessionPoolOptions {
+  /** Global concurrent M365 turns; clamped to 1..4. Default 1. */
+  maxConcurrency?: number;
+}
+
+interface SessionLease {
+  state: ConversationState;
+  release(): void;
+}
 
 export class SessionPool {
   private conversations = new Map<string, ConversationState>();
   private sessionOptions: ModelSessionOptions;
+  private scheduler: Semaphore;
 
-  constructor(sessionOptions: ModelSessionOptions = {}) {
+  constructor(sessionOptions: ModelSessionOptions = {}, options: SessionPoolOptions = {}) {
     this.sessionOptions = sessionOptions;
+    this.scheduler = new Semaphore(schedulerLimit(options.maxConcurrency));
   }
 
   /**
-   * Resolve the conversation state for an incoming request.
-   * Fingerprint is the hash of the first user message — same first user message = same conversation.
+   * Acquire one isolated client session. The explicit header UUID is the only
+   * stable pool key for modern workers. Header-less generic clients use the
+   * compatibility HMAC above so their existing multi-turn flows still work; the
+   * effective id is returned on every response for clients able to adopt it.
    */
-  resolve(messages: ParsedMessage[]): ConversationState {
+  async acquire(messages: ParsedMessage[], requestedSessionId?: string, fallbackScope = "openai"): Promise<SessionLease> {
     this.evictStale();
-
-    const fingerprint = this.fingerprint(messages);
-    const existing = this.conversations.get(fingerprint);
-
-    if (existing) {
-      // Messages shrunk means client restarted this conversation — reset M365 session
-      if (messages.length < existing.sentMessageCount) {
-        log.info(`Conversation ${fingerprint}: messages shrunk (${messages.length} < ${existing.sentMessageCount}), resetting`);
-        existing.session.reset();
-        existing.sentMessageCount = 0;
-      }
-      existing.lastAccessedAt = Date.now();
-      return existing;
+    const clientSessionId = this.getEffectiveSessionId(messages, requestedSessionId, fallbackScope);
+    let state = this.conversations.get(clientSessionId);
+    if (!state) {
+      log.info(`New client session ${clientSessionId}, ${this.conversations.size} active`);
+      state = {
+        clientSessionId,
+        session: new ModelSession({ ...this.sessionOptions, sessionId: clientSessionId }),
+        sentMessageCount: 0,
+        sentTranscriptDigest: null,
+        pendingRuntimeNotice: null,
+        lastAccessedAt: Date.now(),
+        mutex: new AsyncMutex(),
+      };
+      this.conversations.set(clientSessionId, state);
     }
 
-    // New conversation
-    log.info(`New conversation ${fingerprint}, ${this.conversations.size} active`);
-    const state: ConversationState = {
-      session: new ModelSession(this.sessionOptions),
-      sentMessageCount: 0,
-      lastAccessedAt: Date.now(),
-    };
-    this.conversations.set(fingerprint, state);
-    return state;
+    const releaseSession = await state.mutex.acquire();
+    let releaseGlobal: (() => void) | undefined;
+    try {
+      releaseGlobal = await this.scheduler.acquire();
+      state.lastAccessedAt = Date.now();
+
+      // Claude Code compaction can shrink, replace, or keep the same number of
+      // messages. Compare the exact prefix previously sent, not just array length.
+      const prefix = messages.slice(0, state.sentMessageCount);
+      const transcriptRewritten = state.sentMessageCount > 0 && (
+        messages.length < state.sentMessageCount ||
+        transcriptDigest(prefix) !== state.sentTranscriptDigest
+      );
+      if (transcriptRewritten) {
+        log.info(`Client session ${clientSessionId}: transcript compacted/rewritten; rotating upstream conversation`);
+        state.session.newConversation();
+        state.sentMessageCount = 0;
+        state.sentTranscriptDigest = null;
+      }
+
+      let released = false;
+      return {
+        state,
+        release: () => {
+          if (released) return;
+          released = true;
+          state!.lastAccessedAt = Date.now();
+          releaseGlobal?.();
+          releaseSession();
+        },
+      };
+    } catch (error) {
+      releaseGlobal?.();
+      releaseSession();
+      throw error;
+    }
   }
 
-  private fingerprint(messages: ParsedMessage[]): string {
-    const firstUser = messages.find(m => m.role === "user");
-    const text = firstUser ? getMessageContent(firstUser) : "";
-    return simpleHash(text);
+  getEffectiveSessionId(
+    messages: ParsedMessage[],
+    requestedSessionId?: string,
+    fallbackScope = "openai",
+  ): string {
+    if (requestedSessionId !== undefined && !UUID_RE.test(requestedSessionId)) {
+      throw new Error("X-M365-Session-ID must be a UUID");
+    }
+    return requestedSessionId ?? legacySessionId(messages, fallbackScope);
   }
 
   private evictStale() {
     const now = Date.now();
     for (const [key, state] of this.conversations) {
-      if (now - state.lastAccessedAt > MAX_IDLE_MS) {
+      if (!state.mutex.busy && now - state.lastAccessedAt > MAX_IDLE_MS) {
         log.info(`Evicting idle conversation ${key}`);
         this.conversations.delete(key);
       }
@@ -174,27 +311,54 @@ export class SessionPool {
   }
 }
 
-function simpleHash(str: string): string {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
-  }
-  return String(hash);
+export function markMessagesSent(state: ConversationState, messages: ParsedMessage[]): void {
+  state.sentMessageCount = messages.length;
+  state.sentTranscriptDigest = transcriptDigest(messages);
+  state.pendingRuntimeNotice = null;
 }
 
 // --- Delta message formatting ---
 
-function formatDeltaMessages(messages: ParsedMessage[]): string {
+function xmlAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function summarizedArguments(raw: string): string {
+  try {
+    const args = JSON.parse(raw || "{}") as Record<string, unknown>;
+    const value = args.command ?? args.cmd ?? args.path ?? args.file ?? args.query;
+    return typeof value === "string" ? value.replace(/\s+/g, " ").slice(0, 120) : "";
+  } catch {
+    return "";
+  }
+}
+
+export function formatDeltaMessages(messages: ParsedMessage[], runtimeNotice?: string | null): string {
   const parts: string[] = [];
+  if (runtimeNotice) parts.push(`<runtime_notice>\n${runtimeNotice}\n</runtime_notice>`);
+
+  const callMeta = new Map<string, { name: string; summary: string }>();
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    for (const call of message.tool_calls ?? []) {
+      callMeta.set(call.id, {
+        name: call.function.name,
+        summary: summarizedArguments(call.function.arguments),
+      });
+    }
+  }
+
   for (const m of messages) {
     if (m.role === "assistant") {
       // Skip assistant messages — M365 already has them server-side.
       // Echoing them back as a user message confuses M365.
       continue;
     } else if (m.role === "tool") {
-      const name = m.name || "unknown";
+      const meta = m.tool_call_id ? callMeta.get(m.tool_call_id) : undefined;
+      const name = m.name || meta?.name || "unknown";
       const callId = m.tool_call_id || "?";
-      parts.push(`<tool_response name="${name}" call_id="${callId}">\n${getMessageContent(m)}\n</tool_response>`);
+      const command = meta?.summary ? ` command="${xmlAttribute(meta.summary)}"` : "";
+      parts.push(`<tool_response tool="${xmlAttribute(name)}" call_id="${xmlAttribute(callId)}"${command}>\n${getMessageContent(m)}\n</tool_response>`);
     } else if (m.role === "system") {
       // Skip system messages on follow-up turns
     } else {
@@ -202,6 +366,24 @@ function formatDeltaMessages(messages: ParsedMessage[]): string {
     }
   }
   return parts.join("\n\n");
+}
+
+export function enforceSingleToolCall<T extends { function: { name: string } }>(calls: T[]): {
+  calls: T[];
+  runtimeNotice: string | null;
+} {
+  if (process.env.M365_ALLOW_MULTI_TOOL || calls.length <= 1) {
+    return { calls, runtimeNotice: null };
+  }
+  const kept = calls[0];
+  const dropped = calls.slice(1).map((call) => call.function.name);
+  return {
+    calls: [kept],
+    runtimeNotice:
+      `The previous assistant response proposed ${calls.length} tool calls. ` +
+      `The runtime executed only the first (${kept.function.name}); it did not execute ` +
+      `${dropped.join(", ")}. Use the returned tool result as ground truth and re-plan the remaining work.`,
+  };
 }
 
 // --- Main handler ---
@@ -213,9 +395,31 @@ function formatDeltaMessages(messages: ParsedMessage[]): string {
 export async function handleChatCompletion(
   body: ChatBody,
   pool: SessionPool,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; sessionId?: string } = {},
 ): Promise<Response> {
-  const conv = pool.resolve(body.messages);
+  let lease: SessionLease;
+  try {
+    lease = await pool.acquire(body.messages, opts.sessionId, `openai:${body.model}`);
+  } catch (error: any) {
+    return jsonResponse(400, {
+      error: { message: error?.message ?? "Invalid M365 session", type: "invalid_request_error" },
+    });
+  }
+
+  try {
+    return await handleChatCompletionLocked(body, lease.state, lease.release, opts.signal);
+  } catch (error) {
+    lease.release();
+    throw error;
+  }
+}
+
+async function handleChatCompletionLocked(
+  body: ChatBody,
+  conv: ConversationState,
+  release: () => void,
+  signal?: AbortSignal,
+): Promise<Response> {
   const { session } = conv;
   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
   const model = body.model;
@@ -230,14 +434,21 @@ export async function handleChatCompletion(
   // Stay agent-less ONLY when the tone is actually a Claude tone — empirically that's
   // the path that tool-calls right now (route-probe 2026-07-07: Claude_Sonnet agent-less
   // 2/2; the magic path 0/2). Derive it from the RESOLVED tone, not the raw model
-  // string: getToneForModel now routes any unmapped `claude-*` (e.g. the
+  // string: the registry routes any unmapped `claude-*` (e.g. the
   // `claude-opus-4-8[1m]` a Claude Code client sends) to Claude_Sonnet, so this check
   // then keeps that request on the working agent-less path. The old
   // `/claude/i.test(model)` + `magic` fallback split a claude-* string into GPT-tone +
   // agent-suppressed — the confab quadrant we observed. One resolved tone drives both.
-  const tone = getToneForModel(model);
-  const isClaudeTone = /^Claude_/i.test(tone);
-  const useToolAgent = !!hasTools && (process.env.M365_FORCE_AGENT === "1" || !isClaudeTone);
+  const capability = resolveModelCapability(model);
+  const tone = capability.tone;
+  const useToolAgent = !!hasTools && (
+    process.env.M365_FORCE_AGENT === "1" || capability.route.tools === "declarative-agent"
+  );
+  const requestStartedAt = Date.now();
+  let upstreamAttempts = 0;
+  const recoveryEvents: string[] = [];
+  let producedToolCalls = 0;
+  let producedOutputChars = 0;
 
   // Format message: full prompt on first turn, delta on follow-ups.
   // M365 is stateful — it remembers everything from prior turns,
@@ -245,12 +456,16 @@ export async function handleChatCompletion(
   const isFirstTurn = session.turnCount === 0;
   const convId = session.conversationId;
   let text: string;
+  const runtimeNotice = conv.pendingRuntimeNotice;
   if (isFirstTurn || conv.sentMessageCount === 0) {
     text = formatMessages(body.messages, body.tools, body.tool_choice, convId);
+    if (runtimeNotice) text = `<runtime_notice>\n${runtimeNotice}\n</runtime_notice>\n\n${text}`;
     log.info(`Chat completion: model=${model}, stream=${body.stream}, messages=${body.messages.length}, turn=${session.turnCount}, mode=full, cid=${convId}`);
   } else {
     const newMessages = body.messages.slice(conv.sentMessageCount);
-    const delta = newMessages.length > 0 ? formatDeltaMessages(newMessages) : "";
+    const delta = newMessages.length > 0 || runtimeNotice
+      ? formatDeltaMessages(newMessages, runtimeNotice)
+      : "";
     if (delta.length > 0) {
       text = delta;
       log.info(`Chat completion: model=${model}, stream=${body.stream}, messages=${body.messages.length}, new=${newMessages.length}, turn=${session.turnCount}, mode=delta, cid=${convId}`);
@@ -261,7 +476,7 @@ export async function handleChatCompletion(
     }
   }
 
-  log.debug("Formatted prompt:", trunc(text, 1000));
+  log.debug(`Formatted prompt chars=${text.length}`);
 
   const completionId = `chatcmpl-${crypto.randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -278,6 +493,7 @@ export async function handleChatCompletion(
   let lastMessageType: string | null | undefined;
   let lastScores: Record<string, number> | null | undefined;
   let lastTurnCount: number | null | undefined;
+  let lastSourceAttributions: CapturedSourceAttribution[] = [];
 
   // `onDelta` (when provided) forwards each text delta to the caller AS IT ARRIVES,
   // for live incremental streaming. It's safe to forward without ever retracting:
@@ -297,13 +513,14 @@ export async function handleChatCompletion(
     // detection profile. A single long pi thread never trips the trigger.
     await awaitDegradationBackoff();
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      upstreamAttempts++;
       let copilotStream;
       try {
         // Only attach the tool-calling agent when the request actually has tools.
         // The agent overrides `tone` (forces GPT-5), so tool-less requests must
         // skip it to reach the model the tone selects (e.g. Claude). See
         // ModelSession.run / docs H8.6.
-        copilotStream = await session.run(text, model, opts.signal, useToolAgent);
+        copilotStream = await session.run(text, model, signal, useToolAgent);
       } catch (err: any) {
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
       }
@@ -340,6 +557,7 @@ export async function handleChatCompletion(
       lastMessageType = copilotStream.messageType;
       lastScores = copilotStream.scores;
       lastTurnCount = copilotStream.turnCount;
+      lastSourceAttributions = copilotStream.sourceAttributions ?? [];
 
       if (copilotStream.hasContent || fullText.length > 0) {
         noteRequestOutcome(false, convId); // clean response → degradation has lifted
@@ -361,6 +579,7 @@ export async function handleChatCompletion(
         if (hasTools && !disengageRetried && !process.env.M365_NO_DISENGAGE_RETRY) {
           disengageRetried = true;
           session.newConversation();
+          recoveryEvents.push("disengaged_conversation_rotation");
           text = formatMessages(body.messages, body.tools, body.tool_choice, session.conversationId, "softened");
           log.info("Upstream Disengaged — retrying once with 'softened' framing in a fresh conversation (F22)");
           attempt--; // free retry; bounded — disengageRetried flips once
@@ -394,6 +613,7 @@ export async function handleChatCompletion(
           agentRefreshed = true;
           const agentChanged = await session.refreshAgent();
           if (agentChanged) {
+            recoveryEvents.push("agent_refresh");
             // The cached agent was stale/deleted and has been re-resolved.
             // Resend the original prompt to the fresh agent — a bare "continue"
             // would have no context since the dead agent processed nothing.
@@ -404,6 +624,7 @@ export async function handleChatCompletion(
           }
         }
         log.info(`Empty upstream response, quick retry in ${SHORT_RETRY_DELAY_MS / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        recoveryEvents.push("empty_response_retry");
         await new Promise(r => setTimeout(r, SHORT_RETRY_DELAY_MS));
         text = "Please continue."; // M365 already has context
       } else {
@@ -437,10 +658,11 @@ export async function handleChatCompletion(
   if (hasTools) {
     const result = await runBuffered();
     if ("error" in result) return { kind: "error", resp: result.error };
-    conv.sentMessageCount = body.messages.length;
+    markMessagesSent(conv, body.messages);
     let fullText = result.fullText;
+    producedOutputChars = fullText.length;
 
-    log.debug("Raw response (tool mode):", trunc(fullText, 1000));
+      log.debug(`Raw response (tool mode) chars=${fullText.length}`);
     let parsed = parseToolCalls(fullText, body.tools);
     log.info(`Parse result: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
 
@@ -480,11 +702,12 @@ export async function handleChatCompletion(
       text = confab ? CONFAB_FORCE_PROMPT : HALLUCINATION_FORCE_PROMPT;
       const retry = await runBuffered();
       if ("error" in retry) return { kind: "error", resp: retry.error };
-      conv.sentMessageCount = body.messages.length;
+      markMessagesSent(conv, body.messages);
       fullText = retry.fullText;
       parsed = parseToolCalls(fullText, body.tools);
       log.info(`After forcing retry: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
     }
+    producedOutputChars = fullText.length;
 
     // Document guard: the shell-routing parser turns every ```bash block into a
     // tool call, so a model that ANSWERS with a markdown document full of code
@@ -504,7 +727,7 @@ export async function handleChatCompletion(
         log.info(`Mixed output detected (${extraText.length} chars of text alongside ${parsed.toolCalls.length} tool calls), stripping text`);
         // Strip the text — the tool calls are what the client needs.
         // Log the stripped text for debugging but don't send it downstream.
-        log.debug("Stripped text:", trunc(extraText, 500));
+        log.debug(`Stripped mixed-output text chars=${extraText.length}`);
         parsed = { ...parsed, textContent: null };
       }
     }
@@ -537,12 +760,15 @@ export async function handleChatCompletion(
       // call forces a real step-by-step loop where each call reacts to the
       // previous tool_response. Set M365_ALLOW_MULTI_TOOL to restore batching.
       if (!process.env.M365_ALLOW_MULTI_TOOL && parsed.toolCalls.length > 1) {
-        log.info(`One-call-per-turn: keeping ${parsed.toolCalls[0].function.name}, dropping ${parsed.toolCalls.length - 1} batched call(s)`);
-        parsed.toolCalls = [parsed.toolCalls[0]];
+        const selected = enforceSingleToolCall(parsed.toolCalls);
+        log.info(`One-call-per-turn: keeping ${selected.calls[0].function.name}, dropping ${parsed.toolCalls.length - 1} batched call(s)`);
+        parsed.toolCalls = selected.calls;
+        conv.pendingRuntimeNotice = selected.runtimeNotice;
       }
     }
 
     if (parsed.hasToolCalls && parsed.toolCalls.length > 0) {
+      producedToolCalls = parsed.toolCalls.length;
       return { kind: "tools", toolCalls: parsed.toolCalls };
     }
     return { kind: "text", text: fullText };
@@ -550,30 +776,54 @@ export async function handleChatCompletion(
     // No tools — stream deltas live (onDelta) while buffering for the retry logic.
     const result = await runBuffered(onDelta);
     if ("error" in result) return { kind: "error", resp: result.error };
-    conv.sentMessageCount = body.messages.length;
+    markMessagesSent(conv, body.messages);
+    producedOutputChars = result.fullText.length;
     return { kind: "text", text: result.fullText };
   }
   } // end produce()
 
   // --- Render: JSON (non-stream) or an early-flushed SSE stream (stream) ---
   const includeUsage = !!body.stream_options?.include_usage;
-  const usage = () => buildUsage(lastThrottle, lastContentOrigin, lastMessageType, lastScores, lastTurnCount);
+  const usage = () => buildUsage(
+    lastThrottle,
+    lastContentOrigin,
+    lastMessageType,
+    lastScores,
+    lastTurnCount,
+    lastSourceAttributions,
+    {
+      requestedModel: model,
+      resolvedModel: capability.id,
+      tone,
+      agentRoute: useToolAgent ? "declarative-agent" : "agentless",
+      certification: capability.certification,
+      upstreamAttempts,
+      recoveryEvents,
+      latencyMs: Date.now() - requestStartedAt,
+      outputChars: producedOutputChars,
+      toolCalls: producedToolCalls,
+    },
+  );
 
   if (!body.stream) {
-    const p = await produce();
-    if (p.kind === "error") return p.resp;
-    if (p.kind === "tools") {
-      return jsonResponse(200, {
+    try {
+      const p = await produce();
+      if (p.kind === "error") return withClientSessionHeader(p.resp, conv.clientSessionId);
+      if (p.kind === "tools") {
+        return withClientSessionHeader(jsonResponse(200, {
+          id: completionId, object: "chat.completion", created, model,
+          choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: p.toolCalls }, finish_reason: "tool_calls" }],
+          usage: usage(),
+        }), conv.clientSessionId);
+      }
+      return withClientSessionHeader(jsonResponse(200, {
         id: completionId, object: "chat.completion", created, model,
-        choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: p.toolCalls }, finish_reason: "tool_calls" }],
+        choices: [{ index: 0, message: { role: "assistant", content: p.text }, finish_reason: outputFinishReason(p.text) }],
         usage: usage(),
-      });
+      }), conv.clientSessionId);
+    } finally {
+      release();
     }
-    return jsonResponse(200, {
-      id: completionId, object: "chat.completion", created, model,
-      choices: [{ index: 0, message: { role: "assistant", content: p.text }, finish_reason: outputFinishReason(p.text) }],
-      usage: usage(),
-    });
   }
 
   // Streaming: send HTTP 200 + a role chunk + keepalive comments from t=0, then run
@@ -584,7 +834,7 @@ export async function handleChatCompletion(
   // `stream:true` is genuinely incremental. Tool mode still buffers: the raw text is
   // parsed for tool-call fences and can't be shown verbatim, so its tool_calls (or a
   // prose fallback) are emitted once at the end.
-  return sseResponse(new ReadableStream({
+  return withClientSessionHeader(sseResponse(new ReadableStream({
     async start(controller) {
       const enc = new TextEncoder();
       const send = (obj: unknown) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
@@ -632,9 +882,10 @@ export async function handleChatCompletion(
         // client likely disconnected mid-emit — nothing more to do
       } finally {
         try { controller.enqueue(enc.encode("data: [DONE]\n\n")); controller.close(); } catch {}
+        release();
       }
     },
-  }));
+  })), conv.clientSessionId);
 }
 
 /**
@@ -655,6 +906,19 @@ function buildUsage(
   messageType?: string | null,
   scores?: Record<string, number> | null,
   turnCount?: number | null,
+  sourceAttributions: CapturedSourceAttribution[] = [],
+  telemetry?: {
+    requestedModel: string;
+    resolvedModel: string;
+    tone: string;
+    agentRoute: string;
+    certification: string;
+    upstreamAttempts: number;
+    recoveryEvents: string[];
+    latencyMs: number;
+    outputChars: number;
+    toolCalls: number;
+  },
 ): Record<string, unknown> {
   const base: Record<string, unknown> = {
     prompt_tokens: 0,
@@ -670,6 +934,21 @@ function buildUsage(
   if (contentOrigin) base.x_m365_content_origin = contentOrigin;
   if (messageType) base.x_m365_message_type = messageType;
   if (typeof turnCount === "number") base.x_m365_turn_count = turnCount;
+  if (sourceAttributions.length > 0) {
+    base.x_m365_source_attributions = sourceAttributions;
+  }
+  if (telemetry) {
+    base.x_m365_requested_model = telemetry.requestedModel;
+    base.x_m365_resolved_model = telemetry.resolvedModel;
+    base.x_m365_tone = telemetry.tone;
+    base.x_m365_agent_route = telemetry.agentRoute;
+    base.x_m365_certification = telemetry.certification;
+    base.x_m365_upstream_attempts = telemetry.upstreamAttempts;
+    base.x_m365_recovery_events = telemetry.recoveryEvents;
+    base.x_m365_latency_ms = telemetry.latencyMs;
+    base.x_m365_output_chars = telemetry.outputChars;
+    base.x_m365_tool_calls = telemetry.toolCalls;
+  }
   // Disengaged-classifier scores. Empirically: clean tool calls sit at
   // ~1e-13 / ~1e-8, jailbreak-shaped prompts climb to ~1e-3 / ~1e-3. The
   // `dea_violation` component is the one that actually correlates with the
@@ -690,6 +969,11 @@ function jsonResponse(status: number, body: unknown): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function withClientSessionHeader(response: Response, sessionId: string): Response {
+  response.headers.set("X-M365-Session-ID", sessionId);
+  return response;
 }
 
 function sseResponse(stream: ReadableStream): Response {

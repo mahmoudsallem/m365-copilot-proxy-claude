@@ -39,11 +39,27 @@ export { getOrCreateAgent } from "./agent.js";
 
 export {
   decodeJwt,
-  getToneForModel,
-  getAvailableModels,
+  normalizeSourceAttribution,
   type CopilotStream,
   type CapturedImage,
+  type CapturedSourceAttribution,
 } from "./copilot.js";
+
+export {
+  MODEL_CAPABILITIES,
+  CONSERVATIVE_MODEL_LIMITS,
+  getToneForModel,
+  getAvailableModels,
+  getAvailableModelCapabilities,
+  getModelCapability,
+  resolveModelCapability,
+  getDefaultModel,
+  type ModelCapability,
+  type ModelCertification,
+  type IdentityConfidence,
+  type ToolRoute,
+  type ToolReliability,
+} from "./models.js";
 
 export {
   CopilotSession,

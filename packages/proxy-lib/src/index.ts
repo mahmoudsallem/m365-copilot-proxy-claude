@@ -1,4 +1,7 @@
-import { type ModelSessionOptions, getAvailableModels } from "@m365-copilot/core";
+import {
+  type ModelSessionOptions,
+  getAvailableModelCapabilities,
+} from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { SessionPool, handleChatCompletion } from "./handler.js";
 
@@ -37,34 +40,30 @@ export {
 /** Static body for `GET /health`. */
 export const HEALTH_PAYLOAD = { status: "ok" } as const;
 
-// Window/output hints surfaced to harnesses on /v1/models so they can size
-// context packing and output expectations. These are ADVERTISED hints only — M365
-// enforces its own limits server-side; the number here just stops harnesses from
-// pre-truncating our prompts/output. Empirically (docs/hypotheses.md F9) M365 accepts
-// ≥500k tokens of input (retrieval-backed); the old ~3k output hint made harnesses
-// cap generation far below what a coding turn needs. Advertise a roomy 1M window +
-// 1M output (in line with modern large-context models) so nothing client-side clips.
-// Override via env.
-const CONTEXT_WINDOW_TOKENS = Number(process.env.M365_CONTEXT_WINDOW) || 1_000_000;
-const MAX_OUTPUT_TOKENS = Number(process.env.M365_MAX_OUTPUT_TOKENS) || 1_000_000;
-
 /** Build the OpenAI-compatible `GET /v1/models` payload. */
 export function buildModelsPayload() {
   const created = Math.floor(Date.now() / 1000);
   return {
     object: "list",
-    data: getAvailableModels().map((id) => ({
-      id,
+    data: getAvailableModelCapabilities().map((capability) => ({
+      id: capability.id,
       object: "model",
       created,
       owned_by: "microsoft",
       // Non-standard but widely-read by OpenAI-compatible harnesses. Several
       // aliases because clients disagree on the key name. Unknown keys are
       // ignored by strict clients.
-      context_window: CONTEXT_WINDOW_TOKENS,
-      max_context_length: CONTEXT_WINDOW_TOKENS,
-      max_input_tokens: CONTEXT_WINDOW_TOKENS,
-      max_output_tokens: MAX_OUTPUT_TOKENS,
+      context_window: capability.limits.maxInputTokens,
+      max_context_length: capability.limits.maxInputTokens,
+      max_input_tokens: capability.limits.maxInputTokens,
+      max_output_tokens: capability.limits.maxOutputTokens,
+      x_m365_tone: capability.tone,
+      x_m365_certification: capability.certification,
+      x_m365_identity_confidence: capability.identity.confidence,
+      x_m365_tool_route: capability.route.tools,
+      x_m365_tool_reliability: capability.toolReliability,
+      x_m365_auto_selectable: capability.autoSelectable,
+      x_m365_last_tested_service: capability.lastTestedServiceVersion,
     })),
   };
 }
@@ -72,13 +71,18 @@ export function buildModelsPayload() {
 /** Build Anthropic's Models API shape for Claude Code gateway discovery. */
 export function buildClaudeGatewayModelsPayload() {
   const createdAt = "1970-01-01T00:00:00Z";
-  const data = getAvailableModels().map((model) => ({
-    id: toClaudeGatewayModelId(model),
+  const data = getAvailableModelCapabilities().map((capability) => ({
+    id: toClaudeGatewayModelId(capability.id),
     type: "model" as const,
-    display_name: model,
+    display_name: `${capability.id} [${capability.certification}]`,
     created_at: createdAt,
-    max_input_tokens: CONTEXT_WINDOW_TOKENS,
-    max_tokens: MAX_OUTPUT_TOKENS,
+    max_input_tokens: capability.limits.maxInputTokens,
+    max_tokens: capability.limits.maxOutputTokens,
+    x_m365_tone: capability.tone,
+    x_m365_certification: capability.certification,
+    x_m365_identity_confidence: capability.identity.confidence,
+    x_m365_tool_route: capability.route.tools,
+    x_m365_auto_selectable: capability.autoSelectable,
   }));
   return {
     data,
@@ -93,7 +97,8 @@ export function buildClaudeGatewayModelsPayload() {
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-M365-Claude-Code",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-M365-Claude-Code, X-M365-Session-ID",
+  "Access-Control-Expose-Headers": "X-M365-Session-ID",
 };
 
 function withCors(res: Response): Response {
@@ -154,7 +159,10 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
         );
       }
       // req.signal aborts when the client disconnects → cancels the M365 turn.
-      return withCors(await handleChatCompletion(body, pool, { signal: req.signal }));
+      return withCors(await handleChatCompletion(body, pool, {
+        signal: req.signal,
+        sessionId: req.headers.get("x-m365-session-id") ?? undefined,
+      }));
     }
 
     return withCors(

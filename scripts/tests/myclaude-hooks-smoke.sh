@@ -91,6 +91,9 @@ UNIT="$TEST_ROOT/config/myclauded.service"
 node "$ROOT/scripts/myclaude/install-service.mjs" install --executable "$ROOT/bin/myclaude" --socket "$TEST_ROOT/myclauded.sock" --output "$UNIT" >/dev/null
 grep -Fq "ExecStart=\"$ROOT/bin/myclaude\" server run" "$UNIT"
 grep -Fq "Environment=MYCLAUDE_SOCKET=\"$TEST_ROOT/myclauded.sock\"" "$UNIT"
+if command -v systemd-analyze >/dev/null 2>&1; then
+  systemd-analyze verify "$UNIT" >/dev/null
+fi
 node "$ROOT/scripts/myclaude/install-service.mjs" status --output "$UNIT" --socket "$TEST_ROOT/myclauded.sock" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s);if(!v.managed||!v.intact)process.exit(1)})'
 node "$ROOT/scripts/myclaude/install-service.mjs" remove --output "$UNIT" --socket "$TEST_ROOT/myclauded.sock" >/dev/null
 [[ ! -e "$UNIT" && ! -e "$UNIT.managed" ]]

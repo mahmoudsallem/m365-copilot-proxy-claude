@@ -191,6 +191,7 @@ async function proxyProvider(action, request, options) {
     throw new Error("proxy research provider only connects to localhost");
   }
   if (!["http:", "https:"].includes(base.protocol)) throw new Error("proxy base URL must use http or https");
+  if (base.username || base.password) throw new Error("proxy base URL must not contain credentials");
   const apiKey = process.env.M365_PROXY_API_KEY;
   if (!apiKey) throw new Error("M365_PROXY_API_KEY is required for the proxy provider");
   const subject = action === "search"

@@ -1,7 +1,7 @@
 import { getToken } from "./auth.js";
 import { getOrCreateAgent } from "./agent.js";
 import { CopilotSession } from "./session.js";
-import { createLogger, trunc } from "./log.js";
+import { createLogger } from "./log.js";
 import type { CopilotStream } from "./copilot.js";
 
 const log = createLogger("model");
@@ -11,6 +11,8 @@ export interface ModelSessionOptions {
   getToken?: () => Promise<string>;
   /** Whether to attempt agent resolution. Default: true. */
   useAgent?: boolean;
+  /** Stable, caller-generated UUID propagated to M365 as X-SessionId. */
+  sessionId?: string;
 }
 
 /**
@@ -29,7 +31,7 @@ export class ModelSession {
   private cachedAgentId: string | null | undefined = undefined;
 
   /** Stable IDs reused across CopilotSession reconnections. */
-  readonly sessionId: string = crypto.randomUUID();
+  readonly sessionId: string;
   private _conversationId: string = crypto.randomUUID();
   /** Current M365 ConversationId (the throttle/Disengage state keys on this). */
   get conversationId(): string { return this._conversationId; }
@@ -47,6 +49,7 @@ export class ModelSession {
   constructor(options: ModelSessionOptions = {}) {
     this.resolveToken = options.getToken ?? getToken;
     this.useAgent = options.useAgent !== false;
+    this.sessionId = options.sessionId ?? crypto.randomUUID();
   }
 
   /** Number of turns completed in this session */
@@ -103,7 +106,7 @@ export class ModelSession {
       this.currentAgentId = agentForTurn;
     }
 
-    log.info(`run: model=${model}, agent=${agentForTurn ?? "none"}, turn=${this.copilotSession.turnCount}, sid=${this.sessionId}, cid=${this.conversationId}, text=${JSON.stringify(trunc(text, 200))}`);
+    log.info(`run: model=${model}, agent=${agentForTurn ?? "none"}, turn=${this.copilotSession.turnCount}, sid=${this.sessionId}, cid=${this.conversationId}, promptChars=${text.length}`);
 
     // Match the GUI: on the agent-less path, image gen is always available, so a
     // plain "draw me an image" produces one with no special mode (§14). Kept OFF on

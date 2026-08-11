@@ -24,5 +24,10 @@ export default defineEventHandler(async (event) => {
     res.once("close", abort);
   }
 
-  return handleAnthropicMessages(body, pool, controller.signal);
+  return handleAnthropicMessages(
+    body,
+    pool,
+    controller.signal,
+    getHeader(event, "x-m365-session-id") || undefined,
+  );
 });

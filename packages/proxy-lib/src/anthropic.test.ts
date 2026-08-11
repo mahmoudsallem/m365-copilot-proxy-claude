@@ -32,7 +32,7 @@ describe("Anthropic Messages compatibility", () => {
       { role: "system", content: "You are a coding agent." },
       { role: "user", content: "List files" },
       { role: "assistant", content: null, tool_calls: [{ id: "toolu_1", type: "function", function: { name: "Bash", arguments: "{\"command\":\"ls\"}" } }] },
-      { role: "tool", tool_call_id: "toolu_1", content: "README.md" },
+      { role: "tool", tool_call_id: "toolu_1", name: "Bash", content: "README.md" },
     ]);
   });
 
@@ -57,6 +57,79 @@ describe("Anthropic Messages compatibility", () => {
 
   it("returns a stable positive token estimate", () => {
     expect(estimateAnthropicInputTokens({ messages: [{ content: "hello" }] })).toBeGreaterThan(0);
+  });
+
+  it("defaults to the conservative observed output limit", () => {
+    const body = AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(body.max_tokens).toBe(3_072);
+  });
+
+  it("rejects unsupported content blocks instead of silently discarding them", () => {
+    const image = AnthropicMessagesRequest.safeParse({
+      model: "claude-sonnet",
+      messages: [{
+        role: "user",
+        content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }],
+      }],
+    });
+    expect(image.success).toBe(false);
+
+    const thinking = AnthropicMessagesRequest.safeParse({
+      model: "claude-sonnet",
+      messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] }],
+    });
+    expect(thinking.success).toBe(false);
+  });
+
+  it("rejects image content nested inside tool results", () => {
+    const parsed = AnthropicMessagesRequest.safeParse({
+      model: "claude-sonnet",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "toolu_1",
+          content: [{ type: "image", source: { type: "base64", data: "AA==" } }],
+        }],
+      }],
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects supported block types in roles where translating them would drop data", () => {
+    expect(AnthropicMessagesRequest.safeParse({
+      model: "claude-sonnet",
+      messages: [{
+        role: "user",
+        content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "pwd" } }],
+      }],
+    }).success).toBe(false);
+    expect(AnthropicMessagesRequest.safeParse({
+      model: "claude-sonnet",
+      messages: [{
+        role: "assistant",
+        content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "result" }],
+      }],
+    }).success).toBe(false);
+  });
+
+  it("preserves normalized grounding metadata in Anthropic usage", () => {
+    const message = fromOpenAIChatResponse({
+      id: "chatcmpl-grounded",
+      model: "quick",
+      choices: [{ finish_reason: "stop", message: { content: "grounded" } }],
+      usage: {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        x_m365_source_attributions: [{ url: "https://example.test", title: "Example" }],
+      },
+    }, "quick");
+    expect(message.usage.x_m365_source_attributions).toEqual([
+      { url: "https://example.test", title: "Example" },
+    ]);
   });
 
   it("maps Claude-only picker models to the stable M365 default", () => {

@@ -78,14 +78,14 @@ try {
       if (fs.existsSync(output) && (!managed || fileDigest(output) !== managed.digest)) throw new Error(`refusing to overwrite unmanaged or modified unit: ${output}`);
       atomicWrite(output, content);
       atomicWrite(`${output}.managed`, `${JSON.stringify({ schema: "myclaude.managed-service/v1", digest: digest(content), executable, socket }, null, 2)}\n`);
-      process.stdout.write(`${JSON.stringify({ installed: true, output, executable, socket, activation: "systemctl --user daemon-reload && systemctl --user enable --now myclauded.service" }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({ installed: true, output, executable, socket, activation: `systemctl --user daemon-reload && systemctl --user enable --now ${path.basename(output)}` }, null, 2)}\n`);
     }
   } else if (action === "remove") {
     if (!managed) throw new Error(`refusing to remove unit without managed marker: ${output}`);
     if (fs.existsSync(output) && fileDigest(output) !== managed.digest) throw new Error(`refusing to remove modified unit: ${output}`);
     if (fs.existsSync(output)) fs.unlinkSync(output);
     fs.unlinkSync(`${output}.managed`);
-    process.stdout.write(`${JSON.stringify({ removed: true, output, deactivation: "systemctl --user disable --now myclauded.service && systemctl --user daemon-reload" }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ removed: true, output, deactivation: `systemctl --user disable --now ${path.basename(output)} && systemctl --user daemon-reload` }, null, 2)}\n`);
   } else throw new Error("Usage: install-service.mjs install|remove|status|render --executable /absolute/myclaude [--socket /absolute/socket] [--output /absolute/unit]");
 } catch (error) {
   process.stderr.write(`install-service: ${error.message}\n`);

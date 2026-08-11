@@ -1,64 +1,8 @@
 import { JwtClaims } from "./schemas.js";
 
-// Model name → tone mapping.
-// The server VALIDATES tones (an unknown tone errors with "Failed to invoke
-// 'Chat'"), so every entry here has been confirmed accepted against the live
-// API. Claude tones self-identify as "Claude Sonnet 4.5, by Anthropic"
-// (docs/hypotheses.md H8.6) — a genuine non-Microsoft model at zero marginal cost.
-const MODEL_TONES: Record<string, string> = {
-  // Default
-  "m365-copilot": "magic",
-  "auto": "magic",
-
-  // Generic modes
-  "quick": "Gpt_Quick",
-  "think-deeper": "Gpt_Reasoning",
-
-  // Claude (real Anthropic models, confirmed via self-id) — chat + reasoning.
-  "claude": "Claude_Sonnet",
-  "claude-sonnet": "Claude_Sonnet",
-  "claude-sonnet-4.5": "Claude_Sonnet",
-  "claude-sonnet-think-deeper": "Claude_Sonnet_Reasoning",
-  "claude-opus": "Claude_Opus", // accepted tone; identity deflected, likely Opus
-
-  // GPT-5.5 (current generation)
-  "gpt-5.5": "Gpt_5_5_Chat",
-  "gpt-5.5-quick": "Gpt_5_5_Chat",
-  "gpt-5.5-think-deeper": "Gpt_5_5_Reasoning",
-
-  // GPT-5.4
-  "gpt-5.4": "Gpt_5_4_Reasoning",
-  "gpt-5.4-think-deeper": "Gpt_5_4_Reasoning",
-  "gpt-5.4-quick": "Gpt_5_4_Quick",
-
-  // GPT-5.3
-  "gpt-5.3": "Gpt_5_3_Quick",
-  "gpt-5.3-quick": "Gpt_5_3_Quick",
-  "gpt-5.3-think-deeper": "Gpt_5_3_Reasoning",
-
-  // GPT-5.2
-  "gpt-5.2": "Gpt_5_2_Quick",
-  "gpt-5.2-quick": "Gpt_5_2_Quick",
-  "gpt-5.2-think-deeper": "Gpt_5_2_Reasoning",
-};
-
-export function getToneForModel(model: string): string {
-  const exact = MODEL_TONES[model];
-  if (exact) return exact;
-  // Unmapped `claude-*` strings (e.g. the `claude-opus-4-8[1m]` a Claude Code client
-  // sends) must NOT fall back to the `magic` (GPT) tone. Empirically (route-probe,
-  // 2026-07-07) the magic path does not tool-call right now — 0/2, confabulates
-  // "I don't have a shell" — while the Claude tone agent-less path tool-calls 2/2 and
-  // fast (~5s). Route anything Claude-labelled to the working Claude_Sonnet tone
-  // rather than silently serving GPT under a Claude name and landing in the
-  // confabulation quadrant. (getAvailableModels still only advertises the exact keys.)
-  if (/^claude/i.test(model)) return "Claude_Sonnet";
-  return MODEL_TONES["m365-copilot"];
-}
-
-export function getAvailableModels(): string[] {
-  return Object.keys(MODEL_TONES);
-}
+// Kept as re-exports for source compatibility. The capability registry is the
+// single source of truth for tone routing and model discovery.
+export { getToneForModel, getAvailableModels } from "./models.js";
 
 export function decodeJwt(token: string) {
   const payload = token.split(".")[1];
@@ -85,12 +29,70 @@ export interface CapturedImage {
   status?: number;
 }
 
+export interface CapturedSourceAttribution {
+  sourceId?: string;
+  url: string;
+  title?: string;
+  excerpt?: string;
+  provider?: string;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function firstString(objects: Array<Record<string, unknown>>, keys: string[]): string | undefined {
+  for (const object of objects) {
+    for (const key of keys) {
+      const value = object[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+  }
+  return undefined;
+}
+
+/** Normalize the several attribution shapes observed from Bing/M365 frames. */
+export function normalizeSourceAttribution(value: unknown): CapturedSourceAttribution | null {
+  const root = record(value);
+  if (!root) return null;
+  const candidates = [
+    root,
+    record(root.attribution),
+    record(root.source),
+    record(root.reference),
+    record(root.metadata),
+  ].filter((entry): entry is Record<string, unknown> => !!entry);
+  const rawUrl = firstString(candidates, ["url", "seeMoreUrl", "sourceUrl", "webUrl", "href", "link"]);
+  if (!rawUrl) return null;
+  let parsedUrl: URL;
+  try { parsedUrl = new URL(rawUrl); } catch { return null; }
+  if (!["http:", "https:"].includes(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) return null;
+  parsedUrl.hash = "";
+  for (const key of [...parsedUrl.searchParams.keys()]) {
+    if (/(?:api[_-]?key|auth|cookie|credential|mfa|pass(?:word)?|secret|signature|sig|token)/i.test(key)) {
+      parsedUrl.searchParams.delete(key);
+    }
+  }
+  const url = parsedUrl.toString();
+  return {
+    sourceId: firstString(candidates, ["sourceId", "citationId", "id"]),
+    url,
+    title: firstString(candidates, ["title", "displayName", "name", "providerDisplayName"]),
+    excerpt: firstString(candidates, ["snippet", "excerpt", "summary", "description"]),
+    provider: firstString(candidates, ["provider", "providerDisplayName", "sourceType"]),
+  };
+}
+
 export interface CopilotStream {
   [Symbol.asyncIterator](): AsyncIterator<string>;
   fullText: string;
   /** Generated images captured this turn (empty unless image gen was requested
    *  and the server returned a GraphicArt frame). */
   images: CapturedImage[];
+  /** Normalized Bing/M365 grounding records captured from response frames. */
+  sourceAttributions: CapturedSourceAttribution[];
   /** True if the server returned content (deltas or full text) */
   hasContent: boolean;
   /** Throttle info if provided by M365 */
