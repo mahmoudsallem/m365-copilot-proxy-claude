@@ -44,6 +44,34 @@ describe("process adapters", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("cancels the worker process group so tool subprocesses cannot outlive a task", async () => {
+    if (process.platform === "win32") return;
+    const { access, mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const workspace = await mkdtemp(join(tmpdir(), "myclaude-process-tree-"));
+    const marker = join(workspace, "orphan-marker");
+    const grandchild = `setTimeout(()=>require("node:fs").writeFileSync(${JSON.stringify(marker)},"orphan"),600);setInterval(()=>{},1000)`;
+    const parent = `const{spawn}=require("node:child_process");spawn(process.execPath,["-e",${JSON.stringify(grandchild)}],{stdio:"ignore"});setInterval(()=>{},1000)`;
+    const controller = new AbortController();
+    try {
+      const execution = new NodeProcessRunner().run({
+        executable: process.execPath,
+        args: ["-e", parent],
+        cwd: workspace,
+        timeoutMs: 5_000,
+        signal: controller.signal,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      controller.abort();
+      await execution;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("includes untracked files and their lines in change evidence", async () => {
     const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");

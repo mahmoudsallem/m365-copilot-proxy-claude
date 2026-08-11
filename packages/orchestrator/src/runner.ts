@@ -37,21 +37,39 @@ export class NodeProcessRunner implements ProcessRunner {
         env: request.env,
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,
+        // Isolate the worker in its own process group so cancellation also
+        // terminates tool subprocesses instead of leaving orphan commands.
+        detached: process.platform !== "win32",
       });
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let forceKillTimer: NodeJS.Timeout | undefined;
       const finish = (result: ProcessResult | Error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (forceKillTimer) clearTimeout(forceKillTimer);
         request.signal?.removeEventListener("abort", abort);
         if (result instanceof Error) reject(result);
         else resolve(result);
       };
+      const killTree = (signal: NodeJS.Signals) => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        if (process.platform !== "win32" && child.pid) {
+          try {
+            process.kill(-child.pid, signal);
+            return;
+          } catch {
+            // Fall back when process groups are unavailable in the host runtime.
+          }
+        }
+        child.kill(signal);
+      };
       const abort = () => {
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+        killTree("SIGTERM");
+        forceKillTimer = setTimeout(() => killTree("SIGKILL"), 2_000);
+        forceKillTimer.unref();
       };
       request.signal?.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(() => {
