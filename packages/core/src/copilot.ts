@@ -1,321 +1,8 @@
 import { JwtClaims } from "./schemas.js";
-import { UnsupportedModelError } from "./errors.js";
 
-export type BackendFamily = "auto" | "gpt" | "claude";
-export type ToolMode = "agent" | "fenced" | "none";
-
-export interface ModelConfig {
-  canonicalModel: string;
-  displayName: string;
-  tone: string;
-  backendFamily: BackendFamily;
-  supportsAgent: boolean;
-  supportsTools: boolean;
-  toolMode: ToolMode;
-  isPreset?: boolean;
-  deprecated?: boolean;
-  replacement?: string;
-  description?: string;
-}
-
-export interface ResolvedModel {
-  requestedModel: string;
-  normalizedModel: string;
-  canonicalModel: string;
-  config: ModelConfig;
-  warnings: string[];
-}
-
-export const CANONICAL_MODELS: Record<string, ModelConfig> = {
-  "m365-copilot": {
-    canonicalModel: "m365-copilot",
-    displayName: "Microsoft 365 Copilot",
-    tone: "magic",
-    backendFamily: "auto",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  auto: {
-    canonicalModel: "auto",
-    displayName: "Auto (Default)",
-    tone: "magic",
-    backendFamily: "auto",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "gpt-5.5": {
-    canonicalModel: "gpt-5.5",
-    displayName: "GPT-5.5 Chat",
-    tone: "Gpt_5_5_Chat",
-    backendFamily: "gpt",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "gpt-5.5-quick": {
-    canonicalModel: "gpt-5.5-quick",
-    displayName: "GPT-5.5 Quick",
-    tone: "Gpt_5_5_Chat",
-    backendFamily: "gpt",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "gpt-5.5-think-deeper": {
-    canonicalModel: "gpt-5.5-think-deeper",
-    displayName: "GPT-5.5 Reasoning",
-    tone: "Gpt_5_5_Reasoning",
-    backendFamily: "gpt",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  "gpt-5.4-quick": {
-    canonicalModel: "gpt-5.4-quick",
-    displayName: "GPT-5.4 Quick",
-    tone: "Gpt_5_4_Quick",
-    backendFamily: "gpt",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "gpt-5.4-think-deeper": {
-    canonicalModel: "gpt-5.4-think-deeper",
-    displayName: "GPT-5.4 Reasoning",
-    tone: "Gpt_5_4_Reasoning",
-    backendFamily: "gpt",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  "gpt-5.3-quick": {
-    canonicalModel: "gpt-5.3-quick",
-    displayName: "GPT-5.3 Quick",
-    tone: "Gpt_5_3_Quick",
-    backendFamily: "gpt",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "gpt-5.3-think-deeper": {
-    canonicalModel: "gpt-5.3-think-deeper",
-    displayName: "GPT-5.3 Reasoning",
-    tone: "Gpt_5_3_Reasoning",
-    backendFamily: "gpt",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  "gpt-5.2-quick": {
-    canonicalModel: "gpt-5.2-quick",
-    displayName: "GPT-5.2 Quick",
-    tone: "Gpt_5_2_Quick",
-    backendFamily: "gpt",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "gpt-5.2-think-deeper": {
-    canonicalModel: "gpt-5.2-think-deeper",
-    displayName: "GPT-5.2 Reasoning",
-    tone: "Gpt_5_2_Reasoning",
-    backendFamily: "gpt",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  quick: {
-    canonicalModel: "quick",
-    displayName: "GPT Quick",
-    tone: "Gpt_Quick",
-    backendFamily: "gpt",
-    supportsAgent: true,
-    supportsTools: true,
-    toolMode: "agent",
-  },
-  "think-deeper": {
-    canonicalModel: "think-deeper",
-    displayName: "GPT Reasoning",
-    tone: "Gpt_Reasoning",
-    backendFamily: "gpt",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  "claude-sonnet": {
-    canonicalModel: "claude-sonnet",
-    displayName: "Claude Sonnet",
-    tone: "Claude_Sonnet",
-    backendFamily: "claude",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  "claude-sonnet-think-deeper": {
-    canonicalModel: "claude-sonnet-think-deeper",
-    displayName: "Claude Sonnet Reasoning",
-    tone: "Claude_Sonnet_Reasoning",
-    backendFamily: "claude",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-  "claude-opus": {
-    canonicalModel: "claude-opus",
-    displayName: "Claude Opus",
-    tone: "Claude_Opus",
-    backendFamily: "claude",
-    supportsAgent: false,
-    supportsTools: true,
-    toolMode: "fenced",
-  },
-};
-
-export const MODEL_ALIASES: Record<string, string> = {
-  // Claude aliases
-  claude: "claude-sonnet",
-  "claude-sonnet-4.5": "claude-sonnet",
-  "claude-3-7-sonnet": "claude-sonnet",
-  "claude-3-5-sonnet": "claude-sonnet",
-  "claude-sonnet-5": "claude-sonnet",
-  "claude-sonnet-5[1m]": "claude-sonnet",
-  sonnet: "claude-sonnet",
-  "sonnet-5": "claude-sonnet",
-  "sonnet-4": "claude-sonnet",
-  "claude-sonnet-5-20251219": "claude-sonnet",
-  "claude-3-7-sonnet-20250219": "claude-sonnet",
-  "claude-3-5-sonnet-20241022": "claude-sonnet",
-  "claude-3-5-sonnet-20240620": "claude-sonnet",
-
-  "claude-sonnet-5-thinking": "claude-sonnet-think-deeper",
-  "claude-sonnet-5-20251219-thinking": "claude-sonnet-think-deeper",
-  "claude-3-7-sonnet-thinking": "claude-sonnet-think-deeper",
-
-  "claude-opus-4": "claude-opus",
-  "claude-opus-4-5": "claude-opus",
-  "claude-opus-4-20250514": "claude-opus",
-  "opus-4": "claude-opus",
-  "claude-opus-4-5-20250514": "claude-opus",
-  opus: "claude-opus",
-  "opus-5": "claude-opus",
-  "claude-3-opus": "claude-opus",
-  "claude-opus-5": "claude-opus",
-  "claude-opus-5[1m]": "claude-opus",
-  "opus[1m]": "claude-opus",
-
-  // Haiku aliases (map to claude-sonnet with warning)
-  haiku: "claude-sonnet",
-  "claude-haiku": "claude-sonnet",
-  "claude-3-5-haiku": "claude-sonnet",
-  "claude-haiku-4-5": "claude-sonnet",
-  "claude-haiku-4.5": "claude-sonnet",
-  "claude-haiku-4-5-20250514": "claude-sonnet",
-  "claude-3-5-haiku-20241022": "claude-sonnet",
-
-  // GPT-5.6 / Sol / Terra / Luna presets (backed by gpt-5.5)
-  "gpt-5.6": "gpt-5.5",
-  "gpt-5.6-sol": "gpt-5.5",
-  "gpt-5.6-terra": "gpt-5.5",
-  "gpt-5.6-luna": "gpt-5.5",
-  sol: "gpt-5.5",
-  terra: "gpt-5.5",
-  luna: "gpt-5.5",
-
-  // Codex presets
-  codex: "gpt-5.5",
-  "openai-codex": "gpt-5.5",
-  "gpt-codex": "gpt-5.5",
-  "codex-5": "gpt-5.5",
-
-  // GPT-5.4 / 5.3 / 5.2 convenience aliases
-  "gpt-5.4": "gpt-5.4-quick",
-  "gpt-5.3": "gpt-5.3-quick",
-  "gpt-5.2": "gpt-5.2-quick",
-  "gpt-deep": "think-deeper",
-  "gpt-quick": "quick",
-};
-
-export function normalizeModelName(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-export function resolveModel(value: string): ResolvedModel {
-  const normalized = normalizeModelName(value);
-  if (!normalized) {
-    throw new UnsupportedModelError("", getAvailableModels());
-  }
-
-  // Explicitly check for misleading, unsupported model names (e.g. fable/mythos)
-  if (/^(fable|claude-fable|fable-4|mythos|claude-mythos|gpt-mythos|mythos-1)$/i.test(normalized)) {
-    throw new UnsupportedModelError(
-      value,
-      getAvailableModels(),
-      `Unsupported model "${value}". This alias does not select a distinct upstream model. Use "gpt-5.5" or "auto".`,
-    );
-  }
-
-  // 1. Direct match in canonical models
-  if (CANONICAL_MODELS[normalized]) {
-    const config = CANONICAL_MODELS[normalized];
-    return {
-      requestedModel: value,
-      normalizedModel: normalized,
-      canonicalModel: config.canonicalModel,
-      config,
-      warnings: config.deprecated && config.replacement ? [`"${value}" is deprecated. Use "${config.replacement}".`] : [],
-    };
-  }
-
-  // 2. Direct match in aliases
-  const targetCanonical = MODEL_ALIASES[normalized];
-  if (targetCanonical && CANONICAL_MODELS[targetCanonical]) {
-    const config = CANONICAL_MODELS[targetCanonical];
-    const warnings: string[] = [];
-    if (/^(sol|terra|luna|codex|openai-codex|gpt-codex|codex-5|gpt-5\.6)/i.test(normalized)) {
-      warnings.push(`"${value}" is a preset backed by canonical model "${config.canonicalModel}".`);
-    } else if (normalized.includes("haiku")) {
-      warnings.push(`"${value}" is a compatibility alias resolving to canonical model "${config.canonicalModel}".`);
-    }
-    return {
-      requestedModel: value,
-      normalizedModel: normalized,
-      canonicalModel: config.canonicalModel,
-      config,
-      warnings,
-    };
-  }
-
-  // 3. Fallback for unmapped claude-* variants
-  if (/^claude/i.test(normalized)) {
-    const config = CANONICAL_MODELS["claude-sonnet"];
-    return {
-      requestedModel: value,
-      normalizedModel: normalized,
-      canonicalModel: "claude-sonnet",
-      config,
-      warnings: [`Unrecognized Claude model "${value}" mapped to canonical model "claude-sonnet".`],
-    };
-  }
-
-  throw new UnsupportedModelError(value, getAvailableModels());
-}
-
-export function getToneForModel(model: string): string {
-  try {
-    const resolved = resolveModel(model);
-    return resolved.config.tone;
-  } catch {
-    return CANONICAL_MODELS["m365-copilot"].tone;
-  }
-}
-
-export function getAvailableModels(): string[] {
-  const canonical = Object.keys(CANONICAL_MODELS);
-  const aliases = Object.keys(MODEL_ALIASES);
-  return Array.from(new Set([...canonical, ...aliases]));
-}
+// Kept as re-exports for source compatibility. The capability registry is the
+// single source of truth for tone routing and model discovery.
+export { getToneForModel, getAvailableModels } from "./models.js";
 
 export function decodeJwt(token: string) {
   const payload = token.split(".")[1];
@@ -324,26 +11,105 @@ export function decodeJwt(token: string) {
   return JwtClaims.parse(raw);
 }
 
+/**
+ * The streaming result of one M365 Copilot turn. Implemented by
+ * `CopilotSession.chat` (session.ts); async-iterate it for delta text and read
+ * the getters for the turn's diagnostic metadata after it completes.
+ */
+/** One generated image, as carried on a GraphicArt frame (§14). URLs point at
+ *  designerapp.officeapps.live.com and need the designerappservice token to
+ *  fetch — see `fetchImageBytes` / `generateImage`. */
 export interface CapturedImage {
   referenceUrls: string[];
   fileToken?: string;
   pollUrl?: string;
   size?: string;
   orientation?: string;
+  /** Server status; 2 = ready (observed). */
   status?: number;
+}
+
+export interface CapturedSourceAttribution {
+  sourceId?: string;
+  url: string;
+  title?: string;
+  excerpt?: string;
+  provider?: string;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function firstString(objects: Array<Record<string, unknown>>, keys: string[]): string | undefined {
+  for (const object of objects) {
+    for (const key of keys) {
+      const value = object[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+  }
+  return undefined;
+}
+
+/** Normalize the several attribution shapes observed from Bing/M365 frames. */
+export function normalizeSourceAttribution(value: unknown): CapturedSourceAttribution | null {
+  const root = record(value);
+  if (!root) return null;
+  const candidates = [
+    root,
+    record(root.attribution),
+    record(root.source),
+    record(root.reference),
+    record(root.metadata),
+  ].filter((entry): entry is Record<string, unknown> => !!entry);
+  const rawUrl = firstString(candidates, ["url", "seeMoreUrl", "sourceUrl", "webUrl", "href", "link"]);
+  if (!rawUrl) return null;
+  let parsedUrl: URL;
+  try { parsedUrl = new URL(rawUrl); } catch { return null; }
+  if (!["http:", "https:"].includes(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) return null;
+  parsedUrl.hash = "";
+  for (const key of [...parsedUrl.searchParams.keys()]) {
+    if (/(?:api[_-]?key|auth|cookie|credential|mfa|pass(?:word)?|secret|signature|sig|token)/i.test(key)) {
+      parsedUrl.searchParams.delete(key);
+    }
+  }
+  const url = parsedUrl.toString();
+  return {
+    sourceId: firstString(candidates, ["sourceId", "citationId", "id"]),
+    url,
+    title: firstString(candidates, ["title", "displayName", "name", "providerDisplayName"]),
+    excerpt: firstString(candidates, ["snippet", "excerpt", "summary", "description"]),
+    provider: firstString(candidates, ["provider", "providerDisplayName", "sourceType"]),
+  };
 }
 
 export interface CopilotStream {
   [Symbol.asyncIterator](): AsyncIterator<string>;
   fullText: string;
+  /** Generated images captured this turn (empty unless image gen was requested
+   *  and the server returned a GraphicArt frame). */
   images: CapturedImage[];
+  /** Normalized Bing/M365 grounding records captured from response frames. */
+  sourceAttributions: CapturedSourceAttribution[];
+  /** True if the server returned content (deltas or full text) */
   hasContent: boolean;
+  /** Throttle info if provided by M365 */
   throttle: { current: number; max: number } | null;
+  /** `DeepLeo` (reasoning) / `3PDeclarativeAgent` (agent) / etc.  */
   contentOrigin?: string | null;
+  /** Last seen messageType (e.g. `Disengaged`, `EndOfRequest`). Null when M365 sends an unmistakably content message. */
   messageType?: string | null;
+  /** Server-assigned bot message id, useful for telemetry correlation. */
   messageId?: string | null;
+  /** Per-message classifier scores from M365 (BotOffense / dea_violation).
+   *  Highest values across the response. Drives the "how close to Disengaged are we" metric. */
   scores?: Record<string, number> | null;
+  /** Authoritative server-side turn count for this conversation. */
   turnCount?: number | null;
+  /** `Completed` etc. */
   turnState?: string | null;
+  /** True if the model triggered a native custom action this turn (H-NATIVE-6). */
   sawAction?: boolean;
 }

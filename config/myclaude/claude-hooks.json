@@ -1,0 +1,65 @@
+{
+  "env": {
+    "MYCLAUDE_ROOT": "__MYCLAUDE_ROOT__",
+    "MYCLAUDE_EXECUTION_PROFILE": "__MYCLAUDE_PROFILE__",
+    "MYCLAUDE_STOP_MAX_BLOCKS": "2"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Edit|MultiEdit|NotebookEdit|Read|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$MYCLAUDE_ROOT/scripts/myclaude/hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$MYCLAUDE_ROOT/scripts/myclaude/hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$MYCLAUDE_ROOT/scripts/myclaude/hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$MYCLAUDE_ROOT/scripts/myclaude/hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$MYCLAUDE_ROOT/scripts/myclaude/hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

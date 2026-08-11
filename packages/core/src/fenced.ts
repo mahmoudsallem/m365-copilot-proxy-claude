@@ -40,9 +40,10 @@ const log = createLogger("fenced");
 //   >>>>>>> REPLACE
 //   ```
 //
-// Known limitation: a `write_file` body that itself contains a ``` fence can't be
-// carried unambiguously — this is exactly where JSON wins, and the bench A/B will
-// show whether the escaping-free win on ordinary files outweighs it.
+// The renderer follows CommonMark's variable-length fence rule: when a file body
+// contains ``` it chooses a longer outer fence, and the parser only accepts a
+// closing fence at least as long as the opener. This keeps Markdown documents and
+// generated source code round-trippable without falling back to JSON escaping.
 
 const BODY_PARAM_NAMES = [
   "command", "content", "code", "body", "script", "text",
@@ -140,6 +141,12 @@ function scalarToString(v: unknown): string {
   return JSON.stringify(v);
 }
 
+function fenceFor(content: string): string {
+  let longest = 0;
+  for (const run of content.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 /** Render one concrete tool call (name + args object) as a fenced block. */
 export function renderFencedCall(spec: FencedToolSpec, args: Record<string, unknown>): string {
   const lines: string[] = [];
@@ -158,7 +165,9 @@ export function renderFencedCall(spec: FencedToolSpec, args: Record<string, unkn
     lines.push(scalarToString(args[spec.bodyParam]));
   }
 
-  return "```" + spec.name + "\n" + lines.join("\n") + "\n```";
+  const inner = lines.join("\n");
+  const fence = fenceFor(inner);
+  return fence + spec.name + "\n" + inner + "\n" + fence;
 }
 
 /** A self-documenting template shown in the per-request <tools> block. */
@@ -176,7 +185,9 @@ function renderFencedTemplate(spec: FencedToolSpec): string {
     lines.push(`<${spec.bodyParam}>`);
   }
   const header = spec.description ? `${spec.name} — ${spec.description}` : spec.name;
-  return `${header}\n\`\`\`${spec.name}\n${lines.join("\n")}\n\`\`\``;
+  const inner = lines.join("\n");
+  const fence = fenceFor(inner);
+  return `${header}\n${fence}${spec.name}\n${inner}\n${fence}`;
 }
 
 /** The fenced equivalent of formatToolDefinitions' <tools> block.
@@ -510,12 +521,11 @@ export const FRAMING_VARIANT_NAMES = Object.keys(FRAMING_VARIANTS);
 
 // --- Parsing -----------------------------------------------------------------
 
-// Match a fenced block with a tool-like info-string. Dots and hyphens are allowed
-// so namespaced runtime tool names (```container.exec) can be recognised and
-// routed; an info-string that resolves to no spec is left in prose by
-// parseFencedToolCalls, so widening this costs nothing. Non-greedy body; the
-// closing fence is a line that is exactly ``` (start of line).
-const FENCE_REGEX = /```([A-Za-z0-9_.-]+)[ \t]*\r?\n([\s\S]*?)\r?\n?```/g;
+// CommonMark-style fenced blocks with a tool-like info-string. Dots and hyphens
+// are allowed so namespaced runtime tools (```container.exec) can be routed. A
+// closing fence must contain at least as many backticks as its opener; shorter
+// nested fences remain part of the body.
+const FENCE_OPEN_REGEX = /^ {0,3}(`{3,})([A-Za-z0-9_.-]+)[ \t]*\r?$/gm;
 const SEARCH_REPLACE_REGEX =
   /<{5,}\s*SEARCH\s*\r?\n([\s\S]*?)\r?\n={5,}\s*\r?\n([\s\S]*?)\r?\n>{5,}\s*REPLACE/;
 
@@ -571,24 +581,65 @@ export interface FencedParseResult {
   leftover: string;
 }
 
+interface ScannedFence {
+  start: number;
+  end: number;
+  info: string;
+  body: string;
+}
+
+function scanFences(text: string): ScannedFence[] {
+  const blocks: ScannedFence[] = [];
+  const openings = new RegExp(FENCE_OPEN_REGEX.source, "gm");
+  let opening: RegExpExecArray | null;
+  while ((opening = openings.exec(text)) !== null) {
+    let bodyStart = openings.lastIndex;
+    if (text[bodyStart] === "\n") bodyStart++;
+
+    const minLength = opening[1].length;
+    const closing = new RegExp("^ {0,3}(`{" + minLength + ",})[ \\t]*\\r?$", "gm");
+    closing.lastIndex = bodyStart;
+    const close = closing.exec(text);
+    if (!close) continue;
+
+    let body = text.slice(bodyStart, close.index);
+    if (body.endsWith("\n")) body = body.slice(0, -1);
+    if (body.endsWith("\r")) body = body.slice(0, -1);
+    blocks.push({
+      start: opening.index,
+      end: closing.lastIndex,
+      info: opening[2],
+      body,
+    });
+    openings.lastIndex = closing.lastIndex;
+  }
+  return blocks;
+}
+
 /** Parse all fenced tool calls whose info-string matches a known tool name. */
 export function parseFencedToolCalls(
   text: string,
   specs: Map<string, FencedToolSpec>,
 ): FencedParseResult {
   const calls: ParsedToolCall[] = [];
-  let leftover = text;
+  const consumed: Array<{ start: number; end: number }> = [];
 
-  const re = new RegExp(FENCE_REGEX.source, "g");
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const spec = specs.get(match[1]);
+  for (const block of scanFences(text)) {
+    const spec = specs.get(block.info);
     if (!spec) continue; // ```python illustration etc. — not a tool, leave in prose
-    const args = parseFencedInner(spec, match[2]);
+    const args = parseFencedInner(spec, block.body);
     if (!args) continue;
     calls.push(makeCall(spec.name, args));
-    leftover = leftover.replace(match[0], "");
+    consumed.push({ start: block.start, end: block.end });
   }
+
+  let leftover = "";
+  let cursor = 0;
+  for (const range of consumed) {
+    leftover += text.slice(cursor, range.start);
+    cursor = range.end;
+  }
+  leftover += text.slice(cursor);
 
   return { calls, leftover };
 }

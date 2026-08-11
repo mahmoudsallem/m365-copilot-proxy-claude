@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" = /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+ORCHESTRATOR_CLI="$ROOT/packages/orchestrator/dist/cli.mjs"
+PRIVATE_NODE_DIR="$ROOT/.runtime/node/node_modules/node/bin"
+PRIVATE_TOOL_DIR="$ROOT/.runtime/node/node_modules/.bin"
+if [[ -d "$PRIVATE_NODE_DIR" && -d "$PRIVATE_TOOL_DIR" ]]; then
+  export PATH="$PRIVATE_TOOL_DIR:$PRIVATE_NODE_DIR:$PATH"
+fi
+NODE_BIN="$PRIVATE_NODE_DIR/node"
+[[ -x "$NODE_BIN" ]] || NODE_BIN="$(command -v node 2>/dev/null || true)"
+command_name="${1:-}"
+
+export MYCLAUDE_STATE_ROOT="${MYCLAUDE_STATE_ROOT:-${M365_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/m365-copilot-proxy}}"
+export MYCLAUDE_SOCKET="${MYCLAUDE_SOCKET:-$MYCLAUDE_STATE_ROOT/myclauded.sock}"
+
+# The daemon must execute the proxy-backed launcher explicitly.  It is never
+# allowed to discover or fall back to the user's paid `claude` command.
+export MYCLAUDE_EXECUTOR_BIN="${MYCLAUDE_EXECUTOR_BIN:-$ROOT/bin/myclaude}"
+managed_hook_settings="${MYCLAUDE_HOOK_SETTINGS:-${M365_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/m365-copilot-proxy}/myclaude-hooks.json}"
+managed_hooks_state=absent
+if [[ -e "$managed_hook_settings" || -e "$managed_hook_settings.managed" ]]; then
+  managed_hooks_state=invalid
+  if [[ -n "$NODE_BIN" && "$managed_hook_settings" == /* ]]; then
+    managed_hooks_state="$("$NODE_BIN" -e '
+      const crypto = require("node:crypto");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const settingsPath = path.resolve(process.argv[1]);
+      try {
+        const body = fs.readFileSync(settingsPath, "utf8");
+        const markerBody = fs.readFileSync(`${settingsPath}.managed`, "utf8");
+        const marker = JSON.parse(markerBody);
+        const settings = JSON.parse(body);
+        const profile = marker.profile;
+        const digest = crypto.createHash("sha256").update(body).digest("hex");
+        const privateMode = (file) => (fs.statSync(file).mode & 0o077) === 0;
+        const requiredHooks = ["PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop", "StopFailure"];
+        if (marker.schema !== "myclaude.managed-settings/v1"
+            || typeof marker.settingsPath !== "string"
+            || path.resolve(marker.settingsPath) !== settingsPath
+            || marker.digest !== digest
+            || !["guarded", "host-unrestricted"].includes(profile)
+            || settings?.env?.MYCLAUDE_EXECUTION_PROFILE !== profile
+            || !privateMode(settingsPath)
+            || !privateMode(`${settingsPath}.managed`)
+            || requiredHooks.some((event) => !Array.isArray(settings?.hooks?.[event]) || settings.hooks[event].length === 0)) {
+          process.stdout.write("invalid");
+        } else {
+          process.stdout.write(`intact:${profile}`);
+        }
+      } catch {
+        process.stdout.write("invalid");
+      }
+    ' "$managed_hook_settings")"
+  fi
+fi
+case "$managed_hooks_state" in
+  intact:*)
+    managed_profile="${managed_hooks_state#intact:}"
+    export MYCLAUDE_HOOK_SETTINGS="$managed_hook_settings"
+    export MYCLAUDE_EXECUTION_PROFILE="$managed_profile"
+    ;;
+  *)
+    unset MYCLAUDE_HOOK_SETTINGS
+    export MYCLAUDE_EXECUTION_PROFILE=guarded
+    ;;
+esac
+
+require_managed_hooks() {
+  [[ "$managed_hooks_state" == intact:* ]] && return 0
+  if [[ "$managed_hooks_state" == "absent" ]]; then
+    printf 'Error: verified MyClaude hooks are absent. Run: myclaude profile guarded\n' >&2
+  else
+    printf 'Error: verified MyClaude hooks failed their ownership/digest check: %s\n' "$managed_hook_settings" >&2
+    printf 'Restore or remove the modified files, then run: myclaude profile guarded\n' >&2
+  fi
+  exit 1
+}
+
+case "$command_name" in
+  server)
+    server_action="${2:-}"
+    case "$server_action" in
+      start|restart)
+        require_managed_hooks
+        shift
+        exec bash "$ROOT/scripts/myclaude-server.sh" "$@"
+        ;;
+      stop|status)
+        shift
+        exec bash "$ROOT/scripts/myclaude-server.sh" "$@"
+        ;;
+    esac
+    [[ "$server_action" != "run" && "$server_action" != "resume" ]] || require_managed_hooks
+    [[ -f "$ORCHESTRATOR_CLI" ]] || {
+      printf 'Error: the MyClaude orchestrator is not built. Run: m365-copilot install\n' >&2
+      exit 1
+    }
+    [[ -n "$NODE_BIN" ]] || { printf 'Error: Node.js is unavailable. Run: m365-copilot install\n' >&2; exit 1; }
+    exec "$NODE_BIN" "$ORCHESTRATOR_CLI" "$@"
+    ;;
+  task)
+    task_action="${2:-}"
+    [[ "$task_action" != "start" && "$task_action" != "resume" ]] || require_managed_hooks
+    [[ -f "$ORCHESTRATOR_CLI" ]] || {
+      printf 'Error: the MyClaude orchestrator is not built. Run: m365-copilot install\n' >&2
+      exit 1
+    }
+    [[ -n "$NODE_BIN" ]] || { printf 'Error: Node.js is unavailable. Run: m365-copilot install\n' >&2; exit 1; }
+    exec "$NODE_BIN" "$ORCHESTRATOR_CLI" "$@"
+    ;;
+  integrate)
+    [[ -f "$ORCHESTRATOR_CLI" ]] || {
+      printf 'Error: the MyClaude orchestrator is not built. Run: m365-copilot install\n' >&2
+      exit 1
+    }
+    [[ -n "$NODE_BIN" ]] || { printf 'Error: Node.js is unavailable. Run: m365-copilot install\n' >&2; exit 1; }
+    exec "$NODE_BIN" "$ORCHESTRATOR_CLI" "$@"
+    ;;
+  doctor)
+    bash "$ROOT/scripts/m365-control.sh" doctor
+    if [[ -f "$ORCHESTRATOR_CLI" ]]; then
+      [[ -n "$NODE_BIN" ]] || exit 1
+      exec "$NODE_BIN" "$ORCHESTRATOR_CLI" doctor
+    fi
+    exit 0
+    ;;
+  models)
+    shift
+    exec bash "$ROOT/scripts/m365-control.sh" models "$@"
+    ;;
+  profile)
+    shift
+    exec bash "$ROOT/scripts/m365-control.sh" profile "$@"
+    ;;
+  help|-h|--help)
+    cat <<'EOF'
+MyClaude — verified M365 executor and task orchestrator
+
+Usage:
+  myclaude [Claude Code arguments]      Start the proxied Claude Code interface
+  myclaude task ...                     Plan, execute, validate, and review tasks
+  myclaude server start|stop|restart|status
+                                        Manage the task orchestrator
+  myclaude integrate add|remove|status  Connect Codex or direct Claude over MCP
+  myclaude models [--all] [--json]      Show the M365 model catalog
+  myclaude profile guarded|host-unrestricted
+  myclaude doctor                       Diagnose the proxy and orchestrator
+
+The ordinary `claude` command is never modified by this launcher.
+EOF
+    ;;
+  *)
+    require_managed_hooks
+    export MYCLAUDE_MANAGED_HOOKS_VERIFIED=1
+    exec bash "$ROOT/scripts/m365-control.sh" myclaude "$@"
+    ;;
+esac

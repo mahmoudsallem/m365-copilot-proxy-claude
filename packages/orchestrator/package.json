@@ -1,0 +1,40 @@
+{
+  "name": "@m365-copilot/orchestrator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Artifact-first task orchestrator and MCP bridge for MyClaude",
+  "bin": {
+    "myclaude-orchestrator": "./dist/cli.mjs",
+    "myclaude-mcp": "./dist/mcp.mjs"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "types": "./dist/index.d.mts"
+    },
+    "./client": {
+      "import": "./dist/client.mjs",
+      "types": "./dist/client.d.mts"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown src/index.ts src/client.ts src/cli.ts src/mcp.ts --format esm --dts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "pnpm typecheck && vitest run src"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
