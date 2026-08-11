@@ -2,7 +2,7 @@ import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TaskStore } from "./store.js";
+import { assessValidationEvidence, TaskStore } from "./store.js";
 import { makePlan } from "./test-helpers.js";
 
 const roots: string[] = [];
@@ -67,5 +67,27 @@ describe("TaskStore", () => {
     expect(body).not.toContain("hunter2");
     expect(body).not.toContain("abcdefghijklmnop");
     expect(body).toContain("[REDACTED]");
+  });
+
+  it("writes a passed verification only for an exact successful validation contract", async () => {
+    const { store, task, plan } = await storeFixture();
+    const declared = [
+      { command: "pnpm test", timeoutMs: 10_000 },
+      { command: "pnpm lint", timeoutMs: 10_000 },
+    ];
+    const exact = declared.map((item) => ({ command: item.command, exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 }));
+    expect(assessValidationEvidence(declared, exact)).toEqual({ passed: true, issues: [] });
+    await store.submitPlan({ ...plan, validation: { commands: declared } });
+    await store.writeVerification(task.id, declared, exact);
+    let verification = JSON.parse(await readFile(join(store.taskDirectory(task.id), "verification.json"), "utf8"));
+    expect(verification.status).toBe("passed");
+    expect(verification.commands).toHaveLength(2);
+
+    await expect(store.writeVerification(task.id, declared, exact.slice(0, 1))).rejects.toThrow(/count mismatch/);
+    await expect(store.writeVerification(task.id, declared, [...exact].reverse())).rejects.toThrow(/command mismatch/);
+    await expect(store.writeVerification(task.id, declared, exact.map((item, index) => ({ ...item, exitCode: index })))).rejects.toThrow(/did not exit successfully/);
+    await store.invalidateVerification(task.id, ["validation result count mismatch"]);
+    verification = JSON.parse(await readFile(join(store.taskDirectory(task.id), "verification.json"), "utf8"));
+    expect(verification.status).toBe("failed");
   });
 });

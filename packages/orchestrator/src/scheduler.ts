@@ -4,7 +4,7 @@ import type { ExecutionEvidence, MyClaudePlan, MyClaudeReview, TaskRecord } from
 import { TERMINAL_TASK_STATES } from "./schemas.js";
 import type { ExecutorAdapter, ValidatorAdapter } from "./runner.js";
 import { errorMessage } from "./util.js";
-import { TaskStore } from "./store.js";
+import { assessValidationEvidence, TaskStore } from "./store.js";
 import { computeWorkspaceFingerprint } from "./fingerprint.js";
 import { assertSafeValidationPlan, evaluatePlanValidation } from "./validation-policy.js";
 
@@ -17,6 +17,7 @@ export class TaskScheduler extends EventEmitter {
   private readonly queue: string[] = [];
   private readonly queued = new Set<string>();
   private readonly active = new Map<string, AbortController>();
+  private readonly admissionLocks = new Map<string, Promise<void>>();
   private configuredConcurrency: number;
   private effectiveConcurrency: number;
   private paused = false;
@@ -51,35 +52,38 @@ export class TaskScheduler extends EventEmitter {
   async recover(): Promise<void> {
     for (const task of await this.store.listTasks()) {
       if (["queued", "executing", "validating", "repairing"].includes(task.state)) {
-        if (task.state !== "queued") await this.store.transition(task.id, "queued", { lastError: "recovered after orchestrator restart" });
-        await this.store.appendEvent(task.id, "task.recovered", { previousState: task.state });
-        this.push(task.id);
+        await this.withAdmissionLock(task.id, async () => {
+          try {
+            if (!task.planSha256) throw new Error("task has no immutable plan");
+            const plan = await this.store.getPlan(task.id);
+            await this.admitPlan(task.id, plan, true);
+            if (task.state !== "queued") {
+              await this.store.transition(task.id, "queued", { lastError: "recovered after orchestrator restart" });
+            }
+            await this.store.appendEvent(task.id, "task.recovered", { previousState: task.state });
+            this.push(task.id);
+          } catch (error) {
+            await this.quarantineRecovery(task.id, task.state, errorMessage(error));
+          }
+        });
       }
     }
     this.pump();
   }
 
   async enqueue(taskId: string): Promise<TaskRecord> {
-    const current = await this.store.getTask(taskId);
-    if (!current.planSha256) throw new Error("task has no immutable plan");
-    const plan = await this.store.getPlan(taskId);
-    if (plan.execution.profile !== this.executionProfile) {
-      throw new Error(`plan execution profile ${plan.execution.profile} is not allowed by daemon policy ${this.executionProfile}`);
-    }
-    const validationPolicy = evaluatePlanValidation(plan);
-    await this.store.appendEvent(taskId, "validation.policy", { profile: this.executionProfile, decisions: validationPolicy });
-    assertSafeValidationPlan(plan);
-    const priorEvents = await this.store.readEvents(taskId);
-    if (!priorEvents.some((event) => event.type === "execution.started")) {
-      const currentFingerprint = await computeWorkspaceFingerprint(plan.workspace);
-      if (currentFingerprint !== plan.baseFingerprint) {
-        throw new Error(`stale plan: workspace fingerprint changed (planned ${plan.baseFingerprint}, current ${currentFingerprint})`);
+    return this.withAdmissionLock(taskId, async () => {
+      const current = await this.store.getTask(taskId);
+      if (this.active.has(taskId)) throw new Error(`task_start rejected: task ${taskId} is actively executing`);
+      if (!current.planSha256) throw new Error("task has no immutable plan");
+      if (!new Set(["planned", "queued"]).has(current.state)) {
+        throw new Error(`task_start rejected while task is ${current.state}`);
       }
-    }
-    const queued = current.state === "queued" ? current : await this.store.transition(taskId, "queued", { cancellationRequested: false, lastError: undefined });
-    this.push(taskId);
-    this.pump();
-    return queued;
+      if (current.state === "queued" && this.queued.has(taskId)) return current;
+      const plan = await this.store.getPlan(taskId);
+      await this.admitPlan(taskId, plan, true);
+      return this.queuePrepared(taskId, current);
+    });
   }
 
   async cancel(taskId: string): Promise<TaskRecord> {
@@ -136,51 +140,124 @@ export class TaskScheduler extends EventEmitter {
   }
 
   async applyReview(taskId: string, review: MyClaudeReview): Promise<TaskRecord> {
-    const current = await this.store.getTask(taskId);
-    const plan = await this.store.getPlan(taskId);
-    if (!["reviewing", "partial", "failed"].includes(current.state)) {
-      throw new Error(`reviews are not accepted while task is ${current.state}`);
-    }
-    if (review.verdict === "approve") {
-      if (current.state !== "reviewing") {
-        throw new Error(`approval rejected: task is ${current.state}, not reviewing`);
+    return this.withAdmissionLock(taskId, async () => {
+      const current = await this.store.getTask(taskId);
+      if (this.active.has(taskId)) throw new Error(`review rejected: task ${taskId} is actively executing`);
+      const plan = await this.store.getPlan(taskId);
+      if (!["reviewing", "partial", "failed"].includes(current.state)) {
+        throw new Error(`reviews are not accepted while task is ${current.state}`);
       }
-      const evidence = await this.store.getEvidence(taskId);
-      if (evidence.state !== "reviewing" || !hasCompleteSuccessfulEvidence(plan, evidence)) {
-        throw new Error("approval rejected: current execution and every declared validation command must have fresh successful evidence");
+      if (review.verdict === "approve") {
+        if (current.state !== "reviewing") {
+          throw new Error(`approval rejected: task is ${current.state}, not reviewing`);
+        }
+        const evidence = await this.store.getEvidence(taskId);
+        if (evidence.state !== "reviewing" || !hasCompleteSuccessfulEvidence(plan, evidence)) {
+          throw new Error("approval rejected: current execution and every declared validation command must have fresh successful evidence");
+        }
       }
-    }
-    await this.store.addReview(taskId, review);
-    const reviewed = await this.store.getTask(taskId);
-    if (review.verdict === "approve") {
-      await this.setEvidenceState(taskId, "passed");
-      return this.store.transition(taskId, "passed", { lastError: undefined });
-    }
-    if (review.verdict === "blocked") {
-      await this.setEvidenceState(taskId, "blocked", review.summary);
-      return this.store.transition(taskId, "blocked", { lastError: review.summary });
-    }
-    if (reviewed.repairCycles >= plan.execution.budgets.reviewCycles) {
-      await this.setEvidenceState(taskId, "blocked", "review repair-cycle budget exhausted");
-      return this.store.transition(taskId, "blocked", { lastError: "review repair-cycle budget exhausted" });
-    }
-    await this.store.appendEvent(taskId, "repair.requested", { instructions: review.repairInstructions, source: "review" });
-    await this.store.patchTask(taskId, { repairCycles: reviewed.repairCycles + 1 });
-    await this.store.transition(taskId, "repairing");
-    return this.enqueue(taskId);
+      await this.store.addReview(taskId, review);
+      const reviewed = await this.store.getTask(taskId);
+      if (review.verdict === "approve") {
+        await this.setEvidenceState(taskId, "passed");
+        return this.store.transition(taskId, "passed", { lastError: undefined });
+      }
+      if (review.verdict === "blocked") {
+        await this.setEvidenceState(taskId, "blocked", review.summary);
+        return this.store.transition(taskId, "blocked", { lastError: review.summary });
+      }
+      if (reviewed.repairCycles >= plan.execution.budgets.reviewCycles) {
+        await this.setEvidenceState(taskId, "blocked", "review repair-cycle budget exhausted");
+        return this.store.transition(taskId, "blocked", { lastError: "review repair-cycle budget exhausted" });
+      }
+      await this.admitPlan(taskId, plan, false);
+      await this.store.appendEvent(taskId, "repair.requested", { instructions: review.repairInstructions, source: "review" });
+      await this.store.patchTask(taskId, { repairCycles: reviewed.repairCycles + 1 });
+      await this.store.transition(taskId, "repairing");
+      return this.queuePrepared(taskId);
+    });
   }
 
   async requestRepair(taskId: string, instructions: string[] = []): Promise<TaskRecord> {
-    const task = await this.store.getTask(taskId);
-    const plan = await this.store.getPlan(taskId);
-    if (task.repairCycles >= plan.execution.budgets.reviewCycles) {
-      await this.setEvidenceState(taskId, "blocked", "repair-cycle budget exhausted");
-      return this.store.transition(taskId, "blocked", { lastError: "repair-cycle budget exhausted" });
+    return this.withAdmissionLock(taskId, async () => {
+      const task = await this.store.getTask(taskId);
+      if (this.active.has(taskId) || this.queued.has(taskId)) {
+        throw new Error(`repair rejected: task ${taskId} is active or queued`);
+      }
+      if (!new Set(["reviewing", "partial", "failed", "blocked"]).has(task.state)) {
+        throw new Error(`repair rejected while task is ${task.state}`);
+      }
+      const plan = await this.store.getPlan(taskId);
+      await this.admitPlan(taskId, plan, false);
+      if (task.repairCycles >= plan.execution.budgets.reviewCycles) {
+        await this.setEvidenceState(taskId, "blocked", "repair-cycle budget exhausted");
+        return this.store.transition(taskId, "blocked", { lastError: "repair-cycle budget exhausted" });
+      }
+      await this.store.patchTask(taskId, { repairCycles: task.repairCycles + 1 });
+      await this.store.appendEvent(taskId, "repair.requested", { instructions });
+      await this.store.transition(taskId, "repairing");
+      return this.queuePrepared(taskId);
+    });
+  }
+
+  private async withAdmissionLock<T>(taskId: string, action: () => Promise<T>): Promise<T> {
+    const prior = this.admissionLocks.get(taskId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const chained = prior.then(() => current);
+    this.admissionLocks.set(taskId, chained);
+    await prior;
+    try {
+      return await action();
+    } finally {
+      release();
+      if (this.admissionLocks.get(taskId) === chained) this.admissionLocks.delete(taskId);
     }
-    await this.store.patchTask(taskId, { repairCycles: task.repairCycles + 1 });
-    await this.store.appendEvent(taskId, "repair.requested", { instructions });
-    if (task.state !== "repairing") await this.store.transition(taskId, "repairing");
-    return this.enqueue(taskId);
+  }
+
+  private async admitPlan(taskId: string, plan: MyClaudePlan, checkStaleBase: boolean): Promise<void> {
+    const validationPolicy = evaluatePlanValidation(plan);
+    await this.store.appendEvent(taskId, "validation.policy", {
+      profile: this.executionProfile,
+      profileAllowed: plan.execution.profile === this.executionProfile,
+      decisions: validationPolicy,
+    });
+    if (plan.execution.profile !== this.executionProfile) {
+      throw new Error(`plan execution profile ${plan.execution.profile} is not allowed by daemon policy ${this.executionProfile}`);
+    }
+    assertSafeValidationPlan(plan);
+    if (!checkStaleBase) return;
+    const priorEvents = await this.store.readEvents(taskId);
+    if (priorEvents.some((event) => event.type === "execution.started")) return;
+    const currentFingerprint = await computeWorkspaceFingerprint(plan.workspace);
+    if (currentFingerprint !== plan.baseFingerprint) {
+      throw new Error(`stale plan: workspace fingerprint changed (planned ${plan.baseFingerprint}, current ${currentFingerprint})`);
+    }
+  }
+
+  private async queuePrepared(taskId: string, record?: TaskRecord): Promise<TaskRecord> {
+    if (this.active.has(taskId)) throw new Error(`cannot queue task ${taskId} while it is actively executing`);
+    const current = record ?? await this.store.getTask(taskId);
+    const queued = current.state === "queued"
+      ? current
+      : await this.store.transition(taskId, "queued", { cancellationRequested: false, lastError: undefined });
+    this.push(taskId);
+    this.pump();
+    return queued;
+  }
+
+  private async quarantineRecovery(taskId: string, previousState: TaskRecord["state"], reason: string): Promise<void> {
+    const evidence = await this.store.getEvidence(taskId);
+    const risk = `recovery admission rejected: ${reason}`;
+    await this.store.invalidateVerification(taskId, [risk]);
+    await this.store.setEvidence(taskId, {
+      ...evidence,
+      state: "failed",
+      completedAt: new Date().toISOString(),
+      unresolvedRisks: [...new Set([...evidence.unresolvedRisks, risk])],
+    });
+    await this.store.transition(taskId, "failed", { lastError: risk });
+    await this.store.appendEvent(taskId, "task.recovery_quarantined", { previousState, reason });
   }
 
   private push(taskId: string): void {
@@ -272,21 +349,26 @@ export class TaskScheduler extends EventEmitter {
       }
       await this.store.transition(taskId, "validating");
       const validation = await this.validator.validate(plan, controller.signal);
-      await this.store.writeVerification(taskId, validation);
+      const validationAssessment = assessValidationEvidence(plan.validation.commands, validation);
+      if (validationAssessment.passed) {
+        await this.store.writeVerification(taskId, plan.validation.commands, validation);
+      } else {
+        await this.store.invalidateVerification(taskId, validationAssessment.issues);
+      }
       const updatedEvidence: ExecutionEvidence = { ...evidence, state: "validating", executor: result, validation, validationPolicy: evaluatePlanValidation(plan) };
       await this.store.setEvidence(taskId, updatedEvidence);
-      const validationFailed = validation.some((check) => check.exitCode !== 0);
+      const validationFailed = !validationAssessment.passed;
       const expectedFiles = plan.steps.flatMap((step) => step.expectedFiles);
       const planDeviation = expectedFiles.length > 0 && result.changedFiles.some((file) => !isExpectedFile(file, expectedFiles));
       const needsReview = plan.review.policy === "always"
         || (plan.review.policy === "adaptive" && (validationFailed || planDeviation || plan.risk !== "low" || result.changedFiles.length > 5 || result.diffLines > 500));
       if (validationFailed && !needsReview) {
-        await this.finish(taskId, "partial", { ...updatedEvidence, unresolvedRisks: ["one or more deterministic checks failed"] }, "deterministic validation failed");
+        await this.finish(taskId, "partial", { ...updatedEvidence, unresolvedRisks: validationAssessment.issues }, "deterministic validation failed");
         return;
       }
       if (needsReview) {
         const reviewing = { ...updatedEvidence, state: "reviewing" as const, unresolvedRisks: [
-          ...(validationFailed ? ["one or more deterministic checks failed"] : []),
+          ...(validationFailed ? validationAssessment.issues : []),
           ...(planDeviation ? ["changed files outside plan expectedFiles"] : []),
           "external review required",
         ] };
@@ -361,9 +443,5 @@ function isExpectedFile(changedFile: string, expectedFiles: string[]): boolean {
 
 function hasCompleteSuccessfulEvidence(plan: MyClaudePlan, evidence: ExecutionEvidence): boolean {
   if (evidence.executor?.exitCode !== 0) return false;
-  if (evidence.validation.length !== plan.validation.commands.length) return false;
-  return plan.validation.commands.every((declared, index) => {
-    const actual = evidence.validation[index];
-    return actual?.command === declared.command && actual.exitCode === 0;
-  });
+  return assessValidationEvidence(plan.validation.commands, evidence.validation).passed;
 }

@@ -288,13 +288,66 @@ export class TaskStore {
     };
   }
 
-  async writeVerification(taskId: string, validation: ExecutionEvidence["validation"]): Promise<void> {
-    const { sha256 } = await import("./util.js");
+  async writeVerification(
+    taskId: string,
+    declared: MyClaudePlan["validation"]["commands"],
+    validation: ExecutionEvidence["validation"],
+  ): Promise<void> {
+    const assessment = assessValidationEvidence(declared, validation);
+    if (!assessment.passed) {
+      throw new Error(`refusing to write passed verification: ${assessment.issues.join("; ")}`);
+    }
     await atomicWriteJson(join(this.taskDirectory(taskId), "verification.json"), {
       schema: "myclaude.verification/v1",
-      status: validation.every((item) => item.exitCode === 0) ? "passed" : "failed",
+      status: "passed",
       verifiedAt: new Date().toISOString(),
       commands: validation.map((item) => ({ commandHash: sha256(item.command), exitCode: item.exitCode })),
     });
   }
+
+  async invalidateVerification(taskId: string, issues: string[]): Promise<void> {
+    await atomicWriteJson(join(this.taskDirectory(taskId), "verification.json"), {
+      schema: "myclaude.verification/v1",
+      status: "failed",
+      verifiedAt: new Date().toISOString(),
+      issues: redactArtifact(issues.map((issue) => String(issue).slice(0, 1_000))),
+      commands: [],
+    });
+  }
+}
+
+export interface ValidationEvidenceAssessment {
+  passed: boolean;
+  issues: string[];
+}
+
+/** Exact validation contract: count, order, command identity, and exit status. */
+export function assessValidationEvidence(
+  declared: MyClaudePlan["validation"]["commands"],
+  actual: ExecutionEvidence["validation"],
+): ValidationEvidenceAssessment {
+  const issues: string[] = [];
+  if (actual.length !== declared.length) {
+    issues.push(`validation result count mismatch: expected ${declared.length}, received ${actual.length}`);
+  }
+  for (let index = 0; index < declared.length; index += 1) {
+    const expected = declared[index];
+    const result = actual[index];
+    if (!result) {
+      issues.push(`validation result ${index + 1} is missing for ${JSON.stringify(expected.command)}`);
+      continue;
+    }
+    if (result.command !== expected.command) {
+      issues.push(`validation result ${index + 1} command mismatch: expected ${JSON.stringify(expected.command)}, received ${JSON.stringify(result.command)}`);
+    }
+    if (!Number.isInteger(result.exitCode) || result.exitCode !== 0) {
+      issues.push(`validation result ${index + 1} did not exit successfully`);
+    }
+  }
+  if (actual.length > declared.length) {
+    for (let index = declared.length; index < actual.length; index += 1) {
+      issues.push(`unexpected validation result ${index + 1}: ${JSON.stringify(actual[index]?.command ?? "unknown")}`);
+    }
+  }
+  return { passed: issues.length === 0, issues };
 }
