@@ -17,6 +17,7 @@ import { TaskStore } from "./store.js";
 import { errorMessage, secureDirectory, secureWriteFile } from "./util.js";
 import { runAutomaticWorkflow, waitForExecution } from "./workflow.js";
 import { formatTaskProgress } from "./progress.js";
+import { assertManagedHookSettings } from "./hook-settings.js";
 
 const args = process.argv.slice(2);
 void main(args).catch((error) => {
@@ -41,6 +42,10 @@ async function serverCommand(command: string | undefined, argv: string[]): Promi
   const client = new MyClaudeClient({ socketPath });
   if (command === "run") {
     await secureDirectory(stateRoot);
+    const executionProfile = process.env.MYCLAUDE_EXECUTION_PROFILE === "host-unrestricted" ? "host-unrestricted" : "guarded";
+    if (process.env.MYCLAUDE_EXECUTOR_BIN) {
+      await assertManagedHookSettings(process.env.MYCLAUDE_HOOK_SETTINGS, executionProfile);
+    }
     const executor = process.env.MYCLAUDE_EXECUTOR_BIN
       ? new CommandExecutorAdapter({
           executable: process.env.MYCLAUDE_EXECUTOR_BIN,
@@ -51,7 +56,7 @@ async function serverCommand(command: string | undefined, argv: string[]): Promi
     const store = new TaskStore(stateRoot);
     const scheduler = new TaskScheduler(store, executor, new CommandValidatorAdapter(), {
       concurrency: Number(process.env.MYCLAUDE_CONCURRENCY || 1),
-      executionProfile: process.env.MYCLAUDE_EXECUTION_PROFILE === "host-unrestricted" ? "host-unrestricted" : "guarded",
+      executionProfile,
     });
     const daemon = new OrchestratorDaemon({ socketPath, store, scheduler });
     const shutdown = () => void daemon.close();
@@ -187,7 +192,7 @@ async function taskCommand(command: string | undefined, argv: string[]): Promise
   if (command === "resume") {
     const taskId = requiredPositional(argv, "task resume requires RUN_ID");
     const current = await client.getTask(taskId);
-    const result = current.state === "reviewing" || current.state === "partial" || current.state === "blocked"
+    const result = current.state === "reviewing" || current.state === "partial" || current.state === "failed" || current.state === "blocked"
       ? await client.requestRepair(taskId, flags(argv, "--instruction"))
       : await client.startTask(taskId);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

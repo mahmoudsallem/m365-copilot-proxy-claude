@@ -2,6 +2,7 @@ import { access, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import type { ProcessRunner } from "./runner.js";
 import { NodeProcessRunner } from "./runner.js";
+import { assertManagedHookSettings } from "./hook-settings.js";
 
 export interface ModelEntry {
   id: string;
@@ -55,6 +56,20 @@ export async function runDoctor(options: { stateRoot: string; socketPath: string
     ok: Boolean(process.env.MYCLAUDE_EXECUTOR_BIN),
     detail: process.env.MYCLAUDE_EXECUTOR_BIN ?? "MYCLAUDE_EXECUTOR_BIN is not configured; daemon will fail loudly instead of using paid Claude",
   });
+  const profile = process.env.MYCLAUDE_EXECUTION_PROFILE === "host-unrestricted" ? "host-unrestricted" : "guarded";
+  try {
+    await assertManagedHookSettings(process.env.MYCLAUDE_HOOK_SETTINGS, profile);
+    checks.push({ name: "verified hooks", ok: true, detail: `${profile} managed settings are intact` });
+  } catch (error) {
+    checks.push({ name: "verified hooks", ok: false, detail: error instanceof Error ? error.message : String(error) });
+  }
+  const bwrap = process.env.MYCLAUDE_BWRAP_BIN ?? "/usr/bin/bwrap";
+  try {
+    await access(bwrap, constants.X_OK);
+    checks.push({ name: "validation sandbox", ok: true, detail: bwrap });
+  } catch {
+    checks.push({ name: "validation sandbox", ok: false, detail: `bubblewrap is required at ${bwrap}` });
+  }
   try {
     const models = await fetchModels();
     checks.push({ name: "M365 proxy", ok: true, detail: `${models.length} models available` });

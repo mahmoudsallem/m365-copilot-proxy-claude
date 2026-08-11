@@ -57,3 +57,4 @@ export {
   type ValidationPolicyDecision,
 } from "./validation-policy.js";
 export { formatTaskProgress, type TaskProgressStage } from "./progress.js";
+export { assertManagedHookSettings, type ExecutionProfile } from "./hook-settings.js";
