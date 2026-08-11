@@ -3,7 +3,7 @@
   "default": "guarded",
   "profiles": {
     "guarded": {
-      "description": "Workspace-scoped file access with deterministic denials for destructive, credential-store, and external-write commands.",
+      "description": "Workspace-scoped built-in file tools plus best-effort Bash denials and Claude Code approvals; this is defense in depth, not a sandbox.",
       "preToolUse": "enforce",
       "stopVerificationGate": true
     },

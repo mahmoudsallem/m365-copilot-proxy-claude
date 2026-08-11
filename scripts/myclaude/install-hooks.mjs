@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIRECTORY, "..", "..");
 const TEMPLATE_PATH = path.join(ROOT, "config", "myclaude", "claude-hooks.json");
+const GATEWAY_SETTINGS_PATH = path.join(ROOT, "config", "claude-m365-settings.json");
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -40,9 +41,15 @@ function markerPath(filePath) {
 
 function render(profile) {
   if (!["guarded", "host-unrestricted"].includes(profile)) throw new Error(`unsupported profile: ${profile}`);
-  return fs.readFileSync(TEMPLATE_PATH, "utf8")
+  const hookSettings = JSON.parse(fs.readFileSync(TEMPLATE_PATH, "utf8")
     .replaceAll("__MYCLAUDE_ROOT__", ROOT)
-    .replaceAll("__MYCLAUDE_PROFILE__", profile);
+    .replaceAll("__MYCLAUDE_PROFILE__", profile));
+  const gatewaySettings = JSON.parse(fs.readFileSync(GATEWAY_SETTINGS_PATH, "utf8"));
+  return `${JSON.stringify({
+    ...gatewaySettings,
+    ...hookSettings,
+    env: { ...(gatewaySettings.env ?? {}), ...(hookSettings.env ?? {}) },
+  }, null, 2)}\n`;
 }
 
 function atomicWrite(filePath, content) {
