@@ -62,8 +62,33 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
 └── @m365-copilot/openclaw-plugin  — OpenClaw config generator + setup CLI + skill
 ```
 
-## One-click Linux setup
+## Windows
 
+Everything is cross-platform; use PowerShell instead of the bash launchers.
+`run.ps1` is a one-stop bootstrap — it installs Node LTS (winget) if missing,
+provisions pnpm, installs project dependencies, builds, fetches the system-prompt
+corpus, installs Claude Code if no binary is found, starts the proxy, waits for
+health, and can connect + run Claude Code against it:
+
+```powershell
+.\run.ps1                          # deps -> build -> serve (auto live/FAKE mode)
+.\run.ps1 -Claude                  # ...connect + RUN Claude Code through the proxy
+.\run.ps1 -Fake -Claude            # offline scripted backend + Claude Code (zero quota)
+.\run.ps1 -Model claude-sonnet -Claude
+.\run.ps1 -Model claude-sonnet `
+          -SystemPrompt "name:Anthropic/claude-code/claude-code-sonnet-4.6" -Claude
+.\run.ps1 -KeepProxy -Claude       # leave proxy running after Claude exits
+.\run.ps1 -Tui                     # interactive TUI instead
+.\run.ps1 -Fresh                   # force reinstall + rebuild
+
+pnpm test:e2e:sandbox              # cross-platform Node E2E (no quota)
+```
+
+Connection is session-scoped (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` env) —
+nothing global is written. Credentials for live M365 live at
+`%USERPROFILE%\.config\opencode-m365\secrets.json`.
+
+## One-click Linux setup
 ### Requirements
 
 - 64-bit Linux with Bash

@@ -19,13 +19,14 @@ import readline, { emitKeypressEvents } from "node:readline";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { spawnClaude } from "../scripts/lib/claude-bin.mjs";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROXY_PORT = process.env.PORT ?? "4141";
 const PROXY_URL = process.env.M365_PROXY_URL ?? `http://127.0.0.1:${PROXY_PORT}`;
 const API_KEY = process.env.M365_PROXY_API_KEY ?? "";
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? `${os.homedir()}/.local/bin/claude`;
 const STATE_FILE = path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"), "m365-copilot-proxy", "tui.json");
 
 const ANSI = { dim: "\x1b[2m", bold: "\x1b[1m", red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m", cyan: "\x1b[36m", reset: "\x1b[0m", clear: "\x1b[2J\x1b[H" };
@@ -165,7 +166,7 @@ async function launchViaProxy(state) {
   console.log(ANSI.clear);
   console.log(`${ANSI.green}▶ launching Claude Code via ${PROXY_URL}${ANSI.reset}  model=${model}  prompt=${promptChoice ?? "none"}`);
   console.log(`${ANSI.dim}MCP/skills/plugins are client-side — configure them as usual (.mcp.json, ~/.claude).${ANSI.reset}\n`);
-  const child = spawn(CLAUDE_BIN, ["--model", model], {
+  const child = spawnClaude(["--model", model], {
     stdio: "inherit",
     env: claudeEnv({ model, promptSpec: promptChoice }),
   });
@@ -177,7 +178,7 @@ async function launchOriginal(state) {
   console.log(`${ANSI.green}▶ launching ORIGINAL Claude Code (Anthropic backend)${ANSI.reset}`);
   const env = { ...process.env };
   for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_CUSTOM_HEADERS"]) delete env[k];
-  const child = spawn(CLAUDE_BIN, [], { stdio: "inherit", env });
+  const child = spawnClaude([], { stdio: "inherit", env });
   child.on("exit", (code) => process.exit(code ?? 0));
 }
 
@@ -194,7 +195,7 @@ async function parallelAgents() {
   for (let i = 0; i < n; i++) {
     const dir = path.join(rootDir, `agent-${String(i + 1).padStart(2, "0")}`);
     fs.mkdirSync(dir, { recursive: true });
-    const child = spawn(CLAUDE_BIN, ["-p", task, "--model", model], {
+    const child = spawnClaude(["-p", task, "--model", model], {
       cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
       env: claudeEnv({ model, promptSpec: null }),

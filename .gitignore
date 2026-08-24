@@ -43,3 +43,5 @@ scripts/da-app/pkg/
 scripts/da-app/sentinel-agent.zip
 scripts/harness/out/
 vendor/
+proxy.stdout.log
+proxy.stderr.log

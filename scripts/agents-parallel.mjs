@@ -14,7 +14,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { spawnClaude } from "./lib/claude-bin.mjs";
 
 const args = process.argv.slice(2);
 function arg(name, fallback) {
@@ -37,11 +38,9 @@ if (!TASK) {
 const PROXY_PORT = process.env.PORT ?? "4141";
 const PROXY_URL = process.env.M365_PROXY_URL ?? `http://127.0.0.1:${PROXY_PORT}`;
 const API_KEY = process.env.M365_PROXY_API_KEY ?? "";
-const CLAUDE_BIN = process.env.CLAUDE_BIN ?? `${os.homedir()}/.local/bin/claude`;
 
 // Preflight
 try {
-  const headers = { Authorization: API_KEY ? `Bearer ${API_KEY}` : "" };
   const res = await fetch(`${PROXY_URL}/health`);
   if (!res.ok) throw new Error(String(res.status));
 } catch (e) {
@@ -77,7 +76,7 @@ for (let i = 0; i < AGENTS; i++) {
   };
   delete env.ANTHROPIC_API_KEY;
 
-  const child = spawn(CLAUDE_BIN, ["-p", TASK, "--model", MODEL, permFlag, ...permVal], {
+  const child = spawnClaude(["-p", TASK, "--model", MODEL, permFlag, ...permVal], {
     cwd: dir,
     stdio: ["ignore", "pipe", "pipe"],
     env,
