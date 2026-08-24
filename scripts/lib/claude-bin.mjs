@@ -29,7 +29,7 @@ export function resolveClaudeBin() {
   return "claude";
 }
 
-const needsQuoting = (s: string) => /[\s"^&|<>()%!"]/test(s);
+const needsQuoting = (s) => /[\s"^&|<>()%!"]/test(s);
 const quoteWin = (s: string) => `"${s.replace(/"/g, '""')}"`;
 
 /**
@@ -40,10 +40,7 @@ const quoteWin = (s: string) => `"${s.replace(/"/g, '""')}"`;
  *   args would be substituted — callers should not pass untrusted text as
  *   flag VALUES here without knowing that.
  */
-export function spawnClaude(
-  args,
-  opts = {},
-): ReturnType<typeof spawn> {
+export function spawnClaude(args, opts = {}) {
   const bin = resolveClaudeBin();
   if (process.platform !== "win32") {
     return spawn(bin, args, { ...opts, stdio: opts.stdio ?? "inherit" });
