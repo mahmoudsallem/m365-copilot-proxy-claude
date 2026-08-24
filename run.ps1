@@ -116,10 +116,29 @@ $apiKey = if ($env:M365_PROXY_API_KEY) { $env:M365_PROXY_API_KEY } else { "m365"
 # --- 6. Claude Code binary --------------------------------------------------------------
 function Resolve-ClaudeBin {
     if ($env:CLAUDE_BIN -and (Test-Path $env:CLAUDE_BIN)) { return $env:CLAUDE_BIN }
+
+    # 1. Already on PATH? (covers npm, native installer, scoop, etc.)
+    $onPath = Get-Command claude -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+
+    # 2. Ask npm where ITS global bin dir is - handles nvm-windows/fnm/volta/
+    #    custom prefixes that are NOT %APPDATA%\npm.
+    try {
+        $prefix = (& npm config get prefix 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $prefix) {
+            foreach ($name in @("claude.cmd", "claude.ps1", "claude")) {
+                $candidate = Join-Path $prefix $name
+                if (Test-Path $candidate) { return $candidate }
+            }
+        }
+    } catch { }
+
+    # 3. Last resort: well-known locations.
     $candidates = @(
         (Join-Path $userHome "AppData\Roaming\npm\claude.cmd"),
         (Join-Path $userHome "AppData\Local\Programs\claude-code\claude.exe"),
-        (Join-Path $userHome ".local\bin\claude.exe")
+        (Join-Path $userHome ".local\bin\claude.exe"),
+        (Join-Path $userHome ".claude\local\claude.exe")
     )
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
     return $null
