@@ -29,8 +29,8 @@ export function resolveClaudeBin() {
   return "claude";
 }
 
-const needsQuoting = (s) => /[\s"^&|<>()%!"]/test(s);
-const quoteWin = (s: string) => `"${s.replace(/"/g, '""')}"`;
+const needsQuoting = (s) => /[\s"^&|<>()%!"]/.test(s);
+const quoteWin = (s) => `"${s.replace(/"/g, '""')}"`;
 
 /**
  * Spawn the Claude CLI with Windows-correct semantics:
