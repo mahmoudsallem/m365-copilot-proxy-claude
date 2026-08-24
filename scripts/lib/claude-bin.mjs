@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 
 /**
  * Locate the Claude Code CLI cross-platform.
@@ -16,13 +16,26 @@ export function resolveClaudeBin() {
     if (existsSync(env)) return env;
     // CLAUDE_BIN set but missing — fall through to discovery rather than dying later.
   }
-  const candidates = process.platform === "win32"
-    ? [
-        path.join(os.homedir(), "AppData", "Roaming", "npm", "claude.cmd"),
-        path.join(os.homedir(), "AppData", "Local", "Programs", "claude-code", "claude.exe"),
-        path.join(os.homedir(), ".local", "bin", "claude.exe"),
-      ]
-    : [path.join(os.homedir(), ".local", "bin", "claude")];
+  const isWin = process.platform === "win32";
+  const candidates = [];
+  if (isWin) {
+    // Ask npm where its global bin dir is — nvm-windows/fnm/volta/custom
+    // prefixes are NOT %APPDATA%\npm.
+    try {
+      const prefix = execFileSync("npm", ["config", "get", "prefix"], { encoding: "utf8" }).trim();
+      if (prefix) {
+        for (const name of ["claude.cmd", "claude.ps1", "claude"]) candidates.push(path.join(prefix, name));
+      }
+    } catch { /* npm missing/broken — keep going */ }
+    candidates.push(
+      path.join(os.homedir(), "AppData", "Roaming", "npm", "claude.cmd"),
+      path.join(os.homedir(), "AppData", "Local", "Programs", "claude-code", "claude.exe"),
+      path.join(os.homedir(), ".local", "bin", "claude.exe"),
+      path.join(os.homedir(), ".claude", "local", "claude.exe"),
+    );
+  } else {
+    candidates.push(path.join(os.homedir(), ".local", "bin", "claude"));
+  }
   for (const c of candidates) {
     try { if (existsSync(c) && statSync(c).isFile()) return c; } catch { /* keep looking */ }
   }
