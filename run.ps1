@@ -12,7 +12,11 @@
 #   .\run.ps1 -Tui               # interactive TUI instead
 #   .\run.ps1 -Dev               # hot-reload dev server
 #   .\run.ps1 -Fresh             # force reinstall + rebuild
-#   .\run.ps1 -KeepProxy -Claude # leave the proxy running after Claude exits
+#   .\run.ps1                    # serve mode: keeps a self-healing proxy running
+#   .\run.ps1 -Claude            # ...then CONNECT + RUN Claude Code through it.
+#                                #   The proxy now SURVIVES after Claude exits
+#                                #   (a watchdog restarts it if it dies).
+#   .\run.ps1 -StopProxy         # stop the watchdog + proxy
 #
 # First run will: install Node LTS via winget if missing, activate pnpm via
 # corepack, pnpm install, build all packages, and install Claude Code via npm
@@ -24,6 +28,8 @@ param(
     [switch]$Fresh,
     [switch]$Claude,
     [switch]$KeepProxy,
+    [switch]$NoWatchdog,
+    [switch]$StopProxy,
     [string]$Model = $(if ($env:M365_DEFAULT_MODEL) { $env:M365_DEFAULT_MODEL } else { "gpt-5.5-think-deeper" }),
     [string]$SystemPrompt = ""
 )
@@ -31,6 +37,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
+$isWin = ($env:OS -eq "Windows_NT")
 
 if (-not $env:PORT) { $env:PORT = "4141" }
 $Mode = "auto"
@@ -113,6 +120,20 @@ if ($Mode -eq "fake") { $env:M365_FAKE_MODE = "1"; Log "mode: FAKE" } else { Log
 $proxyUrl = "http://127.0.0.1:$($env:PORT)"
 $apiKey = if ($env:M365_PROXY_API_KEY) { $env:M365_PROXY_API_KEY } else { "m365" }
 
+# --- 5b. -StopProxy: tear down watchdog + any running proxy -----------------------------
+if ($StopProxy) {
+    $stopFile = Join-Path $Root ".proxy-watchdog-stop"
+    New-Item -ItemType File -Path $stopFile -Force | Out-Null
+    foreach ($name in @("node", "pwsh", "powershell")) {
+        Get-CimInstance Win32_Process -Filter "Name like '$name%'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'watch-proxy\.ps1|packages.proxy..output.server.index\.mjs' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    Get-ChildItem "$Root\proxy.std*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Log "proxy + watchdog stopped."
+    exit 0
+}
+
 # --- 6. Claude Code binary --------------------------------------------------------------
 function Resolve-ClaudeBin {
     if ($env:CLAUDE_BIN -and (Test-Path $env:CLAUDE_BIN)) { return $env:CLAUDE_BIN }
@@ -174,7 +195,6 @@ if (Test-ProxyUp) {
 } else {
     $serverScript = Join-Path $Root "packages/proxy/.output/server/index.mjs"
     # -WindowStyle exists only on Windows editions of Start-Process.
-    $isWin = ($env:OS -eq "Windows_NT")
     if ($Dev) {
         Log "starting DEV proxy (hot reload) on $proxyUrl"
         $sp = @{ FilePath = "cmd.exe"; ArgumentList = @("/c", "corepack pnpm --filter @m365-copilot/proxy dev");
@@ -202,14 +222,37 @@ if (Test-ProxyUp) {
 }
 Log "proxy healthy at $proxyUrl"
 
+# PID file so -StopProxy / other terminals can find us.
+Set-Content -Path (Join-Path $Root ".proxy.pid") -Value $proxyProcess.Id
+
+# Self-healing: a detached watchdog respawns the server within ~5s if it dies.
+# This is what keeps long Claude Code sessions alive when the background node
+# process gets reaped (console close, signal propagation, crash).
+$watchdog = $null
+if (-not $NoWatchdog) {
+    Log "watchdog armed (disable with -NoWatchdog)"
+    $sp = @{ FilePath = "pwsh"; ArgumentList = @("-NoProfile", "-File", "`"$(Join-Path $Root 'scripts/watch-proxy.ps1')`"", "-Root", "`"$Root`"", "-Port", "$env:PORT");
+             WorkingDirectory = $Root; PassThru = $true }
+    if ($isWin) { $sp.WindowStyle = "Hidden" }
+    try { $watchdog = Start-Process @sp } catch {
+        # older Windows PowerShell: pwsh may not exist, use powershell.exe
+        $sp.FilePath = "powershell"
+        try { $watchdog = Start-Process @sp } catch { Warn "could not start watchdog - proxy will not auto-restart." }
+    }
+}
+
 # --- 8. what to launch ------------------------------------------------------------------------
 if ($Tui) {
     Log "launching TUI..."
     try {
         & node (Join-Path $Root "bin/m365-tui.mjs")
     } finally {
-        if ($startedHere -and -not $KeepProxy -and $proxyProcess) {
-            Log "stopping proxy"; $proxyProcess.Kill() | Out-Null
+        if (-not $KeepProxy -and -not $NoWatchdog) { New-Item -ItemType File -Path (Join-Path $Root ".proxy-watchdog-stop") -Force | Out-Null }
+        if (-not $KeepProxy) {
+            if ($proxyProcess) { $proxyProcess.Kill() | Out-Null }
+            Log "stopping proxy (use -KeepProxy to leave it running)"
+        } else {
+            Log "proxy left running at $proxyUrl  (stop later with: .\run.ps1 -StopProxy)"
         }
     }
     exit $LASTEXITCODE
@@ -217,9 +260,11 @@ if ($Tui) {
 
 if (-not $Claude) {
     Log "serving. Ctrl+C to stop. Endpoints: /health /v1/models /v1/messages /v1/system-prompts"
+    Log "Ctrl+C stops everything."
     try {
         while ($true) { Start-Sleep -Seconds 3600 }
     } finally {
+        if (-not $KeepProxy -and -not $NoWatchdog) { New-Item -ItemType File -Path (Join-Path $Root ".proxy-watchdog-stop") -Force | Out-Null }
         if ($startedHere -and $proxyProcess) { $proxyProcess.Kill() | Out-Null }
     }
 }
@@ -258,8 +303,11 @@ try {
     & $claudeBin --model $Model @args
     exit $LASTEXITCODE
 } finally {
-    if ($startedHere -and -not $KeepProxy -and $proxyProcess) {
-        Log "stopping proxy"
+    if ($KeepProxy -or -not $NoWatchdog) {
+        Log "proxy stays up at $proxyUrl (stop later: .\run.ps1 -StopProxy)"
+    } elseif ($startedHere -and $proxyProcess) {
+        New-Item -ItemType File -Path (Join-Path $Root ".proxy-watchdog-stop") -Force | Out-Null
         $proxyProcess.Kill() | Out-Null
+        Log "stopped proxy"
     }
 }

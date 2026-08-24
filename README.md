@@ -77,11 +77,21 @@ health, and can connect + run Claude Code against it:
 .\run.ps1 -Model claude-sonnet -Claude
 .\run.ps1 -Model claude-sonnet `
           -SystemPrompt "name:Anthropic/claude-code/claude-code-sonnet-4.6" -Claude
-.\run.ps1 -KeepProxy -Claude       # leave proxy running after Claude exits
+.\run.ps1 -StopProxy               # stop the watchdog + proxy
 .\run.ps1 -Tui                     # interactive TUI instead
 .\run.ps1 -Fresh                   # force reinstall + rebuild
 
 pnpm test:e2e:sandbox              # cross-platform Node E2E (no quota)
+```
+
+A **watchdog** (armed automatically) respawns the proxy within ~5 s if it dies,
+so long Claude Code sessions survive background-process crashes. The proxy also
+stays up after Claude exits by default — manage it explicitly:
+
+```powershell
+.\run.ps1                 # terminal A: serve (self-healing)
+.\run.ps1 -Claude         # terminal B: Claude Code attached to that proxy
+.\run.ps1 -StopProxy      # shut everything down
 ```
 
 Connection is session-scoped (`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` env) —
