@@ -269,6 +269,41 @@ if (-not $Claude) {
     }
 }
 
+# --- 8b. repair stale ~/.claude/settings.json overrides -------------------------------
+# Legacy launchers wrote ANTHROPIC_* into the user settings file; Claude Code lets
+# settings.json env OVERRIDE process env, so a stale localhost URL (e.g. port 4146)
+# silently beats whatever we export here. Detect -> back up -> strip those keys.
+function Repair-ClaudeSettings {
+    param([string]$ExpectedBaseUrl)
+    $settingsPath = Join-Path $userHome ".claude\settings.json"
+    if (-not (Test-Path $settingsPath)) { return }
+    try { $json = Get-Content $settingsPath -Raw | ConvertFrom-Json } catch {
+        Warn "~/.claude/settings.json is not valid JSON - leaving it untouched."; return
+    }
+    $conflicts = @()
+    if ($json.env) {
+        foreach ($key in @("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")) {
+            if ($json.env.PSObject.Properties.Name -contains $key) { $conflicts += "env.$key" }
+        }
+        if ($json.env.PSObject.Properties.Name -contains "ANTHROPIC_AUTH_TOKEN") { $conflicts += "env.ANTHROPIC_AUTH_TOKEN" }
+    }
+    if ($json.apiKeyHelper -and $json.apiKeyHelper -match "m365-claude-key") { $conflicts += "apiKeyHelper" }
+    if ($conflicts.Count -eq 0) { return }
+
+    $backup = "$settingsPath.backup-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss")
+    Copy-Item $settingsPath $backup
+    foreach ($key in @("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_AUTH_TOKEN")) {
+        if ($json.env -and $json.env.PSObject.Properties.Name -contains $key) { $json.env.PSObject.Properties.Remove($key) }
+    }
+    if ($json.env -and $json.env.PSObject.Properties.Name.Count -eq 0) { $json.PSObject.Properties.Remove("env") }
+    if ($json.apiKeyHelper -and $json.apiKeyHelper -match "m365-claude-key") { $json.PSObject.Properties.Remove("apiKeyHelper") }
+    $json | ConvertTo-Json -Depth 20 | Set-Content $settingsPath -Encoding UTF8
+    Log "REPAIRED ~/.claude/settings.json - removed stale override(s): $($conflicts -join ', ')"
+    Log "  backup saved to: $backup"
+}
+
+Repair-ClaudeSettings -ExpectedBaseUrl $proxyUrl
+
 # --- 9. connect Claude Code to the proxy and run it ---------------------------------------------
 Log "connecting Claude Code -> $proxyUrl (model: $Model)"
 try {
