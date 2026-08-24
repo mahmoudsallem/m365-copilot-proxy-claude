@@ -24,8 +24,11 @@ export default defineEventHandler(async (event) => {
     res.once("close", abort);
   }
 
+  const systemPromptSpec =
+    (event.node?.req?.headers?.["x-m365-system-prompt"] as string | undefined) ?? undefined;
+
   try {
-    return await handleAnthropicMessages(body, pool, controller.signal);
+    return await handleAnthropicMessages(body, pool, { signal: controller.signal, systemPromptSpec });
   } catch (err: any) {
     console.error("[messages.post error]", err.stack || err);
     throw err;

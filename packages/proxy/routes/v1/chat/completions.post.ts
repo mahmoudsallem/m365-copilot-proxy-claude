@@ -29,5 +29,7 @@ export default defineEventHandler(async (event) => {
 
   // handleChatCompletion returns a Web Response (JSON or an SSE ReadableStream
   // when stream:true). Returning it directly lets h3 forward it untouched.
-  return handleChatCompletion(body, pool, { signal: ac.signal });
+  const systemPromptSpec =
+    (event.node?.req?.headers?.["x-m365-system-prompt"] as string | undefined) ?? undefined;
+  return handleChatCompletion(body, pool, { signal: ac.signal, systemPromptSpec });
 });

@@ -259,6 +259,76 @@ and `.runtime/` remain until you delete that exact folder yourself.
 > injected prompt and can disengage from tools. Prefer `gpt-5.5-think-deeper`.
 > See [docs/m365-copilot-api.md](docs/m365-copilot-api.md) §5/§10.
 
+## Claude Code, TUI, parallel agents & system prompts
+
+### Interactive TUI
+
+```sh
+pnpm tui
+```
+
+Arrow-key launcher: run **Claude Code through this proxy** or the **original**
+Anthropic backend side by side, pick any registered model from the live registry,
+route a system prompt, spawn parallel agents, and live-validate models.
+
+### System prompt routing (corpus)
+
+```sh
+pnpm prompts:fetch        # clone/update github.com/asgeirtj/system_prompts_leaks -> vendor/
+```
+
+425+ real leaked system prompts get indexed (including the full Claude Code
+prompts: `Anthropic/claude-code/claude-code-sonnet-4.6`, opus variants, subagents…).
+Browse via `GET /v1/system-prompts`, fetch one via
+`GET /v1/system-prompts/<url-encoded-name>`, and route per request:
+
+```sh
+curl -X POST localhost:4141/v1/messages \
+  -H 'Authorization: Bearer m365' -H 'x-m365-system-prompt: name:Anthropic/claude-code/claude-code-sonnet-4.6' …
+```
+
+Spec forms: `name:<corpus-name>` · `path:<file>` · bare literal text. A global
+default can be set with `M365_SYSTEM_PROMPT`; the TUI routes it via Claude Code's
+`ANTHROPIC_CUSTOM_HEADERS`. Injection is **opt-in** — big injected prompts raise
+Disengaged risk, so nothing is added unless you ask. The `pnpm tui` picker wires
+this for you; MCP servers/skills/plugins are Claude Code *client* features and
+work unchanged once `ANTHROPIC_BASE_URL` points at the proxy.
+
+### Parallel agents
+
+```sh
+pnpm agents -- --agents 3 --task "fix the failing tests" --model gpt-5.5-think-deeper
+```
+
+N isolated headless Claude Code runs (`--worktree` for git worktrees). Safe for
+M365: every turn passes through the server-side **TurnGate** — bounded inflight
+turns (`M365_MAX_CONCURRENT_TURNS`, default 2) plus staggered NEW-conversation
+starts (`M365_CONVERSATION_START_GAP_MS`, default 5000) so N clients never
+stampede the thread-rate throttle. Long single-agent loops are never gap-delayed.
+Live stats: `GET /health`.
+
+### Offline E2E / sandbox validation (no quota)
+
+```sh
+pnpm test:e2e:sandbox                 # boots built Nitro in M365_FAKE_MODE=1 and drives
+RUN_CLAUDE_E2E=1 pnpm test:e2e:sandbox # …optionally incl. a headless `claude -p` loop
+```
+
+`M365_FAKE_MODE=1` swaps the M365 WebSocket backend for a scripted FakeTransport —
+the FULL stack (fenced tool formatting → parsing → OpenAI/Anthropic translation)
+runs against deterministic responses. Also used by the offline vitest suite
+(`packages/proxy-lib/src/e2e.offline.test.ts`): tool loop round-trip, incremental
+SSE shape, system-prompt injection, gate semantics.
+
+### Live model validation
+
+```sh
+pnpm validate:models -- --yes          # sequential one-turn probe per canonical model
+```
+
+Strictly sequential with cooldowns (quota-aware); writes a JSON scorecard to
+`scripts/validate-models-out/`.
+
 ## Image generation
 
 M365 Copilot generates images through a built-in server-side tool, and the core

@@ -42,3 +42,4 @@ scripts/da-app/gui-out/
 scripts/da-app/pkg/
 scripts/da-app/sentinel-agent.zip
 scripts/harness/out/
+vendor/

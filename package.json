@@ -16,8 +16,13 @@
     "pi:sandbox": "bash scripts/pi-sandbox.sh",
     "test": "pnpm test:unit",
     "test:unit": "pnpm build && npx vitest run",
+    "test:e2e:sandbox": "bash scripts/tests/e2e-sandbox.sh",
     "test:launchers": "bash scripts/tests/launcher-smoke.sh",
-    "test:live": "pnpm build && M365_LIVE=1 npx vitest run"
+    "test:live": "pnpm build && M365_LIVE=1 npx vitest run",
+    "tui": "node bin/m365-tui.mjs",
+    "prompts:fetch": "node scripts/fetch-system-prompts.mjs --list",
+    "agents": "node scripts/agents-parallel.mjs",
+    "validate:models": "node scripts/validate-models.mjs"
   },
   "packageManager": "pnpm@10.32.1",
   "devDependencies": {

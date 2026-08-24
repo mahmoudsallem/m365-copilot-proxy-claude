@@ -112,3 +112,20 @@ First head-to-head of all 10 strategies on the unfakeable tasks (`fix-bug`,
 confirmed with `--repeat` and validated through real pi.
 
 _Update this section with the matrix, the conclusion, and the chosen direction._
+
+## System-prompt routing (new lever — untested live)
+
+The proxy can now inject a system prompt per request (opt-in):
+`x-m365-system-prompt: name:<corpus>|path:<file>|<literal>` header, or the
+`M365_SYSTEM_PROMPT` env default. The corpus is
+`vendor/system-prompts-leaks` (`pnpm prompts:fetch`, 425+ prompts incl. the real
+Claude Code system prompts). Implementation: `packages/core/src/prompts.ts` +
+`injectSystemPrompt()` in proxy-lib's handler; TUI + `/v1/system-prompts`
+endpoints for browsing.
+
+**Status: plumbing validated offline (E2E), NOT yet A/B'd against live M365.**
+Open question for the next bench sweep: does prefixing a real Claude Code system
+prompt (a) improve tool compliance on claude-* tones (which run agent-less,
+fenced mode), and (b) what does it do to `x_m365_dea_score` / Disengaged risk at
+170k-char sizes? Predict: large injected prompts will need truncation before
+live use; test lean subsets first.

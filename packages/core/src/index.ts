@@ -80,8 +80,24 @@ export {
 
 export {
   ModelSession,
+  RealM365Transport,
   type ModelSessionOptions,
+  type ModelTransport,
 } from "./model.js";
+
+export {
+  FakeTransport,
+  type FakeTransportOptions,
+} from "./fake.js";
+
+export {
+  listSystemPrompts,
+  getSystemPrompt,
+  resolveSystemPromptSpec,
+  findSystemPromptIndex,
+  clearSystemPromptCache,
+  type SystemPromptMeta,
+} from "./prompts.js";
 
 export {
   formatMessages,

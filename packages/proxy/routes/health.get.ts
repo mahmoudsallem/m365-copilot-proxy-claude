@@ -1,3 +1,11 @@
-import { HEALTH_PAYLOAD } from "@m365-copilot/proxy-lib";
+import { isDegradationBackoff } from "@m365-copilot/core";
+import { pool } from "../server-pool";
 
-export default defineEventHandler(() => HEALTH_PAYLOAD);
+/** Liveness + live capacity stats (pool size, turn-gate saturation, throttle backoff). */
+export default defineEventHandler(() => ({
+  status: "ok",
+  fakeMode: process.env.M365_FAKE_MODE === "1",
+  conversations: pool.size,
+  gate: pool.turnGate.stats(),
+  degradedBackoff: isDegradationBackoff(),
+}));

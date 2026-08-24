@@ -16,9 +16,11 @@ import {
   awaitDegradationBackoff,
   getImageArtifactToken,
   fetchImageBytes,
+  resolveSystemPromptSpec,
   type CapturedImage,
 } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
+import { TurnGate } from "./gate.js";
 import type { z } from "zod/v4";
 
 const log = createLogger("handler");
@@ -68,7 +70,7 @@ const OUTPUT_CHAR_CEILING = process.env.M365_OUTPUT_CHAR_CEILING !== undefined
   : 12_000;
 
 /** "length" when the answer is at/over the empirical output ceiling, else "stop". */
-function outputFinishReason(text: string): "stop" | "length" {
+export function outputFinishReason(text: string): "stop" | "length" {
   if (OUTPUT_CHAR_CEILING > 0 && text.length >= OUTPUT_CHAR_CEILING) {
     log.info(`Output at ceiling (${text.length} ≥ ${OUTPUT_CHAR_CEILING} chars) — finish_reason=length (likely truncated; harness should continue)`);
     return "length";
@@ -175,6 +177,8 @@ const MAX_IDLE_MS = 30 * 60 * 1000; // evict after 30 min idle
 export class SessionPool {
   private conversations = new Map<string, ConversationState>();
   private sessionOptions: ModelSessionOptions;
+  /** Throttle-aware concurrency gate shared by every conversation in this pool. */
+  readonly turnGate = new TurnGate();
 
   constructor(sessionOptions: ModelSessionOptions = {}) {
     this.sessionOptions = sessionOptions;
@@ -210,6 +214,11 @@ export class SessionPool {
     };
     this.conversations.set(fingerprint, state);
     return state;
+  }
+
+  /** Public so callers can key their own accounting (the turn gate) off the same identity. */
+  fingerprintOf(messages: ParsedMessage[]): string {
+    return this.fingerprint(messages);
   }
 
   private fingerprint(messages: ParsedMessage[]): string {
@@ -266,20 +275,73 @@ function formatDeltaMessages(messages: ParsedMessage[]): string {
 // --- Main handler ---
 
 /**
- * Handle a chat completion request, returning an OpenAI-compatible Response.
- * The SessionPool routes each conversation to its own ModelSession.
+ * One completed turn, as DATA — rendered as JSON or SSE by whichever protocol
+ * route (OpenAI chat completions / Anthropic messages) asked for it.
  */
-export async function handleChatCompletion(
+export type Produced =
+  | { kind: "error"; resp: Response }
+  | { kind: "text"; text: string }
+  | { kind: "tools"; toolCalls: ReturnType<typeof parseToolCalls>["toolCalls"] };
+
+export interface ProduceOptions {
+  /** Aborts the M365 turn when the client disconnects. */
+  signal?: AbortSignal;
+  /**
+   * Live text-delta callback (non-tool path only — tool mode buffers because the
+   * raw text must be parsed for fences and can't be shown verbatim).
+   */
+  onTextDelta?: (delta: string) => void;
+  /**
+   * Per-request system-prompt spec (name:/path:/literal). Takes precedence over
+   * the M365_SYSTEM_PROMPT env var. Never set globally — passed straight through
+   * so concurrent requests can't leak prompts into each other.
+   */
+  systemPromptSpec?: string;
+}
+
+/**
+ * Opt-in system-prompt injection. Spec resolution order per request:
+ * explicit spec argument > M365_SYSTEM_PROMPT env var > none. See core/prompts.ts
+ * for name:/path:/literal semantics. Injected prompts raise Disengaged risk when
+ * huge, so this stays opt-in everywhere.
+ */
+function injectSystemPrompt(body: ChatBody, specOverride?: string): ChatBody {
+  const spec = specOverride ?? process.env.M365_SYSTEM_PROMPT;
+  if (!spec) return body;
+  try {
+    const resolved = resolveSystemPromptSpec(spec);
+    if (!resolved) return body;
+    log.info(`Injecting ${resolved.mode} system prompt (${resolved.text.length} chars)`);
+    return {
+      ...body,
+      messages: [{ role: "system", content: resolved.text } as ParsedMessage, ...body.messages],
+    };
+  } catch (err: any) {
+    throw new Error(`Invalid M365_SYSTEM_PROMPT: ${err.message}`);
+  }
+}
+
+/**
+ * Run one chat-completion turn against M365 and return the result plus an OpenAI-style
+ * usage snapshot. Protocol-neutral: both the OpenAI and Anthropic routes call this and
+ * render `produced` in their own wire format. Handles conversation pooling, delta vs
+ * full prompting, the turn gate, Disengage/confabulation recovery, tool-call parsing,
+ * and image rendering.
+ */
+export async function produceCompletion(
   body: ChatBody,
   pool: SessionPool,
-  opts: { signal?: AbortSignal } = {},
-): Promise<Response> {
+  cb: ProduceOptions = {},
+): Promise<{ produced: Produced; usage: Record<string, unknown> }> {
+  const fail = (status: number, payload: unknown): { produced: Produced; usage: Record<string, unknown> } =>
+    ({ produced: { kind: "error", resp: jsonResponse(status, payload) }, usage: buildUsage(null) });
+
   let resolved;
   try {
     resolved = resolveModel(body.model);
   } catch (err: any) {
     if (err instanceof UnsupportedModelError) {
-      return jsonResponse(400, {
+      return fail(400, {
         error: {
           message: err.message,
           type: "invalid_request_error",
@@ -288,7 +350,7 @@ export async function handleChatCompletion(
         },
       });
     }
-    return jsonResponse(400, { error: { message: err.message, type: "invalid_request_error" } });
+    return fail(400, { error: { message: err.message, type: "invalid_request_error" } });
   }
 
   // Log warnings for deprecated/preset model aliases
@@ -298,10 +360,17 @@ export async function handleChatCompletion(
     }
   }
 
+  try {
+    body = injectSystemPrompt(body, cb.systemPromptSpec);
+  } catch (err: any) {
+    return fail(400, { error: { message: err.message, type: "invalid_request_error" } });
+  }
+
   const conv = pool.resolve(body.messages);
   const { session } = conv;
   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
   const model = resolved.canonicalModel;
+  const convFingerprint = pool.fingerprintOf(body.messages);
 
   const tone = resolved.config.tone;
   const isClaudeTone = /^Claude_/i.test(tone);
@@ -330,9 +399,6 @@ export async function handleChatCompletion(
   }
 
   log.debug("Formatted prompt:", trunc(text, 1000));
-
-  const completionId = `chatcmpl-${crypto.randomUUID()}`;
-  const created = Math.floor(Date.now() / 1000);
 
   // Buffer the full response, with a couple of quick retries on an empty reply.
   const MAX_RETRIES = 2;
@@ -369,8 +435,12 @@ export async function handleChatCompletion(
       let firstTokenTime: number | null = null;
       let copilotStream;
       try {
-        copilotStream = await session.run(text, model, opts.signal, useToolAgent);
+        // Every upstream turn goes through the shared TurnGate: bounded inflight
+        // turns + staggered NEW-conversation starts (thread-rate throttle guard).
+        copilotStream = await pool.turnGate.run(convFingerprint, () =>
+          session.run(text, model, cb.signal, useToolAgent));
       } catch (err: any) {
+        log.error("Upstream turn failed:", err?.stack ?? err);
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
       }
 
@@ -492,20 +562,10 @@ export async function handleChatCompletion(
     return { error: emptyResponseResponse(null) };
   }
 
-  // Produce the final turn result as DATA (not a Response), so the same logic
-  // renders as either JSON (non-stream) or an early-flushed SSE stream (stream).
-  // For streaming we return the SSE stream FIRST and run produce() INSIDE it, so the
-  // client gets HTTP 200 + a role chunk + heartbeats immediately instead of waiting
-  // out the whole (up to ~160s) M365 turn and risking a read-timeout.
-  type Produced =
-    | { kind: "error"; resp: Response }
-    | { kind: "text"; text: string }
-    | { kind: "tools"; toolCalls: ReturnType<typeof parseToolCalls>["toolCalls"] };
-
-  // `onDelta` streams text to the client live (non-tool path only — see produce's
-  // caller). Tool mode ignores it: the raw text is parsed for tool-call fences and
-  // can't be shown verbatim, so it stays fully buffered.
-  async function produce(onDelta?: (delta: string) => void): Promise<Produced> {
+  // Tool mode ignores onDelta: the raw text is parsed for tool-call fences and
+  // can't be shown verbatim, so its tool_calls (or a prose fallback) are emitted
+  // once at the end by whoever renders `produced`.
+  async function produce(): Promise<Produced> {
   // When tools are present, buffer full response to detect tool calls
   if (hasTools) {
     const result = await runBuffered();
@@ -621,99 +681,123 @@ export async function handleChatCompletion(
     return { kind: "text", text: fullText.trim() || "Okay." };
   } else {
     // No tools — stream deltas live (onDelta) while buffering for the retry logic.
-    const result = await runBuffered(onDelta);
+    const result = await runBuffered(cb.onTextDelta);
     if ("error" in result) return { kind: "error", resp: result.error };
     conv.sentMessageCount = body.messages.length;
     return { kind: "text", text: result.fullText.trim() || "Okay." };
   }
   } // end produce()
 
-  // --- Render: JSON (non-stream) or an early-flushed SSE stream (stream) ---
-  const includeUsage = !!body.stream_options?.include_usage;
-  const usage = () => buildUsage(lastThrottle, lastContentOrigin, lastMessageType, lastScores, lastTurnCount);
+  const produced = await produce();
+  return {
+    produced,
+    usage: buildUsage(lastThrottle, lastContentOrigin, lastMessageType, lastScores, lastTurnCount),
+  };
+}
 
-  if (!body.stream) {
-    let p: Produced;
-    try {
-      p = await produce();
-    } catch (err: any) {
-      console.error("[produce error non-stream]", err.stack || err);
-      return jsonResponse(502, { error: { message: err?.message ?? "upstream error", type: "upstream_error" } });
-    }
-    if (p.kind === "error") return p.resp;
-    if (p.kind === "tools") {
-      return jsonResponse(200, {
-        id: completionId, object: "chat.completion", created, model,
-        choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: p.toolCalls }, finish_reason: "tool_calls" }],
-        usage: usage(),
-      });
-    }
-    return jsonResponse(200, {
-      id: completionId, object: "chat.completion", created, model,
-      choices: [{ index: 0, message: { role: "assistant", content: p.text }, finish_reason: outputFinishReason(p.text) }],
-      usage: usage(),
-    });
-  }
+/** True when the request carries an executable toolset (mirrors produceCompletion's rule). */
+export function requestHasTools(body: z.infer<typeof ChatCompletionRequest>): boolean {
+  return !!body.tools && body.tools.length > 0 && body.tool_choice !== "none";
+}
+
+/**
+ * Handle a chat completion request, returning an OpenAI-compatible Response.
+ * Thin protocol renderer over produceCompletion.
+ */
+export async function handleChatCompletion(
+  body: ChatBody,
+  pool: SessionPool,
+  opts: { signal?: AbortSignal; systemPromptSpec?: string } = {},
+): Promise<Response> {
+  const completionId = `chatcmpl-${crypto.randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
 
   // Streaming: send HTTP 200 + a role chunk + keepalive comments from t=0, then run
-  // produce() INSIDE the stream so the client never waits out the whole M365 turn
-  // (up to ~160s) before the first byte — avoids client read-timeouts.
+  // produceCompletion INSIDE the stream so the client never waits out the whole M365
+  // turn (up to ~160s) before the first byte — avoids client read-timeouts.
   //
   // On the non-tool path we forward each text delta AS IT ARRIVES (`liveDelta`), so
   // `stream:true` is genuinely incremental. Tool mode still buffers: the raw text is
   // parsed for tool-call fences and can't be shown verbatim, so its tool_calls (or a
   // prose fallback) are emitted once at the end.
-  return sseResponse(new ReadableStream({
-    async start(controller) {
-      const enc = new TextEncoder();
-      const send = (obj: unknown) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
-      const base = { id: completionId, object: "chat.completion.chunk", created, model };
-      send({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-      const hb = setInterval(() => { try { controller.enqueue(enc.encode(": keepalive\n\n")); } catch {} }, 15000);
+  if (body.stream) {
+    const hasTools = requestHasTools(body);
+    return sseResponse(new ReadableStream({
+      async start(controller) {
+        const enc = new TextEncoder();
+        const send = (obj: unknown) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+        const base = { id: completionId, object: "chat.completion.chunk", created, model: body.model };
+        send({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+        const hb = setInterval(() => { try { controller.enqueue(enc.encode(": keepalive\n\n")); } catch {} }, 15000);
 
-      // Live token passthrough (non-tool only). Track exactly what we've sent so the
-      // final render emits only the not-yet-streamed remainder. session.ts guarantees
-      // every forwarded delta extends the answer, so `sent` is always a prefix of the
-      // final text — the remainder is a clean tail, never a duplicate.
-      let sent = "";
-      const liveDelta = hasTools ? undefined : (delta: string) => {
-        if (!delta) return;
-        sent += delta;
-        try { send({ ...base, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] }); } catch {}
-      };
+        // Live token passthrough (non-tool only). Track exactly what we've sent so the
+        // final render emits only the not-yet-streamed remainder. session.ts guarantees
+        // every forwarded delta extends the answer, so `sent` is always a prefix of the
+        // final text — the remainder is a clean tail, never a duplicate.
+        let sent = "";
+        const liveDelta = hasTools ? undefined : (delta: string) => {
+          if (!delta) return;
+          sent += delta;
+          try { send({ ...base, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] }); } catch {}
+        };
 
-      let p: Produced;
-      try {
-        p = await produce(liveDelta);
-      } catch (err: any) {
-        console.error("[produce error stream]", err.stack || err);
-        p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) };
-      }
-      clearInterval(hb);
-      try {
-        if (p.kind === "error") {
-          let message = "upstream error";
-          try { message = (JSON.parse(await p.resp.text())?.error?.message) || message; } catch {}
-          // HTTP 200 is already committed, so surface the failure as an in-stream error chunk.
-          send({ ...base, error: { message, type: "upstream_error" } });
-        } else if (p.kind === "tools") {
-          p.toolCalls.forEach((tc, i) =>
-            send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] }));
-          send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], ...(includeUsage ? { usage: usage() } : {}) });
-        } else {
-          const finalText = p.text ?? "";
-          const remainder = finalText.startsWith(sent) ? finalText.slice(sent.length) : "";
-          if (!finalText.startsWith(sent)) log.info(`Streamed prefix diverged from final text (sent ${sent.length}, final ${finalText.length} chars) — not re-sending to avoid duplication`);
-          if (remainder) send({ ...base, choices: [{ index: 0, delta: { content: remainder }, finish_reason: null }] });
-          send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: outputFinishReason(finalText) }], ...(includeUsage ? { usage: usage() } : {}) });
+        let p: Produced;
+        try {
+          ({ produced: p } = await produceCompletion(body, pool, { signal: opts.signal, systemPromptSpec: opts.systemPromptSpec, onTextDelta: liveDelta }));
+        } catch (err: any) {
+          console.error("[produce error stream]", err.stack || err);
+          p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) };
         }
-      } catch {
-        // client likely disconnected mid-emit — nothing more to do
-      } finally {
-        try { controller.enqueue(enc.encode("data: [DONE]\n\n")); controller.close(); } catch {}
-      }
-    },
-  }));
+        clearInterval(hb);
+        try {
+          if (p.kind === "error") {
+            let message = "upstream error";
+            try { message = (JSON.parse(await p.resp.text())?.error?.message) || message; } catch {}
+            // HTTP 200 is already committed, so surface the failure as an in-stream error chunk.
+            send({ ...base, error: { message, type: "upstream_error" } });
+          } else if (p.kind === "tools") {
+            p.toolCalls.forEach((tc, i) =>
+              send({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] }));
+            send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+          } else {
+            const finalText = p.text ?? "";
+            const remainder = finalText.startsWith(sent) ? finalText.slice(sent.length) : "";
+            if (!finalText.startsWith(sent)) log.info(`Streamed prefix diverged from final text (sent ${sent.length}, final ${finalText.length} chars) — not re-sending to avoid duplication`);
+            if (remainder) send({ ...base, choices: [{ index: 0, delta: { content: remainder }, finish_reason: null }] });
+            send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: outputFinishReason(finalText) }] });
+          }
+        } catch {
+          // client likely disconnected mid-emit — nothing more to do
+        } finally {
+          try { controller.enqueue(enc.encode("data: [DONE]\n\n")); controller.close(); } catch {}
+        }
+      },
+    }));
+  }
+
+  // Non-stream: one buffered turn, rendered as a chat.completion JSON body.
+  let result: Awaited<ReturnType<typeof produceCompletion>>;
+  try {
+    result = await produceCompletion(body, pool, { signal: opts.signal, systemPromptSpec: opts.systemPromptSpec });
+  } catch (err: any) {
+    console.error("[produce error non-stream]", err.stack || err);
+    return jsonResponse(502, { error: { message: err?.message ?? "upstream error", type: "upstream_error" } });
+  }
+  const p = result.produced;
+
+  if (p.kind === "error") return p.resp;
+  if (p.kind === "tools") {
+    return jsonResponse(200, {
+      id: completionId, object: "chat.completion", created, model: body.model,
+      choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: p.toolCalls }, finish_reason: "tool_calls" }],
+      usage: result.usage,
+    });
+  }
+  return jsonResponse(200, {
+    id: completionId, object: "chat.completion", created, model: body.model,
+    choices: [{ index: 0, message: { role: "assistant", content: p.text }, finish_reason: outputFinishReason(p.text) }],
+    usage: result.usage,
+  });
 }
 
 /**
@@ -728,7 +812,7 @@ export async function handleChatCompletion(
  * (`x_m365_*`) alongside the zeroed standard counters. Real OpenAI clients
  * ignore unknown extension fields; curious users can read them.
  */
-function buildUsage(
+export function buildUsage(
   throttle: { current: number; max: number } | null,
   contentOrigin?: string | null,
   messageType?: string | null,

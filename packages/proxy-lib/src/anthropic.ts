@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { getAvailableModels, resolveModel } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
-import { handleChatCompletion, type SessionPool } from "./handler.js";
+import { handleChatCompletion, produceCompletion, outputFinishReason, type SessionPool } from "./handler.js";
 
 const TextBlock = z.object({
   type: z.literal("text"),
@@ -299,6 +299,31 @@ function anthropicError(status: number, message: string, type = "api_error"): Re
   });
 }
 
+/**
+ * Convert an OpenAI-style error Response from produceCompletion into the Anthropic
+ * error envelope. Claude Code retries 5xx/API errors aggressively (up to ten times),
+ * which multiplies one empty M365 turn into a quota-burning retry storm. Empty or
+ * deliberately disengaged M365 responses need a manual retry/new session, not an
+ * immediate replay of the same request, so surface them as a non-retryable
+ * invalid_request_error. Preserve genuine rate limits with their normal semantics.
+ */
+async function anthropicErrorFromUpstream(upstream: Response): Promise<Response> {
+  let message = `M365 upstream returned HTTP ${upstream.status}`;
+  let upstreamType = "upstream_error";
+  try {
+    const payload = await upstream.json() as any;
+    message = payload?.error?.message ?? message;
+    upstreamType = payload?.error?.type ?? upstreamType;
+  } catch {}
+
+  const nonRetryable = upstreamType === "upstream_empty_response" || upstreamType === "disengaged";
+  const status = nonRetryable ? 400 : upstream.status;
+  const type = nonRetryable
+    ? "invalid_request_error"
+    : upstream.status === 429 ? "rate_limit_error" : "api_error";
+  return anthropicError(status, message, type);
+}
+
 function event(name: string, data: unknown): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
@@ -343,79 +368,228 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
   }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
 }
 
-async function produceAnthropic(
-  body: AnthropicBody,
-  pool: SessionPool,
-  signal?: AbortSignal,
-): Promise<AnthropicMessageResponse | Response> {
-  const openai = toOpenAIChatRequest(body);
-  const upstream = await handleChatCompletion(openai, pool, { signal });
-  if (!upstream.ok) {
-    let message = `M365 upstream returned HTTP ${upstream.status}`;
-    let upstreamType = "upstream_error";
-    try {
-      const payload = await upstream.json() as any;
-      message = payload?.error?.message ?? message;
-      upstreamType = payload?.error?.type ?? upstreamType;
-    } catch {}
-
-    // Claude Code retries 5xx/API errors aggressively (up to ten times), which
-    // multiplies one empty M365 turn into a quota-burning retry storm. Empty or
-    // deliberately disengaged M365 responses need a manual retry/new session,
-    // not an immediate replay of the same request, so surface them as a
-    // non-retryable Anthropic invalid_request_error. Preserve genuine rate limits
-    // and other upstream failures with their normal retry semantics.
-    const nonRetryable = upstreamType === "upstream_empty_response" || upstreamType === "disengaged";
-    const status = nonRetryable ? 400 : upstream.status;
-    const type = nonRetryable
-      ? "invalid_request_error"
-      : upstream.status === 429 ? "rate_limit_error" : "api_error";
-    return anthropicError(status, message, type);
-  }
-  let payload: unknown;
-  try { payload = await upstream.json(); }
-  catch { return anthropicError(502, "M365 upstream returned invalid JSON"); }
-  return fromOpenAIChatResponse(payload, body.model);
+export interface HandleAnthropicOptions {
+  /** Aborts the M365 turn when the client disconnects. */
+  signal?: AbortSignal;
+  /** Opt-in system-prompt spec (see core/prompts.ts). Falls back to M365_SYSTEM_PROMPT env. */
+  systemPrompt?: string;
 }
 
-/** Handle an Anthropic Messages request, including early-flushed streaming with heartbeats. */
+/** Rough output-token estimate — M365 exposes no tokenizer (see handler buildUsage notes). */
+function estimateOutputTokens(text: string): number {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+/**
+ * Run one Anthropic Messages turn through the shared produceCompletion engine and
+ * translate the result back into Anthropic wire shapes. Protocol-neutral errors
+ * come back as OpenAI-style Responses and are converted by the caller.
+ */
+async function completeAnthropic(
+  body: AnthropicBody,
+  pool: SessionPool,
+  opts: HandleAnthropicOptions,
+): Promise<{ message: AnthropicMessageResponse } | { error: Response }> {
+  const chat = toOpenAIChatRequest(body);
+  const { produced, usage } = await produceCompletion(chat, pool, {
+    signal: opts.signal,
+    systemPromptSpec: opts.systemPrompt,
+  });
+  if (produced.kind === "error") return { error: produced.resp };
+
+  const inputTokens = estimateAnthropicInputTokens(body);
+
+  if (produced.kind === "tools") {
+    const content = produced.toolCalls.map((tc) => ({
+      type: "tool_use" as const,
+      id: String(tc.id),
+      name: String(tc.function?.name ?? "unknown"),
+      input: parseToolInput(String(tc.function?.arguments ?? "{}")),
+    }));
+    const outChars = produced.toolCalls.reduce(
+      (n, tc) => n + tc.function.name.length + String(tc.function.arguments ?? "").length + 20, 0);
+    return {
+      message: {
+        id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+        type: "message",
+        role: "assistant",
+        model: body.model,
+        content,
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: estimateOutputTokens("x".repeat(outChars)) },
+        m365: usage,
+      } as AnthropicMessageResponse & { m365?: unknown },
+    };
+  }
+
+  const text = produced.text;
+  return {
+    message: {
+      id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      role: "assistant",
+      model: body.model,
+      content: [{ type: "text", text }],
+      stop_reason: outputFinishReason(text) === "length" ? "max_tokens" : "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: estimateOutputTokens(text) },
+      m365: usage,
+    } as AnthropicMessageResponse & { m365?: unknown },
+  };
+}
+
+/** Handle an Anthropic Messages request, including genuinely incremental streaming. */
 export async function handleAnthropicMessages(
   body: AnthropicBody,
   pool: SessionPool,
-  signal?: AbortSignal,
+  opts: HandleAnthropicOptions | AbortSignal = {},
 ): Promise<Response> {
+  const options: HandleAnthropicOptions = opts instanceof AbortSignal ? { signal: opts } : opts;
+
   if (!body.stream) {
-    const result = await produceAnthropic(body, pool, signal);
-    if (result instanceof Response) return result;
-    return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+    const result = await completeAnthropic(body, pool, options);
+    if ("error" in result) return anthropicErrorFromUpstream(result.error);
+    return new Response(JSON.stringify(result.message), { headers: { "Content-Type": "application/json" } });
   }
 
   const encoder = new TextEncoder();
   return new Response(new ReadableStream({
     async start(controller) {
+      const send = (name: string, data: unknown) => controller.enqueue(encoder.encode(event(name, data)));
       const heartbeat = setInterval(() => {
         try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch {}
       }, 15_000);
+
+      let nextIndex = 0;
+      let openTextIndex: number | null = null;
+      let sent = "";
+      const openTextBlock = (): number => {
+        if (openTextIndex == null) {
+          openTextIndex = nextIndex++;
+          send("content_block_start", {
+            type: "content_block_start",
+            index: openTextIndex,
+            content_block: { type: "text", text: "" },
+          });
+        }
+        return openTextIndex;
+      };
+      const closeOpenBlocks = () => {
+        if (openTextIndex != null) {
+          send("content_block_stop", { type: "content_block_stop", index: openTextIndex });
+          openTextIndex = null;
+        }
+      };
+
       try {
-        const result = await produceAnthropic(body, pool, signal);
-        if (result instanceof Response) {
+        // message_start goes out immediately — Claude Code renders its frame before
+        // the (up to ~160s) M365 turn completes; keepalives hold the connection.
+        send("message_start", {
+          type: "message_start",
+          message: {
+            id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+            type: "message",
+            role: "assistant",
+            model: body.model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: estimateAnthropicInputTokens(body), output_tokens: 0 },
+          },
+        });
+
+        const chat = toOpenAIChatRequest(body);
+        const { produced, usage } = await produceCompletion(chat, pool, {
+          signal: options.signal,
+          // Live passthrough: every upstream delta becomes a text_delta AS IT ARRIVES.
+          onTextDelta: (delta) => {
+            if (!delta) return;
+            sent += delta;
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: openTextBlock(),
+              delta: { type: "text_delta", text: delta },
+            });
+          },
+        });
+
+        let stopReason: "end_turn" | "tool_use" | "max_tokens";
+        let outputChars: number;
+        if (produced.kind === "error") {
+          closeOpenBlocks();
           let error = { type: "api_error", message: "M365 upstream error" };
           try {
-            const payload = await result.json() as any;
+            const payload = JSON.parse(await produced.resp.text()) as any;
             error = {
               type: payload?.error?.type ?? error.type,
               message: payload?.error?.message ?? error.message,
             };
           } catch {}
-          controller.enqueue(encoder.encode(event("error", { type: "error", error })));
+          send("error", { type: "error", error });
+          return;
+        } else if (produced.kind === "tools") {
+          stopReason = "tool_use";
+          outputChars = 0;
+          closeOpenBlocks();
+          for (const tc of produced.toolCalls) {
+            const argsJson = String(tc.function.arguments ?? "{}");
+            outputChars += tc.function.name.length + argsJson.length + 20;
+            const index = nextIndex++;
+            send("content_block_start", {
+              type: "content_block_start",
+              index,
+              content_block: { type: "tool_use", id: String(tc.id), name: String(tc.function.name), input: {} },
+            });
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "input_json_delta", partial_json: argsJson },
+            });
+            send("content_block_stop", { type: "content_block_stop", index });
+          }
         } else {
-          controller.enqueue(encoder.encode(await anthropicSse(result).text()));
+          const finalText = produced.text ?? "";
+          stopReason = outputFinishReason(finalText) === "length" ? "max_tokens" : "end_turn";
+          outputChars = finalText.length;
+          // Three-way prefix comparison: produceCompletion returns TRIMMED text while
+          // live deltas carried the raw stream, so `sent` may be slightly LONGER than
+          // finalText (trailing whitespace) without being a real divergence.
+          let remainder: string;
+          if (finalText.startsWith(sent)) {
+            remainder = finalText.slice(sent.length);
+          } else if (sent.startsWith(finalText)) {
+            remainder = ""; // everything streamed already (final was only trimmed)
+          } else {
+            remainder = finalText; // genuine retry-path divergence — re-send authoritatively
+            closeOpenBlocks();
+          }
+          if (!finalText.startsWith(sent) && !sent.startsWith(finalText)) {
+            log.info(`Streamed prefix diverged from final text (sent ${sent.length}, final ${finalText.length} chars) — resending authoritative full text`);
+          }
+          if (remainder) {
+            const index = openTextBlock();
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "text_delta", text: remainder },
+            });
+          }
+          closeOpenBlocks();
         }
+
+        send("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: { output_tokens: estimateOutputTokens("x".repeat(outputChars)), m365: usage },
+        });
+        send("message_stop", { type: "message_stop" });
       } catch (error: any) {
-        controller.enqueue(encoder.encode(event("error", {
+        closeOpenBlocks();
+        send("error", {
           type: "error",
           error: { type: "api_error", message: error?.message ?? "M365 upstream error" },
-        })));
+        });
       } finally {
         clearInterval(heartbeat);
         try { controller.close(); } catch {}
