@@ -9,7 +9,9 @@ const log = createLogger("gate");
  * (docs/hypotheses.md §9 F13) — raw parallelism is fine, but stampeding fresh
  * conversations trips it. So the gate enforces two independent limits:
  *
- *   - `maxConcurrent`: how many turns may be in flight at once (default 2).
+ *   - `maxConcurrent`: how many turns may be in flight at once. Default 1
+ *     (strict serial — AGENTS.md rule #1); raise via M365_MAX_CONCURRENT_TURNS
+ *     if you accept the throttle risk.
  *   - `minConversationGapMs`: minimum spacing between the FIRST turn of two
  *     DIFFERENT conversations — the stampede guard (default 5s). Follow-up
  *     turns inside a conversation are never gap-delayed; a long agent loop
@@ -40,7 +42,7 @@ export class TurnGate {
   readonly minConversationGapMs: number;
 
   constructor(options: TurnGateOptions = {}) {
-    this.maxConcurrent = Math.max(1, options.maxConcurrent ?? Number(process.env.M365_MAX_CONCURRENT_TURNS ?? 2));
+    this.maxConcurrent = Math.max(1, options.maxConcurrent ?? Number(process.env.M365_MAX_CONCURRENT_TURNS ?? 1));
     this.minConversationGapMs = Math.max(0, options.minConversationGapMs ?? Number(process.env.M365_CONVERSATION_START_GAP_MS ?? 5000));
   }
 

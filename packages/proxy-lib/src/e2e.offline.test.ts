@@ -395,6 +395,132 @@ describe("/v1/messages x-m365-system-prompt passthrough", () => {
   });
 });
 
+// --- Adaptive harness profiles (x-m365-profile) ---
+
+const PROFILE_TOOLS = [
+  BASH_TOOL,
+  { name: "Read", description: "Read a file", input_schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] } },
+  { name: "WebFetch", description: "Fetch a URL", input_schema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } },
+];
+
+describe("x-m365-profile routing (offline)", () => {
+  const SYS2 = undefined;
+  const body = {
+    model: "claude-sonnet",
+    max_tokens: 100,
+    messages: [{ role: "user", content: "ping" }],
+  };
+
+  it("rejects an unknown profile with 400 + supported list on /v1/messages", async () => {
+    const { app } = makeApp();
+    const res = await app.fetch(anthropicRequest(body, { "x-m365-profile": "claude-yolo" }));
+    expect(res.status).toBe(400);
+    const payload = await res.json();
+    expect(payload.error.message).toContain("claude-safe");
+    expect(payload.error.message).toContain("claude-wide");
+  });
+
+  it("rejects an unknown profile on the OpenAI route with parity", async () => {
+    const { app } = makeApp();
+    const res = await app.fetch(new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-m365-profile": "claude-yolo" },
+      body: JSON.stringify({ model: "claude-sonnet", messages: [{ role: "user", content: "hi" }] }),
+    }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.message).toContain("claude-diagnose");
+  });
+
+  it("claude-safe defers web tools behind ToolSearch; claude-wide advertises them", async () => {
+    const safe = makeApp();
+    const safeRes = await safe.app.fetch(
+      anthropicRequest({ ...body, tools: PROFILE_TOOLS }, { "x-m365-profile": "claude-safe" }),
+    );
+    await safeRes.json();
+    const safeManifest = safe.transport.prompts[0].text;
+    expect(safeManifest).toContain("Read");           // coding tool advertised
+    expect(safeManifest).not.toContain("WebFetch");   // deferred, not advertised
+    expect(safeManifest).toContain("ToolSearch");     // discovery meta-tool present
+
+    const wide = makeApp();
+    const wideRes = await wide.app.fetch(
+      anthropicRequest({ ...body, tools: PROFILE_TOOLS }, { "x-m365-profile": "claude-wide" }),
+    );
+    await wideRes.json();
+    expect(wide.transport.prompts[0].text).toContain("WebFetch");
+  });
+
+  it("profiles are part of the conversation identity (no state bleed)", async () => {
+    process.env.M365_CONVERSATION_START_GAP_MS = "0"; // fresh conversations must not pay the stampede gap here
+    try {
+      const { app, transport } = makeApp();
+      const mk = (profile?: string) =>
+        app.fetch(anthropicRequest(
+          { ...body, tools: PROFILE_TOOLS },
+          { ...(profile ? { "x-m365-profile": profile } : {}) },
+        ));
+      await mk("claude-safe");
+      await mk("claude-wide"); // same first message + model — profile alone must fork the thread
+      await mk();              // default (claude-safe) reuses the FIRST conversation
+      expect(transport.prompts.length).toBe(3);
+      const [safeCid, wideCid, defaultCid] = transport.prompts.map((p) => p.conversationId);
+      expect(safeCid).not.toBe(wideCid);
+      expect(defaultCid).toBe(safeCid);
+    } finally {
+      delete process.env.M365_CONVERSATION_START_GAP_MS;
+    }
+  }, 20_000);
+});
+
+// --- Strict serialization through the full stack (normal turns included) ---
+
+describe("account-wide serial execution (max M365 concurrency == 1)", () => {
+  class SerialProbe {
+    inflight = 0;
+    maxInflight = 0;
+    constructor(private inner: FakeTransport) {}
+    readonly prompts = [] as Array<{ text: string; conversationId: string }>;
+    async chat(args: any) {
+      this.inflight += 1;
+      this.maxInflight = Math.max(this.maxInflight, this.inflight);
+      try {
+        return await this.inner.chat(args);
+      } finally {
+        this.inflight -= 1;
+      }
+    }
+  }
+
+  it("two concurrent clients never overlap their M365 turns", async () => {
+    process.env.M365_CONVERSATION_START_GAP_MS = "0"; // isolate queue behavior from the stampede guard
+    const inner = new FakeTransport({});
+    const probe = new SerialProbe(inner);
+    const app = createApp({
+      getToken: async () => "fake-token",
+      useAgent: false,
+      transport: probe as never,
+    });
+    const req = (sid: string) =>
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-m365-session-id": sid },
+        body: JSON.stringify({
+          model: "claude-sonnet",
+          max_tokens: 100,
+          messages: [{ role: "user", content: `work ${sid}` }],
+        }),
+      });
+    try {
+      const [a, b] = await Promise.all([app.fetch(req("s1")), app.fetch(req("s2"))]);
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      expect(probe.maxInflight).toBe(1);
+    } finally {
+      delete process.env.M365_CONVERSATION_START_GAP_MS;
+    }
+  }, 20_000);
+});
+
 // --- Cancellation timing: client disconnects must fail fast, never retry-storm ---
 
 describe("cancellation propagation (abort before start + mid-turn)", () => {

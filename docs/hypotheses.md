@@ -2824,3 +2824,25 @@ both routes. Suite 191 -> 212 green. The external "Master Prompt" audit that tri
 also FICTIONALIZED the protocol (<tool_call> XML fences vs. the real Markdown-fence
 shell-routing contract, F17) and proposed quota-doubling thinking-elicitation pre-turns;
 both rejected. Live end-to-end validation deliberately deferred to the next real session.
+
+## F25 - Adaptive harness profiles + strict-serial Task execution (2026-08-25)
+
+**Hypothesis.** Per-request tool-policy selection (x-m365-profile) could reuse the
+ToolSearch deferred-catalog machinery without enlarging any single advertised manifest,
+and synthetic Task sub-agents could be made rule-#1-compliant by routing them through
+the account-wide FIFO instead of Promise.all.
+
+**Probe.** Offline suite extension (no quota): profile registry/precedence/rejection
+units; full-stack e2e for header->400 mapping, safe-vs-wide advertisement diffs through
+FakeTransport, profile-keyed fingerprint isolation, and a two-client concurrency probe
+asserting max M365 inflight == 1.
+
+**Live conclusion: CONFIRMED offline.** Four profiles shipped (claude-safe default,
+claude-web, claude-diagnose read-only-first, claude-wide Task-enabled); operator env
+vars override profile values; unknown profiles are a 400 at both Nitro routes and the
+embeddable app; fingerprints now include the profile so promoted tools never bleed.
+Task rounds run sequentially through enqueueTurn with per-job cancellation checks;
+TurnGate default maxConcurrent 2 -> 1; SessionStore persistence auto-disables under
+NODE_ENV=test so suites can no longer write the operator's real sessions.json.
+212 -> 232 tests green. Live A/B vs the six-tool baseline is deliberately deferred to
+the PR4 bench gate (sequential runs only).

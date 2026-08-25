@@ -3,6 +3,7 @@ import { ChatCompletionRequest } from "./schemas.js";
 import { SessionPool, handleChatCompletion, getTurnStats } from "./handler.js";
 import { toneHealth } from "./health.js";
 import { turnQueueStats } from "./turn-queue.js";
+import { resolveProfile, listProfileNames, isProfileName } from "./profiles.js";
 import { modelPromptEnabled, modelPromptCandidates, resolveModelSystemPrompt } from "./model-prompts.js";
 import {
   AnthropicMessagesRequest,
@@ -44,6 +45,7 @@ export {
 export { TurnGate, type TurnGateOptions, type TurnGateStats } from "./gate.js";
 export { enqueueTurn, turnQueueStats } from "./turn-queue.js";
 export { SessionStore, defaultSessionStorePath, type PersistedSession } from "./session-store.js";
+export { PROFILES, listProfileNames, resolveProfile, isProfileName, toolAllowedByProfile, type HarnessProfile, type ProfileName } from "./profiles.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
 export {
   AnthropicMessagesRequest,
@@ -298,6 +300,21 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">
       if (pathname === "/v1/messages/count_tokens") {
         return withCors(await handleAnthropicCountTokens(raw));
       }
+
+      // Adaptive harness profile: strict validation — unknown names are a 400
+      // listing the supported set, never a silent fallback.
+      const profileHeader = req.headers.get("x-m365-profile")?.trim() ?? undefined;
+      if (profileHeader && !isProfileName(profileHeader.toLowerCase())) {
+        return withCors(json(400, {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: `Unknown harness profile "${profileHeader}". Supported profiles: ${listProfileNames().join(", ")}`,
+          },
+        }));
+      }
+      const profile = profileHeader?.toLowerCase();
+
       if (pathname === "/v1/messages") {
         let body: ReturnType<typeof AnthropicMessagesRequest.parse>;
         try {
@@ -308,7 +325,7 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">
             error: { type: "invalid_request_error", message: err.message },
           }));
         }
-        return withCors(await handleAnthropicMessages(body, pool, { signal: req.signal, systemPrompt: systemPromptSpec, sessionKey }));
+        return withCors(await handleAnthropicMessages(body, pool, { signal: req.signal, systemPrompt: systemPromptSpec, sessionKey, profile }));
       }
 
       let body: ReturnType<typeof ChatCompletionRequest.parse>;
@@ -319,7 +336,7 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">
           json(400, { error: { message: err.message, type: "invalid_request_error" } }),
         );
       }
-      return withCors(await handleChatCompletion(body, pool, { signal: req.signal, systemPromptSpec, sessionKey }));
+      return withCors(await handleChatCompletion(body, pool, { signal: req.signal, systemPromptSpec, sessionKey, profile }));
     }
 
     return withCors(

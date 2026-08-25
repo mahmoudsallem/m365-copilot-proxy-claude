@@ -417,6 +417,8 @@ export interface HandleAnthropicOptions {
   systemPrompt?: string;
   /** Caller conversation identity (x-m365-session-id header) — isolates the M365 thread per caller. */
   sessionKey?: string;
+  /** Adaptive harness profile (x-m365-profile header / M365_PROFILE env); invalid values fall back to claude-safe here (routes enforce strictly). */
+  profile?: string;
 }
 
 /** Rough output-token estimate — M365 exposes no tokenizer (see handler buildUsage notes). */
@@ -439,6 +441,7 @@ async function completeAnthropic(
     signal: opts.signal,
     systemPromptSpec: opts.systemPromptSpec ?? opts.systemPrompt,
     sessionKey: opts.sessionKey,
+    profile: opts.profile,
   });
   if (produced.kind === "error") return { error: produced.resp };
 
@@ -587,6 +590,7 @@ export async function handleAnthropicMessages(
           // completeAnthropic so both paths behave identically.
           systemPromptSpec: options.systemPromptSpec ?? options.systemPrompt,
           sessionKey: options.sessionKey,
+          profile: options.profile,
           // Live passthrough: every upstream delta becomes a text_delta AS IT ARRIVES.
           onTextDelta: (delta) => {
             if (!delta) return;

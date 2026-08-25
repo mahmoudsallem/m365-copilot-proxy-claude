@@ -33,6 +33,7 @@ import {
 import { upstreamEnabled, handleUpstreamChat } from "./upstream.js";
 import { enqueueTurn } from "./turn-queue.js";
 import { SessionStore } from "./session-store.js";
+import { resolveProfile, toolAllowedByProfile } from "./profiles.js";
 import { resolveModelSystemPrompt } from "./model-prompts.js";
 import {
   subAgentsEnabled,
@@ -292,9 +293,13 @@ export class SessionPool {
 
   constructor(sessionOptions: ModelSessionOptions = {}) {
     this.sessionOptions = sessionOptions;
-    this.store = process.env.M365_NO_SESSION_STORE === "1"
-      ? null
-      : new SessionStore(process.env.M365_SESSION_STORE_PATH || undefined);
+    // Persistence defaults ON in production but stays OFF inside unit tests
+    // (NODE_ENV=test) unless an explicit store path opts in — tests must never
+    // write the operator's real ~/.config/opencode-m365/sessions.json.
+    const explicitPath = process.env.M365_SESSION_STORE_PATH;
+    const enabled = process.env.M365_NO_SESSION_STORE !== "1"
+      && (Boolean(explicitPath) || process.env.NODE_ENV !== "test");
+    this.store = enabled ? new SessionStore(explicitPath || undefined) : null;
   }
 
   /**
@@ -318,10 +323,10 @@ export class SessionPool {
    * conversation: M365 conversations carry server-side tone/model history, and
    * sharing one across clients bleeds context between them.
    */
-  resolve(messages: ParsedMessage[], model?: string, sessionKey?: string): ConversationState {
+  resolve(messages: ParsedMessage[], model?: string, sessionKey?: string, profileName?: string): ConversationState {
     this.evictStale();
 
-    const fingerprint = this.fingerprint(messages, model, sessionKey);
+    const fingerprint = this.fingerprint(messages, model, sessionKey, profileName);
     const existing = this.conversations.get(fingerprint);
 
     if (existing) {
@@ -359,14 +364,16 @@ export class SessionPool {
   }
 
   /** Public so callers can key their own accounting (the turn gate) off the same identity. */
-  fingerprintOf(messages: ParsedMessage[], model?: string, sessionKey?: string): string {
-    return this.fingerprint(messages, model, sessionKey);
+  fingerprintOf(messages: ParsedMessage[], model?: string, sessionKey?: string, profileName?: string): string {
+    return this.fingerprint(messages, model, sessionKey, profileName);
   }
 
-  private fingerprint(messages: ParsedMessage[], model?: string, sessionKey?: string): string {
+  private fingerprint(messages: ParsedMessage[], model?: string, sessionKey?: string, profileName?: string): string {
     const firstUser = messages.find(m => m.role === "user");
     const text = firstUser ? getMessageContent(firstUser) : "";
-    return sha256Hex(`${sessionKey ?? ""}\u0000${model ?? ""}\u0000${text}`);
+    // Profile is part of the identity: promoted tools and prompt policy must
+    // never bleed between claude-safe / claude-wide / ... conversations.
+    return sha256Hex(`${sessionKey ?? ""}\u0000${model ?? ""}\u0000${profileName ?? ""}\u0000${text}`);
   }
 
   private evictStale() {
@@ -455,12 +462,19 @@ export interface ProduceOptions {
    * so concurrent requests can't leak prompts into each other.
    */
   systemPromptSpec?: string;
+   /**
+    * Caller-supplied conversation identity (x-m365-session-id header). Requests
+    * with different keys never share an M365 conversation, even with identical
+    * first messages; omit to keep the legacy content+model fingerprint.
+    */
+   sessionKey?: string;
   /**
-   * Caller-supplied conversation identity (x-m365-session-id header). Requests
-   * with different keys never share an M365 conversation, even with identical
-   * first messages; omit to keep the legacy content+model fingerprint.
+   * Adaptive harness profile (x-m365-profile header / M365_PROFILE env).
+   * Controls advertised-tool surface, ToolSearch depth, synthetic Task
+   * availability, batching and failover policy. Unknown values are rejected
+   * at the HTTP routes; direct callers get claude-safe fallback.
    */
-  sessionKey?: string;
+  profile?: string;
 }
 
 function withSystemMessage(body: ChatBody, text: string): ChatBody {
@@ -512,11 +526,17 @@ export async function produceCompletion(
   const fail = (status: number, payload: unknown): { produced: Produced; usage: Record<string, unknown> } =>
     ({ produced: { kind: "error", resp: jsonResponse(status, payload) }, usage: buildUsage(null) });
 
+  // Adaptive profile resolution (header > M365_PROFILE env > claude-safe).
+  // Drives tool surface, ToolSearch depth, Task availability and failover.
+  const profSel = resolveProfile(cb.profile);
+  const profile = profSel.profile;
+  if (profSel.source === "explicit") log.info(`Harness profile: ${profile.name} (explicit)`);
+
   // Tone-health routing (W-C): when the requested model's breaker is OPEN
   // (consecutive tone_outage failures), transparently reroute to the first
   // healthy fallback — a NEW conversation by construction (fingerprints are
-  // model-keyed). Disable with M365_NO_TONE_FAILOVER=1.
-  if (depth === 0 && failoverEnabled()) {
+  // model-keyed). Disable with M365_NO_TONE_FAILOVER=1 or per-profile policy.
+  if (depth === 0 && failoverEnabled() && profile.toneFailover) {
     const alt = rerouteIfOpen(body.model);
     if (alt) {
       log.warn(`Tone health: ${body.model} breaker open — rerouting to ${alt}`);
@@ -563,7 +583,7 @@ export async function produceCompletion(
     return fail(400, { error: { message: err.message, type: "invalid_request_error" } });
   }
 
-  const conv = pool.resolve(body.messages, resolved.canonicalModel, cb.sessionKey);
+  const conv = pool.resolve(body.messages, resolved.canonicalModel, cb.sessionKey, profile.name);
   const { session } = conv;
 
   // Toolset lean-down (§9: M365 disengages/ignores tool framing on large
@@ -575,16 +595,28 @@ export async function produceCompletion(
   // their schemas are hidden from M365 behind a synthetic `ToolSearch` meta-tool
   // (progressive discovery — Anthropic's pattern for >30-tool catalogs).
   const allTools: NonNullable<typeof body.tools> = body.tools ?? [];
-  const allowed = process.env.M365_ALLOWED_TOOLS
+  // Tool-surface policy precedence: explicit operator env beats the profile.
+  //   M365_ALLOWED_TOOLS="Bash,Read"  — exact-name allow-list (legacy semantics).
+  //   M365_MAX_TOOLS="6"              — hard advertised cap.
+  // Without env, the resolved profile supplies allow-list + cap; anything
+  // filtered out lands in the deferred ToolSearch catalog (still callable).
+  const envAllowed = process.env.M365_ALLOWED_TOOLS
     ?.split(",").map((s) => s.trim()).filter(Boolean);
-  const maxAdvertised = Number(process.env.M365_MAX_TOOLS ?? "");
+  const envMaxAdvertised = Number(process.env.M365_MAX_TOOLS ?? "");
+  const allowed = envAllowed;
+  const profileAllows = (name: string): boolean => toolAllowedByProfile(name, profile);
+  const maxAdvertised = Number.isFinite(envMaxAdvertised) && envMaxAdvertised > 0
+    ? envMaxAdvertised
+    : profile.maxVisibleTools;
   const promoted = conv.promotedTools;
   let advertisedTools: typeof allTools = allTools;
   if (allowed?.length || Number.isFinite(maxAdvertised) && maxAdvertised > 0) {
     const allowedSet = allowed?.length ? new Set(allowed) : null;
     const before = allTools.length;
-    let kept = allTools.filter((t: { function?: { name?: string } }) =>
-      !allowedSet || allowedSet.has(t.function?.name ?? ""));
+    let kept = allTools.filter((t: { function?: { name?: string } }) => {
+      const n = t.function?.name ?? "";
+      return allowedSet ? allowedSet.has(n) : profileAllows(n);
+    });
     // Promoted (previously discovered) tools always keep their slot.
     if (promoted?.size) {
       for (let i = kept.length - 1; i >= 0; i--) {
@@ -621,7 +653,7 @@ export async function produceCompletion(
   // server-side (fresh conversation + read-only fs tools). Skipped when the
   // client already declares its own Task tool.
   const clientHasTask = allTools.some((t) => (t as { function?: { name?: string } }).function?.name === SUBAGENT_TOOL_NAME);
-  const TASK_DEF = subAgentsEnabled() && !clientHasTask ? makeTaskToolDef() : null;
+  const TASK_DEF = subAgentsEnabled() && profile.taskEnabled && !clientHasTask ? makeTaskToolDef() : null;
   const advertiseWithSearch =
     [
       ...advertisedTools,
@@ -631,7 +663,7 @@ export async function produceCompletion(
 
   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
   const model = resolved.canonicalModel;
-  const convFingerprint = pool.fingerprintOf(body.messages, resolved.canonicalModel, cb.sessionKey);
+  const convFingerprint = pool.fingerprintOf(body.messages, resolved.canonicalModel, cb.sessionKey, profile.name);
 
   const tone = resolved.config.tone;
   const isClaudeTone = /^Claude_/i.test(tone);
@@ -644,7 +676,7 @@ export async function produceCompletion(
   const convId = session.conversationId;
   let text: string;
   if (isFirstTurn || conv.sentMessageCount === 0) {
-    text = formatMessages(body.messages, advertiseWithSearch, body.tool_choice, convId);
+    text = formatMessages(body.messages, advertiseWithSearch, body.tool_choice, convId, profile.framing);
     log.info(`Chat completion: model=${model}, stream=${body.stream}, messages=${body.messages.length}, turn=${session.turnCount}, mode=full, cid=${convId}`);
   } else {
     const newMessages = body.messages.slice(conv.sentMessageCount);
@@ -916,7 +948,7 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
       // Models sometimes echo the param name into the body value ("query: x") —
       // harmless to strip before matching.
       query = query.replace(/^query:\s*/i, "").trim();
-      const matched = searchDeferredCatalog(deferredCatalog, query);
+      const matched = searchDeferredCatalog(deferredCatalog, query, profile.toolSearchLimit);
       if (!conv.promotedTools) conv.promotedTools = new Set();
       for (const t of matched) conv.promotedTools.add(t.function?.name ?? "");
       log.info(`ToolSearch("${trunc(query, 80)}") → promoted ${matched.map((t) => t.function?.name).join(", ") || "(no matches)"}`);
@@ -952,23 +984,27 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
       if (tasks.length === 0) break;
       const others = parsed.toolCalls.filter((c) => c.function.name !== SUBAGENT_TOOL_NAME);
       const results: string[] = [];
-      // Parallel sub-agents (productivity): all Task calls launch together;
-      // the shared TurnGate caps actual M365 socket concurrency (maxConcurrent),
-      // so extras queue safely instead of hammering upstream.
+      // SEQUENTIAL sub-agent execution (AGENTS.md rule #1): each synthetic Task
+      // turn goes through the same account-wide FIFO queue as normal turns —
+      // the old Promise.all here could run two M365 turns at once. Remaining
+      // queued jobs are abandoned the moment the caller cancels.
       const runTask = async (idx: number, t: any): Promise<string> => {
+        if (cb.signal?.aborted) return "(cancelled before start)";
         const job = extractSubAgentJob(t.function?.arguments);
         log.info(`Sub-agent delegating [${idx + 1}/${tasks.length}]: "${trunc(job, 100)}"`);
         const subMessages = [{ role: "user" as const, content: `subagent:${trunc(job, 60)}:${taskRounds}:${idx}` }];
         const sub = pool.resolve(subMessages, `${model}-subagent`);
         try {
-          return await pool.turnGate.run(`sub:${convFingerprint}:${taskRounds}:${idx}`, () =>
-            runSubAgent(sub.session, model, job, cb.signal));
+          return await enqueueTurn(() =>
+            pool.turnGate.run(`sub:${convFingerprint}:${taskRounds}:${idx}`, () =>
+              runSubAgent(sub.session, model, job, cb.signal)));
         } catch (err: any) {
           return `(sub-agent failed: ${err?.message ?? "unknown"})`;
         }
       };
-      const reportList = await Promise.all(tasks.map((t, i) => runTask(i, t)));
-      for (const rep of reportList) results.push(`<sub-agent report>\n${rep}\n</sub-agent report>`);
+      for (let i = 0; i < tasks.length; i++) {
+        results.push(`<sub-agent report>\n${await runTask(i, tasks[i])}\n</sub-agent report>`);
+      }
       text =
         `[Automated harness message: ${results.length} sub-agent job(s) completed — their reports follow. ` +
         `Use them to continue; do not re-delegate the same jobs.]\n\n` +
@@ -1078,7 +1114,7 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
       // forcing one-call-per-turn made such turns parse-fail or leak fences.
       // Calls execute sequentially client-side; each reacts to the previous
       // tool_response. Disable with M365_NO_MULTI_TOOL=1.
-      if (process.env.M365_NO_MULTI_TOOL === "1" && parsed.toolCalls.length > 1) {
+      if ((process.env.M365_NO_MULTI_TOOL === "1" || !profile.multiTool) && parsed.toolCalls.length > 1) {
         log.info(`One-call-per-turn (M365_NO_MULTI_TOOL): keeping ${parsed.toolCalls[0].function.name}, dropping ${parsed.toolCalls.length - 1} batched call(s)`);
         parsed.toolCalls = [parsed.toolCalls[0]];
       }
@@ -1196,7 +1232,7 @@ export function requestHasTools(body: z.infer<typeof ChatCompletionRequest>): bo
 export async function handleChatCompletion(
   body: ChatBody,
   pool: SessionPool,
-  opts: { signal?: AbortSignal; systemPromptSpec?: string } = {},
+  opts: { signal?: AbortSignal; systemPromptSpec?: string; sessionKey?: string; profile?: string } = {},
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1236,7 +1272,7 @@ export async function handleChatCompletion(
         let p: Produced;
         let streamUsage: Record<string, unknown> | null = null;
         try {
-          ({ produced: p, usage: streamUsage } = await produceCompletion(body, pool, { signal: opts.signal, systemPromptSpec: opts.systemPromptSpec, sessionKey: opts.sessionKey, onTextDelta: liveDelta }));
+          ({ produced: p, usage: streamUsage } = await produceCompletion(body, pool, { signal: opts.signal, systemPromptSpec: opts.systemPromptSpec, sessionKey: opts.sessionKey, profile: opts.profile, onTextDelta: liveDelta }));
         } catch (err: any) {
           console.error("[produce error stream]", err.stack || err);
           p = { kind: "error", resp: jsonResponse(502, { error: { message: err?.message ?? "stream error", type: "upstream_error" } }) };
@@ -1284,7 +1320,7 @@ export async function handleChatCompletion(
   // Non-stream: one buffered turn, rendered as a chat.completion JSON body.
   let result: Awaited<ReturnType<typeof produceCompletion>>;
   try {
-    result = await produceCompletion(body, pool, { signal: opts.signal, systemPromptSpec: opts.systemPromptSpec, sessionKey: opts.sessionKey });
+    result = await produceCompletion(body, pool, { signal: opts.signal, systemPromptSpec: opts.systemPromptSpec, sessionKey: opts.sessionKey, profile: opts.profile });
   } catch (err: any) {
     console.error("[produce error non-stream]", err.stack || err);
     return jsonResponse(502, { error: { message: err?.message ?? "upstream error", type: "upstream_error" } });

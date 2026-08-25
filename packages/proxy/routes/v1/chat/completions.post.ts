@@ -1,4 +1,4 @@
-import { ChatCompletionRequest, handleChatCompletion } from "@m365-copilot/proxy-lib";
+import { ChatCompletionRequest, handleChatCompletion, isProfileName, listProfileNames } from "@m365-copilot/proxy-lib";
 import { pool } from "../../../server-pool";
 
 export default defineEventHandler(async (event) => {
@@ -33,5 +33,18 @@ export default defineEventHandler(async (event) => {
     (event.node?.req?.headers?.["x-m365-system-prompt"] as string | undefined) ?? undefined;
   const sessionKey =
     (event.node?.req?.headers?.["x-m365-session-id"] as string | undefined) ?? undefined;
-  return handleChatCompletion(body, pool, { signal: ac.signal, systemPromptSpec, sessionKey });
+  const profileHeader =
+    (event.node?.req?.headers?.["x-m365-profile"] as string | undefined)?.trim().toLowerCase() ?? undefined;
+  if (profileHeader && !isProfileName(profileHeader)) {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: `Unknown harness profile "${profileHeader}". Supported profiles: ${listProfileNames().join(", ")}`,
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+  }
+  return handleChatCompletion(body, pool, { signal: ac.signal, systemPromptSpec, sessionKey, profile: profileHeader });
 });

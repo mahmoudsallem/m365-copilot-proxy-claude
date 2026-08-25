@@ -1,4 +1,4 @@
-import { AnthropicMessagesRequest, handleAnthropicMessages } from "@m365-copilot/proxy-lib";
+import { AnthropicMessagesRequest, handleAnthropicMessages, isProfileName, listProfileNames } from "@m365-copilot/proxy-lib";
 import { pool } from "../../server-pool";
 
 /** Anthropic Messages compatibility endpoint for Claude Code and Anthropic SDK clients. */
@@ -28,9 +28,22 @@ export default defineEventHandler(async (event) => {
     (event.node?.req?.headers?.["x-m365-system-prompt"] as string | undefined) ?? undefined;
   const sessionKey =
     (event.node?.req?.headers?.["x-m365-session-id"] as string | undefined) ?? undefined;
+  const profileHeader =
+    (event.node?.req?.headers?.["x-m365-profile"] as string | undefined)?.trim().toLowerCase() ?? undefined;
+  if (profileHeader) {
+    if (!isProfileName(profileHeader)) {
+      return new Response(JSON.stringify({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: `Unknown harness profile "${profileHeader}". Supported profiles: ${listProfileNames().join(", ")}`,
+        },
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+  }
 
   try {
-    return await handleAnthropicMessages(body, pool, { signal: controller.signal, systemPromptSpec, sessionKey });
+    return await handleAnthropicMessages(body, pool, { signal: controller.signal, systemPromptSpec, sessionKey, profile: profileHeader });
   } catch (err: any) {
     console.error("[messages.post error]", err.stack || err);
     throw err;

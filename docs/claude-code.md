@@ -75,5 +75,24 @@ untouched.
   next request with the same conversation fingerprint (disable with
   `M365_NO_SESSION_STORE=1`).
 
+## Harness profiles
+
+Pick a tooling policy per request with the `x-m365-profile` header, or set a
+default with the `M365_PROFILE` env var. Unknown names are rejected with HTTP 400
+listing the supported set.
+
+| Profile | Advertised surface | Deferred (ToolSearch) | Synthetic Task |
+|---|---|---|---|
+| `claude-safe` *(default)* | bash / read / edit / write / glob / grep / todowrite | rest, 4 matches/round | off |
+| `claude-web` | coding + webfetch / websearch | rest, 5/round | off |
+| `claude-diagnose` | read-only investigation (bash/read/glob/grep) | write/edit deferred, 6/round | off |
+| `claude-wide` | nothing filtered, cap 10 | everything else, 8/round | **on** |
+
+Operator env vars (`M365_ALLOWED_TOOLS`, `M365_MAX_TOOLS`, `M365_NO_MULTI_TOOL`,
+`M365_NO_SUBAGENTS`) override profile values. The resolved profile is part of the
+conversation identity — switching profiles forks the M365 thread so promoted-tool
+state never bleeds across policies. All M365 turns (normal, ToolSearch follow-ups,
+Task sub-agent jobs) execute through one account-wide FIFO queue.
+
 Keep the proxy bound to `127.0.0.1`. Do not expose the endpoint or its bearer token over
 the network.
