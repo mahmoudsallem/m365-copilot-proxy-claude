@@ -454,7 +454,17 @@ run_claude_proxy() {
   esac
 
   printf '[claude-m365] proxy=%s model=%s\n' "$PROXY_URL" "$selected_model" >&2
-  exec "$ORIGINAL_CLAUDE" --model "$selected_model" --tools=Bash,Read,Edit,Write,Glob,Grep "$@"
+
+  # No client-side --tools restriction by default: the full Claude Code harness
+  # catalog is declared to the proxy, where M365_MAX_TOOLS / M365_ALLOWED_TOOLS
+  # cap the advertised manifest and ToolSearch promotes deferred tools on
+  # demand. Launcher-level filtering would make deferred discovery impossible
+  # and diverge from the Windows launchers. Escape hatch: M365_CLAUDE_TOOLS.
+  local tools_args=()
+  if [[ -n "${M365_CLAUDE_TOOLS:-}" ]]; then
+    tools_args=(--tools="$M365_CLAUDE_TOOLS")
+  fi
+  exec "$ORIGINAL_CLAUDE" --model "$selected_model" ${tools_args[@]+"${tools_args[@]}"} "$@"
 }
 
 run_claude_direct() {
@@ -479,7 +489,8 @@ doctor() {
     fi
   done
 
-  if [[ -x "$ROOT/.runtime/node/node_modules/node/bin/node" ]]; then
+  local runtime_dir="${M365_RUNTIME_DIR:-$ROOT/.runtime}"
+  if [[ -x "$runtime_dir/node/node_modules/node/bin/node" ]]; then
     note "[ok] private Node runtime installed"
   else
     note "[missing] private Node runtime; run install"

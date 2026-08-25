@@ -78,6 +78,12 @@ if ($Unsafe) {
     Write-Host "[claude-m365] UNSAFE MODE: permission prompts disabled (--dangerously-skip-permissions)" -ForegroundColor Yellow
     $claudeArgs += "--dangerously-skip-permissions"
 }
+# Optional client-side tool narrowing (parity with m365-control.sh). Empty by
+# default: the full harness catalog reaches the proxy, whose deferred-catalog
+# machinery (ToolSearch) keeps the advertised manifest lean.
+if ($env:M365_CLAUDE_TOOLS) {
+    $claudeArgs += "--tools=$($env:M365_CLAUDE_TOOLS)"
+}
 
 if ($SessionId) {
     $claudeArgs += @("--resume", $SessionId)

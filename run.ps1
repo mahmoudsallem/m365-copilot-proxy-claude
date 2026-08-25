@@ -311,12 +311,20 @@ try {
     $env:ANTHROPIC_AUTH_TOKEN = $apiKey
     $env:ANTHROPIC_MODEL = $Model
     $env:ANTHROPIC_SMALL_FAST_MODEL = $Model
+
+    # Custom headers, assembled appends-only: per-process conversation identity
+    # (x-m365-session-id) plus optional system-prompt routing. Never clobber
+    # pre-existing headers and never reuse a previous process's session id —
+    # distinct CLI processes must never fuse into one M365 conversation.
+    $headers = @()
+    if ($env:ANTHROPIC_CUSTOM_HEADERS) { $headers += @($env:ANTHROPIC_CUSTOM_HEADERS -split "`n" | Where-Object { $_ -and $_ -notmatch '^x-m365-session-id:' }) }
+    $headers += "x-m365-session-id: cc-$([guid]::NewGuid().ToString('N'))"
     if ($SystemPrompt) {
-        $env:ANTHROPIC_CUSTOM_HEADERS = "x-m365-system-prompt: $SystemPrompt"
+        $headers += "x-m365-system-prompt: $SystemPrompt"
         Log "routing system prompt: $SystemPrompt (browse: GET /v1/system-prompts)"
-    } else {
-        Remove-Item Env:ANTHROPIC_CUSTOM_HEADERS -ErrorAction SilentlyContinue
     }
+    $env:ANTHROPIC_CUSTOM_HEADERS = $headers -join "`n"
+
     $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
     $env:DISABLE_TELEMETRY = "1"
     $env:DISABLE_ERROR_REPORTING = "1"
@@ -335,7 +343,13 @@ try {
     Write-Host "=========================================================" -ForegroundColor Green
     Write-Host ""
 
-    & $claudeBin --model $Model @args
+    # Optional client-side tool narrowing (parity with m365-control.sh). Empty by
+    # default: the full harness catalog reaches the proxy, whose deferred-catalog
+    # machinery keeps the advertised manifest lean.
+    $toolsArgs = @()
+    if ($env:M365_CLAUDE_TOOLS) { $toolsArgs = @("--tools=$($env:M365_CLAUDE_TOOLS)") }
+
+    & $claudeBin --model $Model @toolsArgs @args
     exit $LASTEXITCODE
 } finally {
     if ($KeepProxy -or -not $NoWatchdog) {

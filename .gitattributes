@@ -1,0 +1,2 @@
+*.sh text eol=lf
+bin/m365-copilot text eol=lf

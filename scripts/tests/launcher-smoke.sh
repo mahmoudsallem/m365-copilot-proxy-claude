@@ -14,6 +14,10 @@ STATE_DIR="$TEST_HOME/.local/state/m365-copilot-proxy"
 SETTINGS_FILE="$TEST_HOME/.claude/settings.json"
 mkdir -p "$USER_BIN" "$FAKE_BIN" "$(dirname "$SETTINGS_FILE")"
 
+# The private Node/pnpm runtime install needs ~100 MB — keep it off the repo
+# drive so the suite stays independent of checkout-disk headroom.
+export M365_RUNTIME_DIR="$TEST_ROOT/runtime"
+
 printf '#!/usr/bin/env bash\nprintf "fake-claude:%%s\\n" "$*"\n' > "$FAKE_BIN/claude"
 chmod 700 "$FAKE_BIN/claude"
 printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:4141","ANTHROPIC_MODEL":"gpt-5.5-think-deeper","KEEP_ME":"yes"},"model":"opus[1m]","theme":"dark"}' > "$SETTINGS_FILE"
@@ -48,5 +52,23 @@ restored_hash="$(sha256sum "$USER_BIN/claude" | cut -d' ' -f1)"
 
 bash -n "$ROOT"/*.sh "$ROOT/bin/m365-copilot" "$ROOT/scripts/m365-control.sh"
 node --check "$ROOT/scripts/claude-settings.mjs"
+
+# --- PR1 parity: safe defaults + per-process identity + no client tool filter ---
+if grep -q "dangerously-skip-permissions" "$ROOT/scripts/m365-control.sh"; then
+  echo "FAIL: m365-control.sh must not hardcode --dangerously-skip-permissions (explicit opt-in only)" >&2
+  exit 1
+fi
+grep -q "x-m365-session-id" "$ROOT/scripts/m365-control.sh" || {
+  echo "FAIL: managed launcher must inject x-m365-session-id" >&2
+  exit 1
+}
+if grep -q -- "--tools=Bash" "$ROOT/scripts/m365-control.sh"; then
+  echo "FAIL: launcher-level --tools filtering blocks deferred-tool discovery" >&2
+  exit 1
+fi
+if grep -q '"--dangerously-skip-permissions"' "$ROOT/connect-claude.ps1" && ! grep -q 'Unsafe' "$ROOT/connect-claude.ps1"; then
+  echo "FAIL: connect-claude.ps1 ships skip-permissions without an explicit opt-in switch" >&2
+  exit 1
+fi
 
 printf '%s\n' "launcher smoke tests passed"

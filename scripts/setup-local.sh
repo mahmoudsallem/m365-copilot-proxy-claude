@@ -2,7 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="$ROOT/.runtime"
+# Private runtime location. Override with M365_RUNTIME_DIR when the repo drive
+# is short on space (the node+pnpm install needs ~100 MB) or to share one
+# runtime across several checkouts.
+RUNTIME="${M365_RUNTIME_DIR:-$ROOT/.runtime}"
 PRIVATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/m365-copilot-proxy"
 ENV_FILE="${M365_LOCAL_ENV:-$PRIVATE_DIR/proxy.env}"
 NODE_PREFIX="$RUNTIME/node"
