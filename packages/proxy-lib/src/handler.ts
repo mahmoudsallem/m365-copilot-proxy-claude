@@ -56,6 +56,8 @@ export interface TurnStat {
   ttftMs: number | null;
   chars: number;
   outcome: "ok" | "empty" | "disengaged" | "rate_limited";
+  /** Harness profile active for the turn (telemetry only). */
+  profile?: string;
 }
 
 const TURN_STATS_CAP = 80;
@@ -475,6 +477,11 @@ export interface ProduceOptions {
    * at the HTTP routes; direct callers get claude-safe fallback.
    */
   profile?: string;
+  /**
+   * Anthropic `tool_choice.disable_parallel_tool_use` translated by the bridge:
+   * forces strict one-tool-per-turn for THIS request regardless of profile/env.
+   */
+  forceSingleToolUse?: boolean;
 }
 
 function withSystemMessage(body: ChatBody, text: string): ChatBody {
@@ -528,7 +535,12 @@ export async function produceCompletion(
 
   // Adaptive profile resolution (header > M365_PROFILE env > claude-safe).
   // Drives tool surface, ToolSearch depth, Task availability and failover.
+  // Routes pre-validate strictly; direct callers get the same hard 400 here —
+  // never a silent fallback, never an undefined-profile crash.
   const profSel = resolveProfile(cb.profile);
+  if (!profSel.ok) {
+    return fail(400, { error: { message: profSel.error, type: "invalid_request_error" } });
+  }
   const profile = profSel.profile;
   if (profSel.source === "explicit") log.info(`Harness profile: ${profile.name} (explicit)`);
 
@@ -643,6 +655,29 @@ export async function produceCompletion(
       ...allTools.filter((t) => promoted.has((t as { function?: { name?: string } }).function?.name ?? "")),
       ...allTools,
     ]);
+  }
+
+  // Control tools are ALWAYS advertised, exempt from both the profile allow-list
+  // and maxVisibleTools: deferring ExitPlanMode strands a model inside plan mode,
+  // deferring BashOutput/KillShell strands background shells, deferring TodoWrite
+  // breaks plan tracking. They occupy reserved slots; the cap applies to the rest.
+  const CONTROL_TOOL_RE = /^(exitplanmode|todowrite|bashoutput|killshell)$/i;
+  const controlTools = allTools.filter((t) => CONTROL_TOOL_RE.test(t.function?.name ?? ""));
+  if (controlTools.length > 0) {
+    const controlNames = new Set(controlTools.map((t) => t.function?.name ?? ""));
+    const merged = dedupeByName([...controlTools, ...advertisedTools]);
+    const nonControl = merged.filter((t) => !controlNames.has(t.function?.name ?? ""));
+    const keepNonControl = new Set(
+      nonControl
+        .slice(0, Math.max(0, maxAdvertised - controlTools.length))
+        .map((t) => t.function?.name ?? ""),
+    );
+    advertisedTools = merged.filter(
+      (t) => controlNames.has(t.function?.name ?? "") || keepNonControl.has(t.function?.name ?? ""),
+    );
+    if (advertisedTools.length !== allTools.length) {
+      log.info(`Control-tool exemption: ${controlTools.map((t) => t.function?.name).join(", ")} always visible`);
+    }
   }
   const advertisedNames = new Set(
     advertisedTools.map((t: { function?: { name?: string } }) => t.function?.name ?? ""),
@@ -761,7 +796,7 @@ let lastThinking: string | null = null;
       const totalTime = Math.round(performance.now() - startTime);
       const ttft = firstTokenTime ? Math.round(firstTokenTime - startTime) : null;
       log.info(`Upstream turn latency: total=${totalTime}ms, ttft=${ttft ?? "N/A"}ms, chars=${fullText.length}, model=${model}`);
-      recordTurnStat({ at: Date.now(), model, totalMs: totalTime, ttftMs: ttft, chars: fullText.length, outcome: fullText.length > 0 ? "ok" : "empty" });
+      recordTurnStat({ at: Date.now(), model, totalMs: totalTime, ttftMs: ttft, chars: fullText.length, outcome: fullText.length > 0 ? "ok" : "empty", profile: profile.name });
 
       // Image gen (§14): the picture arrives on a GraphicArt frame, usually with NO
       // chat text — so an image turn looks empty to the checks below and would burn
@@ -1114,7 +1149,10 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
       // forcing one-call-per-turn made such turns parse-fail or leak fences.
       // Calls execute sequentially client-side; each reacts to the previous
       // tool_response. Disable with M365_NO_MULTI_TOOL=1.
-      if ((process.env.M365_NO_MULTI_TOOL === "1" || !profile.multiTool) && parsed.toolCalls.length > 1) {
+      if (
+        (process.env.M365_NO_MULTI_TOOL === "1" || !profile.multiTool || cb.forceSingleToolUse === true)
+        && parsed.toolCalls.length > 1
+      ) {
         log.info(`One-call-per-turn (M365_NO_MULTI_TOOL): keeping ${parsed.toolCalls[0].function.name}, dropping ${parsed.toolCalls.length - 1} batched call(s)`);
         parsed.toolCalls = [parsed.toolCalls[0]];
       }

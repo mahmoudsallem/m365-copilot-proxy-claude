@@ -64,3 +64,64 @@ describe("Anthropic Messages compatibility", () => {
     expect(resolveM365Model("gpt-5.5-think-deeper")).toBe("gpt-5.5-think-deeper");
   });
 });
+
+describe("image blocks and parallel-tool-use signal", () => {
+  it("never drops pasted images — emits an explicit placeholder the model can see", () => {
+    const body = AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      max_tokens: 100,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8" } },
+        ],
+      }],
+    });
+    const messages = toOpenAIChatRequest(body).messages;
+    const user = messages.find((m) => m.role === "user")!;
+    expect(String(user.content)).toContain("[IMAGE ATTACHED: image/png");
+    expect(String(user.content)).toContain("vision is not supported");
+  });
+
+  it("flags image blocks inside tool_result content arrays too", () => {
+    const body = AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: "screenshot it" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "shot", input: {} }] },
+        {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "t1",
+            content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: "aGk" } }],
+          }],
+        },
+      ],
+    });
+    const messages = toOpenAIChatRequest(body).messages;
+    const toolMsg = messages.find((m) => m.role === "tool")!;
+    expect(String(toolMsg.content)).toContain("[IMAGE ATTACHED: image/jpeg");
+  });
+
+  it("requestsSingleToolUse reflects tool_choice.disable_parallel_tool_use", async () => {
+    const { requestsSingleToolUse } = await import("./anthropic.js");
+    const base = { model: "claude-sonnet", max_tokens: 10, tools: [{ name: "Bash", input_schema: {} }] };
+    expect(requestsSingleToolUse(AnthropicMessagesRequest.parse({
+      ...base,
+      messages: [{ role: "user", content: "x" }],
+      tool_choice: { type: "auto", disable_parallel_tool_use: true },
+    }))).toBe(true);
+    expect(requestsSingleToolUse(AnthropicMessagesRequest.parse({
+      ...base,
+      messages: [{ role: "user", content: "x" }],
+      tool_choice: { type: "auto" },
+    }))).toBe(false);
+    expect(requestsSingleToolUse(AnthropicMessagesRequest.parse({
+      ...base,
+      messages: [{ role: "user", content: "x" }],
+    }))).toBe(false);
+  });
+});

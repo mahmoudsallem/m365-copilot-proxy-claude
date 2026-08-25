@@ -3,7 +3,7 @@ import { ChatCompletionRequest } from "./schemas.js";
 import { SessionPool, handleChatCompletion, getTurnStats } from "./handler.js";
 import { toneHealth } from "./health.js";
 import { turnQueueStats } from "./turn-queue.js";
-import { resolveProfile, listProfileNames, isProfileName } from "./profiles.js";
+import { listProfileNames, isProfileName } from "./profiles.js";
 import { modelPromptEnabled, modelPromptCandidates, resolveModelSystemPrompt } from "./model-prompts.js";
 import {
   AnthropicMessagesRequest,

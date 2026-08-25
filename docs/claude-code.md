@@ -89,10 +89,15 @@ listing the supported set.
 | `claude-wide` | nothing filtered, cap 10 | everything else, 8/round | **on** |
 
 Operator env vars (`M365_ALLOWED_TOOLS`, `M365_MAX_TOOLS`, `M365_NO_MULTI_TOOL`,
-`M365_NO_SUBAGENTS`) override profile values. The resolved profile is part of the
-conversation identity — switching profiles forks the M365 thread so promoted-tool
-state never bleeds across policies. All M365 turns (normal, ToolSearch follow-ups,
-Task sub-agent jobs) execute through one account-wide FIFO queue.
+`M365_NO_SUBAGENTS`) override profile values. Control tools (`ExitPlanMode`,
+`TodoWrite`, `BashOutput`, `KillShell`) are always advertised — exempt from both the
+allow-list and the cap, since deferring them strands plan mode or background shells.
+`tool_choice.disable_parallel_tool_use` forces strict one-call-per-turn for that
+request regardless of profile. Pasted images are never silently dropped: they become
+an explicit `[IMAGE ATTACHED: …]` placeholder the model can see. The resolved profile
+is part of the conversation identity — switching profiles forks the M365 thread so
+promoted-tool state never bleeds across policies. All M365 turns (normal, ToolSearch
+follow-ups, Task sub-agent jobs) execute through one account-wide FIFO queue.
 
 Keep the proxy bound to `127.0.0.1`. Do not expose the endpoint or its bearer token over
 the network.

@@ -84,6 +84,13 @@ function textFromUnknown(value: unknown): string {
         if (item && typeof item === "object" && "text" in item && typeof item.text === "string") {
           return item.text;
         }
+        // Image blocks inside tool_result content: never silently drop them —
+        // the model must at least know an attachment existed.
+        if (item && typeof item === "object" && (item as { type?: string }).type === "image") {
+          const src = (item as { source?: { media_type?: string; data?: string } }).source ?? {};
+          const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
+          return `[IMAGE ATTACHED: ${src.media_type ?? "unknown"}${bytes ? `, ~${bytes} bytes` : ""} — vision is not supported by this backend]`;
+        }
         return "";
       })
       .filter(Boolean)
@@ -181,6 +188,14 @@ export function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] 
     for (const block of message.content) {
       if (block.type === "text") {
         pendingText.push(block.text);
+      } else if ((block as { type?: string }).type === "image") {
+        // Keep the placeholder ADJACENT to its question: push into pendingText
+        // instead of flushing, so text+attachment travel as one user message.
+        const src = (block as { source?: { media_type?: string; data?: string } }).source ?? {};
+        const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
+        pendingText.push(
+          `[IMAGE ATTACHED: ${src.media_type ?? "unknown"}${bytes ? `, ~${bytes} bytes` : ""} — vision is not supported by this backend]`,
+        );
       } else if (block.type === "tool_result") {
         flushText();
         const result = textFromUnknown(block.content);
@@ -222,6 +237,18 @@ function mapToolChoice(choice: AnthropicBody["tool_choice"]) {
 }
 
 /**
+ * Anthropic's `tool_choice.disable_parallel_tool_use` translated into proxy
+ * terms: strict one-tool-per-turn for THIS request, overriding profile/env
+ * batching defaults. Exported so both protocol paths (and tests) share it.
+ */
+export function requestsSingleToolUse(body: AnthropicBody): boolean {
+  if (!body.tools?.length) return false;
+  const choice = body.tool_choice as { disable_parallel_tool_use?: boolean; type?: string } | undefined;
+  if (!choice || choice.type === "none") return false;
+  return choice.disable_parallel_tool_use === true;
+}
+
+/**
  * Claude Code's /model picker sends Anthropic model names or custom model aliases.
  * Resolve against our centralized capability-aware model registry.
  */
@@ -257,7 +284,8 @@ export function toOpenAIChatRequest(body: AnthropicBody) {
 
 type AnthropicContent =
   | { type: "text"; text: string }
-  | { type: "tool_use"; id: string; name: string; input: unknown };
+  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | { type: "thinking"; thinking: string; signature: string };
 
 export interface AnthropicMessageResponse {
   id: string;
@@ -268,6 +296,8 @@ export interface AnthropicMessageResponse {
   stop_reason: "end_turn" | "tool_use" | "max_tokens";
   stop_sequence: null;
   usage: { input_tokens: number; output_tokens: number };
+  /** M365 diagnostics (conversation quota %, classifier scores) as extension data. */
+  m365?: Record<string, unknown>;
 }
 
 function parseToolInput(raw: string): unknown {
@@ -442,6 +472,7 @@ async function completeAnthropic(
     systemPromptSpec: opts.systemPromptSpec ?? opts.systemPrompt,
     sessionKey: opts.sessionKey,
     profile: opts.profile,
+    forceSingleToolUse: requestsSingleToolUse(body),
   });
   if (produced.kind === "error") return { error: produced.resp };
 
@@ -470,9 +501,14 @@ async function completeAnthropic(
         content,
         stop_reason: "tool_use",
         stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: estimateOutputTokens("x".repeat(outChars)) },
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: estimateOutputTokens("x".repeat(outChars)),
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
         m365: usage,
-      } as AnthropicMessageResponse & { m365?: unknown },
+      },
     };
   }
 
@@ -497,7 +533,7 @@ async function completeAnthropic(
         cache_read_input_tokens: 0,
       },
       m365: usage,
-    } as AnthropicMessageResponse & { m365?: unknown },
+    },
   };
 }
 
@@ -539,6 +575,8 @@ export async function handleAnthropicMessages(
         try { controller.enqueue(encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`)); } catch {}
       }, 15_000);
 
+      const inputTokens = estimateAnthropicInputTokens(body);
+
       let nextIndex = 0;
       let openTextIndex: number | null = null;
       let sent = "";
@@ -574,7 +612,7 @@ export async function handleAnthropicMessages(
             stop_reason: null,
             stop_sequence: null,
             usage: {
-            input_tokens: estimateAnthropicInputTokens(body),
+            input_tokens: inputTokens,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
@@ -591,6 +629,7 @@ export async function handleAnthropicMessages(
           systemPromptSpec: options.systemPromptSpec ?? options.systemPrompt,
           sessionKey: options.sessionKey,
           profile: options.profile,
+          forceSingleToolUse: requestsSingleToolUse(body),
           // Live passthrough: every upstream delta becomes a text_delta AS IT ARRIVES.
           onTextDelta: (delta) => {
             if (!delta) return;
@@ -704,7 +743,8 @@ export async function handleAnthropicMessages(
         send("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: estimateOutputTokens("x".repeat(outputChars)), m365: usage },
+          usage: { input_tokens: inputTokens, output_tokens: estimateOutputTokens("x".repeat(outputChars)) },
+          m365: usage,
         });
         send("message_stop", { type: "message_stop" });
       } catch (error: any) {

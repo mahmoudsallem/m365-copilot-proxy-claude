@@ -97,8 +97,9 @@ describe("proactive token refresh", () => {
   it("skips refresh when the token still has runway", async () => {
     const seenTokens: string[] = [];
     let refreshes = 0;
+    const original = makeJwt(Date.now() / 1000 + 3600); // build ONCE — rebuilding could cross a second boundary
     const session = makeSession({
-      token: makeJwt(Date.now() / 1000 + 3600),
+      token: original,
       refreshToken: async () => {
         refreshes += 1;
         return "fresh-token";
@@ -107,7 +108,7 @@ describe("proactive token refresh", () => {
     });
     await session.run("hello", "m365-copilot", undefined, false);
     expect(refreshes).toBe(0);
-    expect(seenTokens).toEqual([makeJwt(Date.now() / 1000 + 3600)]);
+    expect(seenTokens).toEqual([original]);
   });
 
   it("a failed refresh never blocks the turn — current token rides until its exp", async () => {

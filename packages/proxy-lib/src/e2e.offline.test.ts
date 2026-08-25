@@ -9,6 +9,7 @@ import {
 import { FakeTransport } from "@m365-copilot/core";
 import { TurnGate } from "./gate.js";
 import { SessionPool, produceCompletion } from "./handler.js";
+import { AnthropicMessagesRequest, toOpenAIChatRequest } from "./anthropic.js";
 import { CANONICAL_MODELS } from "@m365-copilot/core";
 
 /**
@@ -519,6 +520,140 @@ describe("account-wide serial execution (max M365 concurrency == 1)", () => {
       delete process.env.M365_CONVERSATION_START_GAP_MS;
     }
   }, 20_000);
+});
+
+// --- Control-tool exemption + request-level single-tool enforcement ---
+
+const EXIT_PLAN_TOOL = {
+  name: "ExitPlanMode",
+  description: "Exit plan mode",
+  input_schema: { type: "object", properties: {} },
+};
+const TODO_TOOL = {
+  name: "TodoWrite",
+  description: "Write todos",
+  input_schema: { type: "object", properties: { todos: { type: "array" } }, required: ["todos"] },
+};
+const ECHO_TOOL = {
+  name: "echo",
+  description: "Echo text",
+  input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+};
+
+function staticStream(text: string): never {
+  const stream = {
+    fullText: text,
+    hasContent: true,
+    throttle: null,
+    contentOrigin: null,
+    messageType: null,
+    messageId: null,
+    scores: null,
+    turnCount: null,
+    turnState: null,
+    thinkingText: null,
+    hasThinking: false,
+    images: [],
+    sawAction: false,
+    async *[Symbol.asyncIterator]() {
+      yield text;
+    },
+  };
+  return stream as never;
+}
+
+class ScriptedTransport {
+  calls = 0;
+  constructor(private readonly script: string) {}
+  reset(): void {}
+  async chat(args: { token: string; text: string }): Promise<never> {
+    this.calls += 1;
+    this.lastPrompt = args.text;
+    return staticStream(this.script);
+  }
+  lastPrompt = "";
+}
+
+describe("control tools are exempt from profile filtering and caps", () => {
+  it("advertises ExitPlanMode/TodoWrite even when the allow-list and cap would drop them", async () => {
+    // claude-safe allow-list covers Bash+Read but NOT ExitPlanMode; the 7-tool
+    // catalog exceeds maxVisibleTools=7 once WebFetch defers — controls must
+    // still be visible.
+    const transport = new ScriptedTransport("```bash\nls\n```");
+    const pool = new SessionPool({
+      getToken: async () => "fake-token",
+      useAgent: false,
+      transport: transport as never,
+    });
+    const anthropicBody = AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      messages: [{ role: "user", content: "plan then do" }],
+      tools: [
+        BASH_TOOL,
+        PROFILE_TOOLS[1], // Read
+        { name: "Write", description: "w", input_schema: { type: "object", properties: {} } },
+        { name: "Edit", description: "e", input_schema: { type: "object", properties: {} } },
+        { name: "WebFetch", description: "wf", input_schema: { type: "object", properties: {} } },
+        EXIT_PLAN_TOOL,
+        TODO_TOOL,
+      ],
+    });
+    const { produced } = await produceCompletion(toOpenAIChatRequest(anthropicBody), pool, { profile: "claude-safe" });
+    expect(produced.kind).toBe("tools");
+    const manifest = transport.lastPrompt;
+    expect(manifest).toContain("ExitPlanMode"); // control exemption beats allow-list
+    expect(manifest).toContain("TodoWrite");
+    expect(manifest).not.toContain("WebFetch");
+    expect(manifest).toContain("ToolSearch");   // WebFetch deferred & discoverable
+  });
+});
+
+describe("tool_choice.disable_parallel_tool_use forces one call per turn", () => {
+  const TWO_FENCES = "```bash\nls\n```\n```echo\nhello\n```";
+  const mkBody = (parallelDisabled?: boolean) =>
+    toOpenAIChatRequest(AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      messages: [{ role: "user", content: "run both" }],
+      tools: [
+        { name: "bash", description: "Run shell", input_schema: { type: "object", properties: {} } },
+        { name: "echo", description: "Echo text", input_schema: { type: "object", properties: {} } },
+      ],
+      ...(parallelDisabled
+        ? { tool_choice: { type: "auto", disable_parallel_tool_use: true } }
+        : {}),
+    }));
+
+  it("default profile batching forwards both calls", async () => {
+    const transport = new ScriptedTransport(TWO_FENCES);
+    const pool = new SessionPool({ getToken: async () => "t", useAgent: false, transport: transport as never });
+    const { produced } = await produceCompletion(mkBody(false), pool, {});
+    if (produced.kind !== "tools") throw new Error(`expected tools, got ${produced.kind}`);
+    expect(produced.toolCalls.length).toBe(2);
+  });
+
+  it("disable_parallel_tool_use trims to the first call", async () => {
+    const transport = new ScriptedTransport(TWO_FENCES);
+    const pool = new SessionPool({ getToken: async () => "t", useAgent: false, transport: transport as never });
+    const { produced } = await produceCompletion(mkBody(true), pool, { forceSingleToolUse: true });
+    if (produced.kind !== "tools") throw new Error(`expected tools, got ${produced.kind}`);
+    expect(produced.toolCalls.length).toBe(1);
+    expect(produced.toolCalls[0].function.name).toBe("bash");
+  });
+});
+
+describe("direct produceCompletion callers get strict profile validation too", () => {
+  it("invalid profile -> 400 invalid_request_error, no crash", async () => {
+    const transport = new ScriptedTransport("ok");
+    const pool = new SessionPool({ getToken: async () => "t", useAgent: false, transport: transport as never });
+    const { produced } = await produceCompletion(
+      { model: "claude-sonnet", messages: [{ role: "user" as const, content: "hi" }] } as never,
+      pool,
+      { profile: "nope" },
+    );
+    expect(produced.kind).toBe("error");
+    if (produced.kind === "error") expect(produced.resp.status).toBe(400);
+    expect(transport.calls).toBe(0); // rejected before any upstream work
+  });
 });
 
 // --- Cancellation timing: client disconnects must fail fast, never retry-storm ---
