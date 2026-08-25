@@ -1,13 +1,17 @@
 # cc-doctor v2 - local Claude Code installation audit. No AI, instant.
 # One optional registry lookup for the version check; -Offline skips it.
-# Run:  powershell -NoProfile -File scripts\cc-doctor.ps1 [-Offline] [-Compact]
+# Run:  powershell -NoProfile -File scripts\cc-doctor.ps1 [-Offline] [-Compact] [-Markdown]
+#       -Markdown emits GitHub-flavored Markdown (tables, headings) instead of
+#       console colors - paste-ready for issues, PRs and notes.
 # Exit: 0 clean | 1 warnings | 2 failures
 
 param(
     [switch]$Offline,
-    [switch]$Compact
+    [switch]$Compact,
+    [switch]$Markdown
 )
 $script:Compact = $Compact
+$script:Markdown = $Markdown
 
 $ErrorActionPreference = 'Continue'
 $t0 = [System.Diagnostics.Stopwatch]::StartNew()
@@ -20,7 +24,36 @@ $proj = 'E:\m365-copilot-proxy-claude'
 $nOK = 0; $nWarn = 0; $nFail = 0; $nInfo = 0
 $W = 64
 
+# --- Markdown emission layer: buffer rows per section, flush as GFM tables ---
+$script:Rows = New-Object System.Collections.Generic.List[object]
+$script:Section = ''
+function TitleCase([string]$s) {
+    return (Get-Culture).TextInfo.ToTitleCase($s.ToLower())
+}
+function Escape-Md([string]$s) {
+    return $s.Replace('|', '\|').Replace("`r", '').Replace("`n", ' ')
+}
+function Add-Row([string]$status, [string]$text) {
+    $script:Rows.Add([pscustomobject]@{ status = $status; text = $text; fix = '' })
+}
+function Flush-MdSection {
+    if (-not $script:Markdown) { $script:Rows.Clear(); return }
+    if ($script:Rows.Count -eq 0) { return }
+    Write-Output ''
+    Write-Output ('## ' + (TitleCase $script:Section))
+    Write-Output ''
+    Write-Output '| Status | Check |'
+    Write-Output '|--------|-------|'
+    foreach ($r in $script:Rows) {
+        $detail = Escape-Md $r.text
+        if ($r.fix) { $detail += ' `<fix:` ' + (Escape-Md $r.fix) }
+        Write-Output ('| ' + $r.status + ' | ' + $detail + ' |')
+    }
+    $script:Rows.Clear()
+}
+
 function Banner([string]$Text) {
+    if ($script:Markdown) { Flush-MdSection; $script:Section = $Text; return }
     if ($script:Compact) { return }
     Write-Host ''
     $dash = [Math]::Max(2, $W - $Text.Length - 4)
@@ -28,15 +61,34 @@ function Banner([string]$Text) {
 }
 function Ok([string]$t) {
     $script:nOK++
+    if ($script:Markdown) { Add-Row 'OK' $t; return }
     if (-not $script:Compact) { Write-Host ('  [OK]   ' + $t) -ForegroundColor Green }
 }
-function Warn([string]$t) { $script:nWarn++; Write-Host ('  [WARN] ' + $t) -ForegroundColor Yellow }
-function Fail([string]$t) { $script:nFail++; Write-Host ('  [FAIL] ' + $t) -ForegroundColor Red }
+function Warn([string]$t) {
+    $script:nWarn++
+    if ($script:Markdown) { Add-Row 'WARN' $t; return }
+    Write-Host ('  [WARN] ' + $t) -ForegroundColor Yellow
+}
+function Fail([string]$t) {
+    $script:nFail++
+    if ($script:Markdown) { Add-Row 'FAIL' $t; return }
+    Write-Host ('  [FAIL] ' + $t) -ForegroundColor Red
+}
 function Info([string]$t) {
     $script:nInfo++
+    if ($script:Markdown) { Add-Row 'INFO' $t; return }
     if (-not $script:Compact) { Write-Host ('  [i]    ' + $t) -ForegroundColor Gray }
 }
-function Hint([string]$t) { Write-Host ('         fix: ' + $t) -ForegroundColor DarkYellow }
+function Hint([string]$t) {
+    if ($script:Markdown) {
+        if ($script:Rows.Count -gt 0) {
+            $last = $script:Rows[$script:Rows.Count - 1]
+            $last.fix = if ($last.fix) { "$($last.fix); $t" } else { $t }
+        }
+        return
+    }
+    Write-Host ('         fix: ' + $t) -ForegroundColor DarkYellow
+}
 
 function VersionOf([string]$v) {
     if (-not $v) { return $null }
@@ -65,11 +117,16 @@ function Test-NoBom([string]$path) {
     }
 }
 
-Write-Host ('=' * $W)
-Write-Host (' cc-doctor  |  ' + $env:COMPUTERNAME + '  |  ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
-Write-Host ('=' * $W)
-if (-not $script:Compact) {
-    Write-Host (' [OK] fine   [WARN] attention   [FAIL] broken   [i] info') -ForegroundColor DarkGray
+if ($script:Markdown) {
+    Write-Output ('# cc-doctor - ' + $env:COMPUTERNAME + ' - ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+    $script:Section = 'header' # nothing buffered before the first real section
+} else {
+    Write-Host ('=' * $W)
+    Write-Host (' cc-doctor  |  ' + $env:COMPUTERNAME + '  |  ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+    Write-Host ('=' * $W)
+    if (-not $script:Compact) {
+        Write-Host (' [OK] fine   [WARN] attention   [FAIL] broken   [i] info') -ForegroundColor DarkGray
+    }
 }
 
 # ---------------------------------------------------------------- install
@@ -229,8 +286,8 @@ if (Test-Path -LiteralPath $skillsDir) {
 } else { Info 'no user skills installed' }
 
 if ($j -and $j.skillUsage) {
-    $rows = @($j.skillUsage.PSObject.Properties | Sort-Object { [int]$_.Value.usageCount } -Descending)
-    Info ("lifetime skill usage: " + (($rows | ForEach-Object { "{0}[{1}]" -f $_.Name, $_.Value.usageCount }) -join '  '))
+    $usageRows = @($j.skillUsage.PSObject.Properties | Sort-Object { [int]$_.Value.usageCount } -Descending)
+    Info ("lifetime skill usage: " + (($usageRows | ForEach-Object { "{0}[{1}]" -f $_.Name, $_.Value.usageCount }) -join '  '))
 }
 foreach ($ad in @((Join-Path $sd 'agents'), (Join-Path $proj '.claude\agents'))) {
     $label = $ad.Replace($homeDir, '~')
@@ -290,13 +347,29 @@ foreach ($name in @('settings.json', 'settings.local.json', '.mcp.json')) {
 }
 
 # ----------------------------------------------------------------- summary
+Flush-MdSection
 $t0.Stop()
 $el = [math]::Round($t0.Elapsed.TotalSeconds, 1)
+$checks = $nOK + $nWarn + $nFail
+$pct = 0; if ($checks -gt 0) { $pct = [int][math]::Round(100 * $nOK / $checks) }
+$exit = 0
+
+if ($script:Markdown) {
+    $verdictText = 'healthy'
+    if ($nFail -gt 0) { $verdictText = 'BROKEN - fix the FAIL items above'; $exit = 2 }
+    elseif ($nWarn -gt 0) { $verdictText = 'usable - WARN items deserve attention'; $exit = 1 }
+    Write-Output ''
+    Write-Output '## Result'
+    Write-Output ''
+    Write-Output ("- **Checks:** $nOK ok / $nWarn warn / $nFail fail / $nInfo info  ($el s)")
+    Write-Output ("- **Health:** $pct%")
+    Write-Output ("- **Verdict:** **$verdictText**")
+    exit $exit
+}
+
 Write-Host ''
 Write-Host ('=' * $W)
 Write-Host (" RESULT: $nOK ok | $nWarn warn | $nFail fail | $nInfo info   ($el s)") -ForegroundColor White
-$checks = $nOK + $nWarn + $nFail
-$pct = 0; if ($checks -gt 0) { $pct = [int][math]::Round(100 * $nOK / $checks) }
 $filled = [int][math]::Round($pct / 10)
 if ($filled -gt 10) { $filled = 10 }
 $gaugeColor = 'Green'; if ($nFail -gt 0) { $gaugeColor = 'Red' } elseif ($nWarn -gt 0) { $gaugeColor = 'Yellow' }
