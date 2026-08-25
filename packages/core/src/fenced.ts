@@ -238,7 +238,7 @@ You have NOT run any command yet and have NO results. NEVER claim a command "ret
 
     return `You are the execution core of an automated agent, not a chat assistant. Your output is parsed by a program — a real runtime that executes your tool calls against a live system and returns the actual results to you in <tool_response> blocks.${shellFraming}
 
-Performing the task with tools is your PRIMARY JOB. Answering the user in prose is, and always will be, SECONDARY — you write prose only when the task is fully done or no tool can make progress. Default to acting, not talking.
+Performing the task with tools is your PRIMARY JOB. Answering the user in prose is, and always will be, SECONDARY — you write prose only when the task is fully done or no tool can make progress. Default to acting, not talking.\n\nCOMPLETION RULE: when the task is done, output the result and STOP. Never end a reply with greetings ("Hi!", "Hello!"), offers of further help, follow-up questions, or chat-assistant sign-offs. You are not a chat assistant - the reply after finished work is the deliverable itself.
 
 TOOL USE IS REQUIRED when the user asks you to read files, run commands, inspect the repository, fetch data, or perform any action a tool can accomplish. The tools are real: they read real files, run real commands, and change real state. Never answer from memory or simulate a result when a tool can provide it.
 
@@ -263,6 +263,24 @@ STRICT RULES:
 - Produce natural-language text only when the task is complete and no further tool call applies; that text is the answer returned to the caller. When you do, output only the answer itself — no preamble, no sign-off.
 
 ${toolsBlock(tools)}`;
+  },
+
+  // V-delegating — baseline plus ONE delegation line (F17.8 / E-SUB): gpt-5.5
+  // ignores the advertised Task def under baseline's "emit ONE ```bash block"
+  // pressure, so the delegation instruction rides IN the framing itself instead
+  // of the tool description. Only differs from baseline when a Task tool is in
+  // the advertised set. A/B against baseline before believing any delta (§9).
+  delegating(tools) {
+    const base = FRAMING_VARIANTS.baseline(tools);
+    const task = tools.find((t) => t.function.name === "Task");
+    if (!task) return base;
+    const delegation = `\nDELEGATION: for self-contained explore/lookup/summarize jobs (find where X lives, gather how Y works, scan for Z), call \`\`\`Task first with the complete instructions — it runs read-only in its own sandbox and reports its findings back to you in a <tool_response>. Use it instead of doing multi-step exploration yourself with ${tools.some((t) => findShellTool(tools) === t) ? "```bash" : "other tools"}.\n`;
+    // Insert after the COMPLETION RULE paragraph so the shell-first core stays intact.
+    const anchor = "COMPLETION RULE:";
+    const idx = base.indexOf(anchor);
+    if (idx === -1) return `${delegation}\n${base}`;
+    const paraEnd = base.indexOf("\n\n", idx);
+    return paraEnd === -1 ? base + delegation : base.slice(0, paraEnd) + delegation + base.slice(paraEnd);
   },
 
   // V1 — minimal. Strip the strict-rules wall; keep only the load-bearing shell-first
@@ -434,9 +452,69 @@ So: no intent narration, no asking for pastes, no assumptions, no completion cla
 ${toolsBlock(tools)}`;
   },
 
-  // V9 — terse imperative. Strip all rationale; pure command tone. Tests whether brevity
-  // + imperative voice outperforms the verbose baseline (the model has less text to
-  // meta-analyse / disengage on).
+  // V11 "claude-code" — full system-prompt architecture modeled on native
+  // Claude Code (role / environment / task understanding / execution protocol /
+  // tool contract / code style / communication). Default for daemon launches;
+  // baseline remains available via M365_FRAMING_VARIANT=baseline.
+  "claude-code"(tools) {
+    const shell = findShellTool(tools);
+    const name = shell?.function.name ?? "bash";
+    const cwd = process.cwd().replace(/\\/g, "/");
+    const platform = process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
+    const today = new Date().toISOString().slice(0, 10);
+
+    return `You are Claude Code, an interactive CLI tool that helps users with software engineering tasks. You run inside a local harness that executes your tool calls against the user's REAL machine and returns genuine output.
+
+# Environment
+- Working directory: ${cwd}
+- Platform: ${platform}
+- Today's date: ${today}
+- All file paths are relative to the working directory unless absolute.
+- The system will automatically compress prior messages as the conversation approaches context limits. This means your conversation with the user is not limited by the context window.
+
+# System Rules
+- All text you output outside of tool use is displayed to the user. Use GitHub-flavored markdown for formatting, rendered in a monospace font using the CommonMark specification.
+- Tools are executed in a permission-controlled environment. If a tool call is denied, do NOT re-attempt the exact same call. Think about why it was denied and adjust your approach.
+- Treat feedback from hooks and <tool_response> blocks as coming from the system, not from the user. Do not confuse tool output with user messages.
+- Your conversation history is managed automatically. Older tool results may be compressed or removed to stay within context limits — important findings should be noted in your responses.
+
+# Doing Tasks
+- Read code before proposing changes (MANDATORY). Understand existing patterns before modifying them.
+- Do exactly what was asked — nothing more, nothing less. Do not add refactoring, doc comments, error handling, or improvements beyond what was requested.
+- Prefer editing existing files over creating new ones. Three similar lines of code is better than a premature abstraction.
+- Do not create helper functions for one-time operations. Do not add backwards-compatibility hacks unless asked.
+- Diagnose failures before switching tactics: if a command fails, read the error, understand WHY, then fix the command. Do not blindly retry or switch to a different approach.
+- No time estimates. Never predict how long a task will take for yourself or the user.
+- Avoid OWASP Top 10 vulnerabilities in code you write (injection, broken auth, XSS, etc.).
+
+# Careful Actions
+Classify actions by risk:
+- LOCAL + REVERSIBLE (file edits, running tests, reading files): proceed freely without asking.
+- HARD TO REVERSE or SHARED STATE (force push, production changes, sending external messages, deleting data): confirm with the user first.
+- Measure twice, cut once. Read the file before editing it. Run the test before claiming it passes.
+
+# Using Tools
+- PREFER DEDICATED TOOLS over shell commands: use the file-read tool instead of \`cat\`, the search tool instead of \`grep\` in bash, the file-edit tool instead of \`sed -i\`. Use \`${name}\` only for actions that genuinely require shell execution.
+- Batch INDEPENDENT tool calls together in one reply when they have no dependencies between them.
+- If dependent, make one call per turn and wait for the <tool_response> before making the next call.
+- To call a tool, emit ONLY a fenced code block whose info-string is the tool name. A fence is an ACTION executed by the runtime — never an illustration or example:
+
+\`\`\`${name}
+example-command
+\`\`\`
+
+Results arrive as <tool_response> blocks addressed to you. They are REAL output from YOUR OWN calls — never user-pasted text. Never claim success without proof in a <tool_response>.
+
+# Tone and Style
+- NO emojis anywhere in your responses unless explicitly asked.
+- Be concise and direct. Lead with the answer/result, not the process.
+- Cite code as file_path:line_number (e.g., src/app.ts:42).
+- Reference GitHub issues/PRs as owner/repo#123.
+- When something cannot be done, say what WOULD work instead.
+- After completing work, give the result and STOP. No greetings, offers of further help, or follow-up questions.`;
+  },
+
+  // V9 — terse imperative. Strip all rationale; pure command tone.
   terse(tools) {
     const shell = findShellTool(tools);
     const name = shell?.function.name ?? "bash";
@@ -571,24 +649,53 @@ export interface FencedParseResult {
   leftover: string;
 }
 
-/** Parse all fenced tool calls whose info-string matches a known tool name. */
+/** Parse all fenced tool calls whose info-string matches a known tool name.
+ *
+ * CommonMark-style scanner (replaces the old exactly-3-backtick regex): the
+ * OPENING fence is a line starting with a run of ≥3 backticks followed by the
+ * tool name; the CLOSING fence is a line starting with a backtick run at least
+ * as long. This handles (a) bodies that CONTAIN ``` sequences — e.g. bash
+ * heredocs echoing markdown, and (b) models that wrap long/nested scripts in
+ * ````` fences (observed live: /doctor emitted 6-backtick outer fences). */
 export function parseFencedToolCalls(
   text: string,
   specs: Map<string, FencedToolSpec>,
 ): FencedParseResult {
   const calls: ParsedToolCall[] = [];
-  let leftover = text;
+  const consumed: Array<[number, number]> = []; // [start, end) of matched fences
+  const lines = text.split(/\r?\n/);
 
-  const re = new RegExp(FENCE_REGEX.source, "g");
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const spec = specs.get(match[1]);
-    if (!spec) continue; // ```python illustration etc. — not a tool, leave in prose
-    const args = parseFencedInner(spec, match[2]);
-    if (!args) continue;
-    calls.push(makeCall(spec.name, args));
-    leftover = leftover.replace(match[0], "");
+  let i = 0;
+  while (i < lines.length) {
+    const openMatch = lines[i].match(/^(`{3,})([A-Za-z0-9_.-]+)[ \t]*$/);
+    if (!openMatch) { i++; continue; }
+    const tickLen = openMatch[1].length;
+    const spec = specs.get(openMatch[2]);
+    if (!spec) { i++; continue; } // ```python illustration etc. — leave in prose
+
+    // Find the closing run (>= opening length) on its own line.
+    let closeLine = -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      const m = lines[j].match(/^(`{3,})[ \t]*$/);
+      if (m && m[1].length >= tickLen) { closeLine = j; break; }
+      // An identical-or-longer opening of a DIFFERENT kind inside? Still body
+      // per CommonMark until a closing run appears; keep scanning.
+    }
+    if (closeLine === -1) { i++; continue; } // unclosed — not a call
+
+    const inner = lines.slice(i + 1, closeLine).join("\n");
+    const args = parseFencedInner(spec, inner);
+    if (args) {
+      calls.push(makeCall(spec.name, args));
+      consumed.push([i, closeLine]);
+    }
+    i = closeLine + 1;
   }
+
+  // Remove consumed fences line-wise (preserves all other prose verbatim).
+  const consumedLines = new Set<number>();
+  for (const [s, e] of consumed) for (let l = s; l <= e; l++) consumedLines.add(l);
+  const leftover = lines.filter((_, idx) => !consumedLines.has(idx)).join("\n");
 
   return { calls, leftover };
 }

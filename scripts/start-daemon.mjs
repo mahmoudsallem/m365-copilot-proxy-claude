@@ -34,6 +34,23 @@ const child = spawn(process.execPath, [script], {
     NITRO_HOST: "127.0.0.1",
     PORT: "4141",
     NODE_NO_WARNINGS: "1",
+    // Lean toolset for harness clients (M365 ignores tool framing on large
+    // payloads). Core coding tools + web pair stay advertised; everything else
+    // becomes a DEFERRED catalog reachable via the synthetic ToolSearch tool.
+    // Override by pre-setting the var. M365_MAX_TOOLS caps the advertised count.
+    M365_ALLOWED_TOOLS: process.env.M365_ALLOWED_TOOLS ?? "Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch",
+    // M365_ALLOW_MULTI_TOOL=1 restores batched calls (opt-in: premature-success
+    // risk). M365_NO_TONE_FAILOVER=1 disables upstream tone failover.
+    // Latency: stagger between NEW conversation starts (throttle guard — the
+    // degradation backoff is the real sustained-burst protection, so this can
+    // stay tight) and the quick-retry sleep for empty turns.
+    M365_CONVERSATION_START_GAP_MS: process.env.M365_CONVERSATION_START_GAP_MS ?? "1000",
+    M365_EMPTY_RETRY_DELAY_MS: process.env.M365_EMPTY_RETRY_DELAY_MS ?? "1000",
+    // Claude Code-grade system framing by default (role/environment/protocol).
+    // Override with e.g. "baseline" for the legacy shell-first control.
+    M365_FRAMING_VARIANT: process.env.M365_FRAMING_VARIANT ?? "claude-code",
+    // Inject each requested model family's real system prompt (leak corpus).
+    M365_MODEL_PROMPTS: process.env.M365_MODEL_PROMPTS ?? "1",
   },
 });
 

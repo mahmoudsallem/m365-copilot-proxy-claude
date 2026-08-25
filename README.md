@@ -280,6 +280,7 @@ and `.runtime/` remain until you delete that exact folder yourself.
 | `gpt-5.4` / `gpt-5.4-quick` | Gpt_5_4_* | GPT-5.4 |
 | `gpt-5.3` / `gpt-5.3-think-deeper` | Gpt_5_3_* | GPT-5.3 |
 | `gpt-5.2` / `gpt-5.2-think-deeper` | Gpt_5_2_* | GPT-5.2 |
+| `gpt-5.6-reasoning` / `sol` / `terra` / `luna` / `gpt-5.6-sol|terra|luna` | **Gpt_5_6_Reasoning** | GPT-5.6 reasoning tone — a REAL distinct backend model ([F17.11](docs/hypotheses.md)); sol/terra/luna differ only by effort preset |
 
 > ✅ **For tool calling, use `gpt-5.5-think-deeper` (the default when no model is sent).**
 > The current agent + fenced/shell-routing path makes this reasoning tone robust —
@@ -426,6 +427,69 @@ Three token scopes are acquired:
 - `api.powerplatform.com/.default` — For Copilot Studio agent management
 - `api.bap.microsoft.com/.default` — For environment discovery
 
+## Sub-agents (Task)
+
+The proxy synthesizes a **`Task(prompt)`** tool: the model can delegate self-contained
+research/exploration jobs to a sub-agent that runs in its OWN M365 conversation with
+restricted read-only workspace tools (`read_file` / `glob_files` / `grep_files`,
+executed in-process by the proxy, workspace-jailed). The sub-agent's report is fed back
+into the main conversation; the client only sees ordinary turns. Mutations stay with the
+main loop. Knobs: `M365_NO_SUBAGENTS=1` (disable), `M365_SUBAGENT_TURNS` (default 6),
+`M365_WORKSPACE_ROOT` (sandbox root, default cwd).
+
+> Note: adoption is tone-dependent today — gpt-5.5's shell-first framing may ignore Task
+> ([F17.8](docs/hypotheses.md)); a delegating framing variant is the planned fix.
+
+## DeepSeek Harness (dsh) as a frontend
+
+The proxy is a standard OpenAI-compatible endpoint, so [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+(`npm i -g @deepseek-ai/dsh`) works as a full Web-UI agent on M365 models:
+
+```powershell
+m365-dsh          # starts proxy if needed, opens the dsh Web UI
+```
+
+Config lives in `~/.dsh-m365/settings.yaml` (provider `m365` → `http://127.0.0.1:4141/v1`,
+models gpt-5.5 / claude-opus-5 / claude-sonnet-5 / sol; default route set via the
+`agent-default-model:` section). Headless mode: `dsh --profile headless "task"` with
+`DSH_HOME=%USERPROFILE%\.dsh-m365`. dsh ships native sub-agents, workflows, and a
+plan tool — all driving your M365 models through this proxy.
+
+## Status dashboard
+
+While the proxy runs, open **http://127.0.0.1:4141/** — a local-only page showing tone-health
+circuit breakers, recent upstream turn latencies (total + TTFT per turn), and pool/gate state.
+Raw JSON: `/internal/stats`. Keep the proxy bound to 127.0.0.1.
+
+## TTFT / perceived latency
+
+Tool-mode responses now **stream their prose live**: the moment M365 emits preamble text
+("Let me check the files…") it flows to the client — only the tool-call fence itself is held
+back until the turn completes and is parsed into `tool_calls`. Fence bytes never leak as
+content (guarded forwarder with holdback window; see [hypotheses §17](docs/hypotheses.md)).
+Remaining latency after that is M365 server think-time (measured: gpt-5.5 ≈5s/turn healthy;
+Claude tones vary 5–50s under load). Tune retry pacing with `M365_EMPTY_RETRY_DELAY_MS` /
+`M365_MAX_EMPTY_RETRIES`, conversation-start stagger with `M365_CONVERSATION_START_GAP_MS`.
+
+## Generic OpenAI-upstream mode
+
+Set `OPENAI_UPSTREAM_BASE_URL` (+ `OPENAI_UPSTREAM_API_KEY`) **before starting the proxy** to
+bypass M365 entirely and point Claude Code / any Anthropic client at any OpenAI-compatible
+backend — the same job as LiteLLM-based bridges (`claude-code-proxy` et al.), no Python needed:
+
+```powershell
+$env:OPENAI_UPSTREAM_BASE_URL = "https://api.openai.com"   # or OpenRouter / vLLM / LM Studio
+$env:OPENAI_UPSTREAM_API_KEY  = "sk-..."
+$env:UPSTREAM_BIG_MODEL       = "gpt-4.1"                  # sonnet/opus requests map here
+$env:UPSTREAM_SMALL_MODEL     = "gpt-4.1-mini"             # haiku requests map here
+.\start-proxy.ps1
+```
+
+`POST /v1/chat/completions` becomes a near-verbatim reverse proxy (model remapped);
+`POST /v1/messages` gets full Anthropic⇄OpenAI translation incl. streaming tool_use.
+Unset the variable and the proxy returns to M365 mode. M365-specific features (tone
+failover, ToolSearch deferred catalog, breaker dashboard data) apply to M365 mode only.
+
 ## Environment variables
 
 | Variable | Description |
@@ -434,7 +498,9 @@ Three token scopes are acquired:
 | `M365_TRACE` | Set to `1` for full, untruncated debug logging (every WS frame/prompt/response) — implies `M365_DEBUG`. For reverse engineering. |
 | `M365_LOG_STDOUT` | Set to `1` to mirror debug lines to the proxy's stdout as well as the log file, so you can watch a run without tailing it in a second terminal. Needs `M365_DEBUG` or `M365_TRACE` — on its own it logs nothing. |
 | `M365_DUMP_FRAMES` | Set to `1` to write every WebSocket frame (both directions) to `~/.config/opencode-m365/frames/<requestId>.ndjson`. For offline diffing of new M365 fields. |
-| `M365_ALLOW_MULTI_TOOL` | Allow the model to emit multiple tool calls per turn (default: only the first is kept) |
+| `M365_NO_MULTI_TOOL` | Batched tool calls are now **ON by default** (models naturally emit several gather-checks in one turn — e.g. `/doctor`-style sweeps; one-call-per-turn made those parse-fail). Set to `1` to restore the old truncate-to-first behavior. The fenced parser also accepts CommonMark-style LONG fences (`````bash … `````) so bodies containing ` ``` ` sequences — or models wrapping nested markdown — parse correctly instead of leaking as text ([F17.7](docs/hypotheses.md)). |
+| `M365_ALLOWED_TOOLS` / `M365_MAX_TOOLS` | Lean-toolset control (M365 ignores tool framing on large payloads — [F16.4](docs/hypotheses.md)). `M365_ALLOWED_TOOLS="Bash,Read,Edit,Write,Glob,Grep"` keeps only those names; `M365_MAX_TOOLS="6"` caps the advertised count (original order wins). Tools dropped by either become a **deferred catalog**: still executable by the client, hidden from M365 behind a synthetic `ToolSearch` meta-tool the model can call to pull matching definitions into the conversation. The daemon launcher defaults to the 6 core tools; set `M365_ALLOWED_TOOLS=""` to disable filtering. |
+| `M365_NO_TONE_FAILOVER` | Set to `1` to disable automatic tone failover. By default, when the requested Claude tone is in an upstream outage (`turnState:"Failed"` empties — the F16.3 signature) or its circuit breaker is open after `M365_BREAKER_THRESHOLD` consecutive failures (default 3, cooldown `M365_BREAKER_COOLDOWN_MS`, default 10 min), the proxy transparently retries/reroutes on a healthy fallback (sonnet↔opus↔gpt-5.5) on a **new** conversation. Throttle-class empties never fail over — degradation backoff owns those. |
 | `M365_INJECT_REPLY_TOOL` | Set to `1` to inject a synthetic `reply(text)` tool. Forces every turn to be a tool call, including pure-prose answers. Cleaner contract for the model, +1 tool to the prompt (watch the Disengaged threshold). Confirmed 5/5 compliance on June 9 2026 ([hypotheses §1.1](docs/hypotheses.md)). |
 | `M365_NO_CONFAB_RETRY` / `M365_CONFAB_RETRIES` | M365's chat model sometimes produces prose instead of a tool call when it should act — either confabulating an inability ("I can't access the files, please paste them") **or** claiming a completion it never did ("I've replaced the README", with no tool call). On a first-turn refusal, the proxy now returns a safe read-only `bash` orientation call directly (when available), avoiding an extra M365 message; other detected cases are re-prompted forcefully **in the same conversation** (`M365_CONFAB_RETRIES`, default `1`). Set `M365_NO_CONFAB_RETRY=1` to disable recovery. |
 | `M365_NO_BACKOFF` (alias `M365_NO_AUTO_REAUTH`) | Set to `1` to disable degradation backoff. By default, when empty/throttled responses span several **distinct conversations** in a short window (the thread-rate-throttle signature, [F13](docs/hypotheses.md)), the proxy **paces subsequent turns** (a jittered delay before starting new backend conversations) to let the account self-heal. This replaced the old auto-reauth: a fresh login does **not** clear this throttle (it's `oid`-keyed — [§11 H-R1](docs/hypotheses.md)) and raised our detection profile. A single long pi thread never trips the trigger. |

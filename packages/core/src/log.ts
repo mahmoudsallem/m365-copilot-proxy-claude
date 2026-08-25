@@ -40,6 +40,7 @@ function write(level: string, component: string, ...args: unknown[]) {
 export function createLogger(component: string) {
   return {
     info: (...args: unknown[]) => write("INFO", component, ...args),
+    warn: (...args: unknown[]) => write("WARN", component, ...args),
     error: (...args: unknown[]) => write("ERROR", component, ...args),
     debug: (...args: unknown[]) => write("DEBUG", component, ...args),
   };

@@ -31,6 +31,332 @@ than "we eyeballed one run." See §M (Methods) for the experimental rig.
   third-party): loopback redirect falsified, `nativeclient` corroborated by two forks
 - §12 — Multi-agent research dig (July 13 2026) + framing A/Bs, and §12.13: tool-less
   requests silently execute in M365's sandbox and return a real (wrong-machine) transcript
+- §16 — Aug 24 2026: Claude model IDs end-to-end — tone-mangling bug fixed, pool
+  cross-model contamination fixed, upstream Claude_Sonnet InternalError incident mapped,
+  Claude Code harness validated on claude-opus-5
+
+---
+
+## 17. Aug 24 2026 — Gap-closure build: progressive tool discovery (ToolSearch), tone-health failover, batched-call opt-in, latency probe
+
+**Premise.** Close the measured gaps vs native Claude Code: (a) 6-tool ceiling,
+(b) one-call-per-turn, (c) upstream tone outages take models down for hours,
+(d) no latency baselines. Built offline-first; live smokes pending.
+
+### F17.1 — ToolSearch progressive discovery (W-A) 🟢 built + offline-tested
+
+`M365_ALLOWED_TOOLS`/`M365_MAX_TOOLS` now feed a **deferred catalog**: dropped tools
+stay executable (parse + client forwarding use the FULL client-declared list) but a
+synthetic `ToolSearch` meta-tool is advertised in their place. When the model emits
+```ToolSearch```, the proxy resolves keywords against the catalog (term overlap over
+name+description), promotes matches into the conversation's advertised set
+(`ConversationState.promotedTools`), and injects rendered definitions straight back
+into the SAME M365 conversation — the model then emits the real call; the client
+only ever sees genuine tools. Mirrors Anthropic/OpenAI "tool search / deferred
+loading" patterns for the >30-tool accuracy cliff (industry: selection degrades
+past ~30 tools; retrieval keeps effective context ≤6). Fenced convention gotcha:
+single free-form string param = fence BODY, so `query:` prefixes leak into values —
+parser-side strip added.
+
+### F17.2 — Tone-health classifier + circuit breaker + failover (W-C) 🟢 built + offline-tested
+
+New `proxy-lib/health.ts`: `classifyFailure()` maps the four documented empty-turn
+signatures (F13 throttle / F22 Disengaged / §10 dead-agent / F16.3 `turnState:"Failed"`
+outage); `ToneHealth` breaker opens after N=3 consecutive tone_outage failures
+(cooldown 10 min, single half-open probe); entry reroute + ONE inline retry walk
+sonnet↔opus↔gpt-5.5 on a NEW conversation (fingerprints already model-keyed per
+F16.2). Throttle-class empties NEVER failover — degradation backoff owns them.
+Disable with `M365_NO_TONE_FAILOVER=1`; knobs `M365_BREAKER_THRESHOLD`,
+`M365_BREAKER_COOLDOWN_MS`. Also fixed: core logger had no `.warn`
+(`model.ts` refreshAgent path was a latent crash).
+
+### F17.3 — Multi-call batching stays OPT-IN (W-B) 🟢 verified
+
+F23 fence-swallow fix was already landed (`isProseDocument` now only flags document
+shapes: ≥4 fences / markdown headers / ≥300-char prose). Batch gate unchanged
+(`M365_ALLOW_MULTI_TOOL`, default off) — offline e2e now covers both states.
+
+### F17.4 — Latency baseline tooling (W-D) 🟡 built, no data yet
+
+`scripts/latency-probe.mjs`: streaming TTFT + total-turn time per model through the
+running proxy, sequential, JSON rows out. First real numbers still to be collected
+(docs had zero ttft measurements anywhere).
+
+**Offline verification:** 144/144 unit tests (18 new: classifier matrix, breaker
+transitions incl. half-open probe claim, fallback selection, multi-call gate both
+states, ToolSearch round-trip, inline failover, breaker rerouting, opt-out).
+
+---
+
+### F17.14 — Watchdog v2: hard pre-content cap + jq unblocked live session 🟢 shipped
+
+**Live drivers.** (a) /doctor burned 15min+ because the host had **no `jq`** — every
+check errored and the model improvised escalating scripts (installed jq 1.7.1 to
+npm-global, already on PATH). (b) Stats captured a 409s opus turn with **187s ttft**
+— Progress keepalive frames kept resetting the idle watchdog, so v1 never fired.
+
+**Fixes.** Two-tier watchdog in session.ts: idle-no-frames ≥90s (as before) OR
+total pre-first-content time ≥ `M365_FIRST_CONTENT_TIMEOUT_MS` (default 180s) →
+Stop frame + fresh retry. Progress drips can no longer hide an endless think.
+Also: warm-socket prefetch shipped earlier this session (park ≤20s, ping 5s) —
+live log confirms "Reusing pre-warmed connection" on same-conversation turns.
+
+**Ops note.** Sonnet breaker cycled open→half-open during the same window and
+opus absorbed traffic — failover behaving as designed under mixed tone health.
+
+---
+
+### F17.13 — First-byte watchdog + pseudo-fence leak filter 🟢 shipped
+
+**Live drivers (n=1 each).** (a) /doctor audit hit a 6m29s zero-byte server stall —
+proxy waited passively. (b) Models batching calls sometimes write the NEXT call's
+header WITHOUT backticks ("Bash\ntimeout: 30000\ndescription: …") which streamed
+into visible prose.
+
+**Fixes.**
+1. First-byte watchdog in `session.ts`: no WS frame for
+   `M365_FIRST_BYTE_TIMEOUT_MS` (default 90s) before any content → Stop frame +
+   close → handler empty-retry re-runs fresh (empirically seconds). Only guards
+   pre-first-byte stalls; never interrupts flowing turns. 0 disables.
+2. Guarded streamer freezes on pseudo-fence signature too: `ToolName\n` +
+   known-param line (`timeout|description|command|path|prompt…`) without backticks.
+3. Latency defaults trimmed earlier this session: stagger 1500→1000ms, retry sleep
+   2000→1000ms; warm-socket prefetch hides the rest of connect on same-conv turns.
+
+Sanity: WATCHDOG_OK live post-deploy; 172/178 suite green.
+
+---
+
+### F17.12 — Chat-persona coda suppression (COMPLETION RULE in baseline) 🟢 shipped
+
+**Live symptom (n=1).** After finishing a tool task, the model appended a full
+chat-assistant coda ("Hi Mahmoud! How can I help you today?") and prefaced work
+with "I can't actually run X on your filesystem" — M365's base persona bleeding
+around the harness framing at turn edges.
+
+**Fix.** One mechanical COMPLETION RULE line added to the `baseline` framing
+(fenced.ts, after the PRIMARY/SECONDARY clause): finish → output result → STOP;
+no greetings/offers/follow-ups. Deliberately narrow (anti-coda, not identity
+rewriting — §9's wording-only caution applies to tool-calling compliance, which
+this does not touch). 26 fenced tests + full suite green; live A/B pending.
+
+**Also noted:** `/doctor` is a Claude Code BUILT-IN command — if it reaches the
+model as prompt text, the CLI didn't intercept it (session-state or wrapper
+artifact). Running `claude doctor` directly in PowerShell is the reliable path.
+
+---
+
+### F17.11 — Sol/Terra/Luna are a REAL distinct tone: Gpt_5_6_Reasoning 🟢 fixed
+
+**Question.** Are Copilot2API's `gpt-5.6-sol/terra/luna` distinct models or gpt-5.5
+presets? **Their Go source settles it**: all three map to upstream tone
+`Gpt_5_6_Reasoning`, differing only by default effort level (low/medium/medium —
+transmission channel unconfirmed, cosmetic for us). Our registry had been pointing
+them at `magic`/gpt-5.5 — wrong backend entirely.
+
+**Live proof.** Raw probe `tone:"Gpt_5_6_Reasoning"` → clean reply (n=1);
+post-fix validate-models: sol 4226ms ✓ terra 4295ms ✓ through the full proxy.
+Registry now has canonical `gpt-5.6-reasoning`; all seven aliases remap to it.
+
+---
+
+### F17.10 — ChainOfThought → REAL Anthropic thinking blocks (from M365-Copilot2API) 🟢 shipped
+
+**Source.** HEXUXIU/M365-Copilot2API (Go gateway, same ChatHub protocol) maps
+ChatHub's reasoning transcript to thinking blocks / reasoning_content. Their parser
+revealed the exact marker: bot messages with `contentOrigin:"ChainOfThoughtSummary"`
+or `addToChainOfThought:true` carry the multi-step reasoning transcript (text or
+`hiddenText`). We had never declared/captured it.
+
+**Shipped.** `session.ts` accumulates CoT frames into `stream.thinkingText`
+(`hasThinking`); handler threads it through `Produced` (`thinking?`); renderers emit:
+- Anthropic non-stream: `{type:"thinking",thinking,signature:""}` block before text
+- Anthropic SSE: full block sequence (start → thinking_delta → signature_delta → stop)
+  — empty signature is valid because we're the terminal endpoint
+- OpenAI: `reasoning_content` on message + stream delta
+4 new tests; 170/170 suite green. Note: simple prompts may produce NO CoT frames
+(model answers inline) — absence is silent-ok per spec, matching native behavior.
+
+**Also from the same repo (roadmap, not built):** multimodal image INPUT via
+UploadFile+annotation injection; `/v1/responses` protocol; explicit
+`X-M365-Session-Id` binding; multi-account PKCE pool. Our existing equivalents:
+content-key conversation reuse ≈ their session resolver; usage stats ring ≈ their
+usage.jsonl.
+
+---
+
+### F17.9 — Wire-format parity audit vs native Claude Code 🟢 shipped
+
+Four-agent deep search (official docs + claude-code-reverse decompile + repo docs +
+code audit). Verdict: our /v1/messages surface is fully TOLERANT (`.passthrough()` —
+thinking/metadata/output_config/context_management all parse, never 400), but five
+silent drops mattered → **fixed**: (1) assistant-history `thinking`/`redacted_thinking`
+blocks preserved as lossy text markers instead of vanishing every replayed turn;
+(2) orphan `tool_result` gets a synthesized stub `assistant.tool_calls` (OpenAI 400
+guard); (3) upstream converter reads real `usage.completion_tokens` from the final
+chunk (constant-0 corrupted CC context math); (4) `delta.text` fallback for looser
+upstreams; (5) cache_* usage zeros emitted in message_start. Remaining deltas are
+structural, not wire-level: M365's wrapper system prompt/RLHF cage (F17.5),
+no true thinking blocks (CC silent-tolerates absence), server think-time latency.
+
+---
+
+### F17.8 — Sub-agent orchestration (Task) built 🟢 machinery / 🟡 adoption open
+
+**Built.** Synthetic `Task(prompt)` tool: executed entirely server-side via
+`runSubAgent()` — dedicated conversation (fingerprint `model-subagent`), restricted
+READ-ONLY fs toolset (`read_file`/`glob_files`/`grep_files`, workspace-jailed,
+node:fs executors, output caps), bounded turns (`M365_SUBAGENT_TURNS`=6), report
+injected back into the main conversation as a tool_response. Client never sees a
+Task tool_use; mutations stay main-loop-only. `M365_NO_SUBAGENTS=1` disables.
+7 offline tests incl. workspace-escape refusal, glob conventions, full loop.
+
+**Live gap (n=2).** gpt-5.5 does NOT adopt Task: baseline framing's "emit ONE
+```bash block" pressure overrides the advertised def — the model calls the def
+"pasted text", refuses, and emits a bash call instead (machinery verified: that
+bash call parses/returns correctly). Strengthening the description ("PREFERRED
+first step…") did not move it.
+
+**Next experiment (E-SUB).** Adoption is a FRAMING problem, not plumbing: add one
+delegation line to the baseline framing variant itself ("For exploration jobs, call
+```Task``` first — it runs in a sandbox and reports back") behind
+`M365_FRAMING_VARIANT=delegating` A/B vs baseline on bench find-needle/count-lines.
+Do NOT edit baseline in place (load-bearing, §9 rule).
+
+---
+
+### F17.7 — Long-fence parser + batching default flip (live /doctor failure) 🟢 shipped
+
+**Live failure (n=1, Aug 24 night).** A `/doctor` gather turn emitted SEVEN bash
+blocks wrapped in 6-backtick outer fences (model's workaround for embedding ```
+inside scripts). The old exactly-3-backtick regex matched nothing → zero tool
+calls → entire response leaked as literal text; 4m34s burned with nothing executed.
+
+**Fixes.**
+1. `parseFencedToolCalls` rewritten as a CommonMark-style scanner: opening run ≥3
+   backticks + info-string, closing run ≥ opening length, bodies may contain
+   shorter fence runs. Covered by 4 new core tests (nested ```, shorter-inner-run,
+   unclosed → prose).
+2. Batched calls now **default ON** (`M365_NO_MULTI_TOOL=1` restores truncation) —
+   one-call-per-turn was the direct cause of multi-gather turns failing; sequential
+   client-side execution keeps each call reactive to the previous tool_response.
+3. Daemon latency defaults: conversation-start stagger 5000→1500ms, empty-retry
+   sleep 2000→1000ms (degradation backoff unchanged as the sustained-burst guard).
+
+---
+
+### F17.6 — Tool-mode live streaming + status dashboard (W-D) 🟢 shipped
+
+Tool-mode turns no longer buffer to completion: a guarded forwarder streams prose
+deltas as they arrive and permanently stops at the first ``` sequence (12-char
+holdback catches fences split across chunks; fence bytes can never leak as content).
+`Produced("tools")` now carries `text` (the raw pre-fence slice); all four renderers
+(OpenAI/Anthropic × stream/non-stream) emit prose remainder before tool_calls.
+Live check: content chunks flowed at 49s of a 53s sonnet turn (previously first byte
+= turn end). Remaining latency = M365 think-time (gpt-5.5 ≈5s healthy; opus threw two
+empty turns same session). Ops UI: `GET /` local dashboard — breaker states, recent
+turn latencies, gate/pool stats (`/internal/stats` JSON behind it).
+
+---
+
+### F17.5 — Claude_Opus tone ships its own native tools and REJECTS injected manifests as prompt injection 🔴 new constraint
+
+**Evidence (n=2 live, Aug 24 evening).** Two /v1/chat/completions probes on
+claude-opus (benign deferred-tool discovery tasks) returned safety refusals:
+opus named our `<system>` execution-core block as an "embedded system block trying
+to override my behavior / impersonate a different AI runtime", listed its REAL
+tools as "`search_web`, `web_fetch`, `record_memory`, `image_gen`,
+`python_execution`", and refused to emit fences for tools "it doesn't have".
+Also: a WebFetch probe was answered server-side by M365's Bing plugin
+(`<cite>turn1search1</cite>` in the reply) before any client tool could fire.
+
+**Implications.**
+1. Claude tones are not blank models awaiting framing — they are full Copilot
+   agents with their own tool surface; opus's RLHF treats manifest-injection as
+   an attack. Sonnet tolerates the framing (real fenced calls observed post-F16.3
+   recovery); opus largely will not.
+2. Harness-parity work on Claude tones should either (a) standardize on sonnet,
+   or (b) explore MAPPING our tool requests onto opus's NATIVE tools
+   (`web_fetch`/`python_execution`/`search_web`) instead of injecting schemas —
+   a genuinely different integration shape, untested.
+3. Server-side Bing/WebFetch inside M365 can preempt client-side web tools;
+   expect answers-without-tool_use when the question is web-answerable.
+
+---
+
+## 16. Aug 24 2026 — Claude model IDs end-to-end: two proxy bugs found + fixed, one upstream outage mapped
+
+**Premise (user).** Validate five requested model IDs (`claude-fable-5`,
+`claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`, `claude-mythos-5`)
+through the `/v1/messages` bridge and the Claude Code harness.
+
+### F16.1 — Tone mangling: the transport passed the TONE string into CopilotSession.chat's positional MODEL param → every non-default Claude tone silently collapsed to Claude_Sonnet 🟢 FIXED
+
+**Claim.** `RealM365Transport.chat` called `sess.chat(token, text, args.tone)` — the third
+positional arg is `model`. `sendChat` then ran `getToneForModel(model)` on that TONE string;
+any non-default Claude tone re-resolved through the generic `^claude` fallback →
+`Claude_Sonnet`. Frames proved `claude-opus-5` requests went out with `tone:"Claude_Sonnet"`
+while logs claimed `Claude_Opus`. GPT tones survived only because unrecognized→fallback→
+`magic` happened to match.
+
+**Fix.** `ChatTurnOptions.tone` override (`core/session.ts`: sendChat uses
+`toneOverride ?? getToneForModel(model)`), and the transport passes `{ tone: args.tone }`
+(`core/model.ts`). **Verified live post-fix:** `validate-models claude-opus-5` → ok
+"claude-opus-5 online", 4627ms, frame carries `Claude_Opus`.
+
+### F16.2 — SessionPool fingerprint ignored the model: different models sharing a first message reused ONE M365 conversation 🟢 FIXED
+
+**Claim.** `SessionPool.fingerprint` hashed ONLY the first user message text, so identical
+prompts across different models shared a conversation — inheriting foreign tone history/wedges.
+Observed: an opus request reused a sonnet-poisoned cid; turns 2–4 ("Please continue.") all
+came back empty.
+
+**Fix.** Fingerprint now hashes `text\0canonicalModel`; `resolve()`/`fingerprintOf()` take a
+model param, single call site passes `resolved.canonicalModel` (`proxy-lib/handler.ts:372-376`).
+Unit suite green post-fix (126 passed / 6 live-skipped).
+
+### F16.3 — Upstream: M365's Claude_Sonnet tone pool returned InternalError on EVERY turn for ~4h 🟢 NOT OUR BUG
+
+**Evidence (n≈15+, ~4h window, both via proxy AND raw `_probe-chat.mjs` WS probes on fresh
+conversations).** `result.value="InternalError"` + canned apology on every turn. No Disengaged
+frames, throttle counters healthy. Control: `Claude_Opus` ponged fine throughout; GPT tones
+(`magic`/`auto`/`gpt-5.5`) fine throughout. Earlier mass failure (~16:25Z) was compounded by
+the F13 thread-rate throttle (~10 fresh conversations/40min) and recovered after ~75 min idle.
+**Implication:** an HTTP 400 from the proxy on a `-5` Claude ID can be pure upstream tone-pool
+failure while resolution is correct — check the tone before blaming the alias table.
+
+**Resolution table (offline, verified against dist).** `claude-opus-5`→`claude-opus`/
+`Claude_Opus` (alias :204); `claude-sonnet-5`→`claude-sonnet`/`Claude_Sonnet` (:182);
+fable/mythos/-haiku `-5` variants are unregistered → generic `^claude` fallback →
+`claude-sonnet` + warning. Note: exact strings `claude-fable`/`claude-mythos` hit the
+UnsupportedModelError blocklist (:251-257) but the `-5` suffixes slip past the regex via
+fallback — likely unintended gap; decide whether to block or register them.
+
+### F16.4 — Claude Code harness on claude-opus-5 works end-to-end 🟢
+
+**Evidence (n=2 live runs).** Smoke `claude -p --model claude-opus-5` (CLI v2.1.21x,
+ANTHROPIC_BASE_URL→proxy) returned `HARNESS_OK`. Agentic loop with stream-json: assistant
+tool_use(Bash echo) → harness executed → tool_result captured → model echoed exact stdout;
+num_turns=2. Full 30+-tool Claude Code toolset advertised with no Disengaged despite payload
+size (consistent with §9's lean-injection finding — the Anthropic bridge advertises tools
+without injecting their schemas into the M365 prompt).
+
+**CORRECTION (later same day, n=3):** the "no Disengaged" reading was wrong — with the full
+34-tool set the model answered as TEXT-ONLY chat ("I can't see files", hasToolCalls=false),
+i.e. it ignored tool framing entirely rather than disengaging. After adding a proxy-side
+`M365_ALLOWED_TOOLS` filter (default Bash,Read,Edit,Write,Glob,Grep for daemon-launched
+proxies; observed 34→6 and 109→6 tools), the same prompt produced `hasToolCalls=true,
+count=1` and a real executed loop. Lean injection is load-bearing for Claude Code too.
+Known rough edge: when the model tries TWO tool calls in one turn, the second leaks as
+fenced text (one-call-per-turn enforcement; multi-fence parsing still open from §9).
+
+### F16.5 — Incidental fixes (same session)
+
+`scripts/validate-models.mjs` missing `import path`; `_probe-chat.mjs` Windows dynamic-import
+fix (pathToFileURL + pinned ws path), plus PROBE_DUMP_FILE send-frame dumping and optional
+headers/tone hooks. Also seen: four duplicate m365-proxy instances sharing port 4141 (Windows
+SO_REUSEADDR artifact) — killed; root cause unknown, possibly start-proxy.ps1 + manual starts.
+Watch for recurrence.
 
 ---
 

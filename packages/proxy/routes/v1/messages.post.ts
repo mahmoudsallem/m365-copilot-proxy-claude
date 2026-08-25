@@ -26,9 +26,11 @@ export default defineEventHandler(async (event) => {
 
   const systemPromptSpec =
     (event.node?.req?.headers?.["x-m365-system-prompt"] as string | undefined) ?? undefined;
+  const sessionKey =
+    (event.node?.req?.headers?.["x-m365-session-id"] as string | undefined) ?? undefined;
 
   try {
-    return await handleAnthropicMessages(body, pool, { signal: controller.signal, systemPromptSpec });
+    return await handleAnthropicMessages(body, pool, { signal: controller.signal, systemPromptSpec, sessionKey });
   } catch (err: any) {
     console.error("[messages.post error]", err.stack || err);
     throw err;

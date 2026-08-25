@@ -16,7 +16,9 @@ export default defineEventHandler((event) => {
 
   if (process.env.M365_REQUIRE_API_KEY === "0") return;
 
-  const expectedKeys = Array.from(new Set([process.env.M365_PROXY_API_KEY ?? "m365", "m365"]));
+  // A configured key must be the ONLY accepted key — falling back to "m365"
+  // alongside it would silently keep a publicly-guessable credential valid.
+  const expectedKeys = [process.env.M365_PROXY_API_KEY ?? "m365"];
 
   const rawCandidates = [
     getHeader(event, "authorization"),
@@ -31,7 +33,10 @@ export default defineEventHandler((event) => {
 
   const isValid = tokens.some((token) => expectedKeys.some((exp) => equalSecret(token, exp)));
   if (!isValid) {
-    console.warn(`[api-auth] 401 Unauthorized for ${pathname}. Received headers:`, rawCandidates);
+    // Log only which credential headers were present — never their values.
+    const headerNames = ["authorization", "x-api-key", "api-key", "anthropic-api-key"]
+      .filter((name) => getHeader(event, name) != null);
+    console.warn(`[api-auth] 401 Unauthorized for ${pathname}. Credential headers present: ${headerNames.join(", ") || "none"}`);
     throw createError({ statusCode: 401, statusMessage: "Invalid proxy API key" });
   }
 });

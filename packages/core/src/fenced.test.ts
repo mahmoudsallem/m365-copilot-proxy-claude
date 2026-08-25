@@ -139,9 +139,48 @@ describe("parseFencedToolCalls", () => {
     expect(leftover).not.toContain("ls\n```");
   });
 
+  it("claude-code variant carries CC-grade sections", () => {
+    const out = formatFencedToolDefinitions([bash], "claude-code");
+    expect(out).toContain("# Environment");
+    expect(out).toContain("# Doing Tasks");
+    expect(out).toContain("NO emojis");
+    expect(out).toContain("file_path:line_number");
+    expect(out).toContain(process.cwd().replace(/\\/g, "/").split("/").pop() ?? "");
+  });
   it("parses multiple fenced calls", () => {
     const { calls } = parseFencedToolCalls("```read_file\na\n```\n```read_file\nb\n```", specs);
     expect(calls).toHaveLength(2);
+  });
+
+  it("parses LONG (4+) outer fences whose body contains ``` sequences", () => {
+    // Models wrap nested-markdown scripts in extra backticks — the /doctor case.
+    const text = [
+      "````bash",
+      "cat <<'EOF'",
+      "```markdown",
+      "# inner doc",
+      "```",
+      "EOF",
+      "````",
+    ].join("\n");
+    const { calls, leftover } = parseFencedToolCalls(text, specs);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].function.name).toBe("bash");
+    expect(JSON.parse(calls[0].function.arguments).command).toContain("# inner doc");
+    expect(leftover.includes("inner doc")).toBe(false); // fence fully consumed
+  });
+
+  it("does NOT let a shorter inner run close a longer fence", () => {
+    const text = "````bash\nnested:\n```not-a-close\nstill body\n````\n";
+    const { calls } = parseFencedToolCalls(text, specs);
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0].function.arguments).command).toContain("still body");
+  });
+
+  it("leaves an UNCLOSED long fence as prose (no call)", () => {
+    const text = "````bash\nnever closed...\n";
+    const { calls } = parseFencedToolCalls(text, specs);
+    expect(calls).toHaveLength(0);
   });
 
   it("drops an edit fence missing SEARCH/REPLACE markers", () => {

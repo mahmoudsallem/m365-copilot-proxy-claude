@@ -60,7 +60,10 @@ export class RealM365Transport implements ModelTransport {
     generateImages: boolean;
   }): Promise<CopilotStream> {
     const sess = this.ensure(args.agentId, args.sessionId, args.conversationId);
-    return sess.chat(args.token, args.text, args.tone, args.signal, { generateImages: args.generateImages });
+    // Pass the resolved tone explicitly — the positional `model` param would
+    // otherwise re-resolve the TONE string through getToneForModel and collapse
+    // every non-default Claude tone to Claude_Sonnet.
+    return sess.chat(args.token, args.text, args.tone, args.signal, { generateImages: args.generateImages, tone: args.tone });
   }
 
   reset(): void {

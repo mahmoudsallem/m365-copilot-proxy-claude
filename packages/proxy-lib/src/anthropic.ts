@@ -2,6 +2,10 @@ import { z } from "zod/v4";
 import { getAvailableModels, resolveModel } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
 import { handleChatCompletion, produceCompletion, outputFinishReason, type SessionPool } from "./handler.js";
+import { upstreamEnabled, handleUpstreamMessages } from "./upstream.js";
+import { createLogger } from "@m365-copilot/core";
+
+const log = createLogger("anthropic");
 
 const TextBlock = z.object({
   type: z.literal("text"),
@@ -106,7 +110,7 @@ function systemText(system: AnthropicBody["system"]): string {
   return String(system);
 }
 
-function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
+export function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
 
   // Collect system content from both the top-level `system` field and any
@@ -135,17 +139,30 @@ function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
     }
 
     if (message.role === "assistant") {
-      const text = message.content
-        .filter((block): block is z.infer<typeof TextBlock> => block.type === "text")
-        .map((block) => block.text)
-        .join("\n");
-      const toolCalls = message.content
-        .filter((block): block is z.infer<typeof ToolUseBlock> => block.type === "tool_use")
-        .map((block) => ({
-          id: block.id,
-          type: "function" as const,
-          function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
-        }));
+      const textParts: string[] = [];
+      const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+      for (const block of message.content) {
+        if (block.type === "text") {
+          const t = (block as z.infer<typeof TextBlock>).text;
+          if (t) textParts.push(t);
+        } else if (block.type === "tool_use") {
+          const tb = block as z.infer<typeof ToolUseBlock>;
+          toolCalls.push({
+            id: tb.id,
+            type: "function" as const,
+            function: { name: tb.name, arguments: JSON.stringify(tb.input ?? {}) },
+          });
+        } else if (block.type === "thinking" || block.type === "redacted_thinking") {
+          // Claude Code replays prior thinking blocks verbatim; OpenAI-format
+          // upstreams have no slot for them. Preserve the reasoning CONTEXT as a
+          // lossy text marker instead of dropping it silently.
+          const think = block as { type: string; thinking?: string; data?: string };
+          const body = think.thinking ?? "[reasoning withheld]";
+          textParts.push(`[previous reasoning (${block.type})]: ${body.slice(0, 2000)}`);
+        }
+        // Unknown block types: tolerated + dropped (IgnoredBlock catch-all).
+      }
+      const text = textParts.join("\n");
       messages.push({
         role: "assistant",
         content: text || null,
@@ -167,6 +184,22 @@ function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] {
       } else if (block.type === "tool_result") {
         flushText();
         const result = textFromUnknown(block.content);
+        // Orphan guard: OpenAI backends 400 when a `tool` message has no
+        // preceding assistant tool_call (e.g. history was trimmed). Synthesize
+        // a stub assistant turn so the pair stays valid.
+        const prev = messages[messages.length - 1];
+        const prevCalls = prev?.role === "assistant" ? (prev as { tool_calls?: Array<{ id: string }> }).tool_calls : undefined;
+        if (!prevCalls?.some((c) => c.id === block.tool_use_id)) {
+          messages.push({
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: block.tool_use_id,
+              type: "function" as const,
+              function: { name: "unknown_tool", arguments: "{}" },
+            }],
+          });
+        }
         messages.push({
           role: "tool",
           tool_call_id: block.tool_use_id,
@@ -209,6 +242,7 @@ export function toOpenAIChatRequest(body: AnthropicBody) {
     stream: false,
     max_tokens: body.max_tokens,
     temperature: body.temperature,
+    stop: (body as any).stop_sequences,
     tools: body.tools?.map((tool) => ({
       type: "function",
       function: {
@@ -373,6 +407,8 @@ export interface HandleAnthropicOptions {
   signal?: AbortSignal;
   /** Opt-in system-prompt spec (see core/prompts.ts). Falls back to M365_SYSTEM_PROMPT env. */
   systemPrompt?: string;
+  /** Caller conversation identity (x-m365-session-id header) — isolates the M365 thread per caller. */
+  sessionKey?: string;
 }
 
 /** Rough output-token estimate — M365 exposes no tokenizer (see handler buildUsage notes). */
@@ -394,18 +430,24 @@ async function completeAnthropic(
   const { produced, usage } = await produceCompletion(chat, pool, {
     signal: opts.signal,
     systemPromptSpec: opts.systemPrompt,
+    sessionKey: opts.sessionKey,
   });
   if (produced.kind === "error") return { error: produced.resp };
 
   const inputTokens = estimateAnthropicInputTokens(body);
 
   if (produced.kind === "tools") {
-    const content = produced.toolCalls.map((tc) => ({
-      type: "tool_use" as const,
-      id: String(tc.id),
-      name: String(tc.function?.name ?? "unknown"),
-      input: parseToolInput(String(tc.function?.arguments ?? "{}")),
-    }));
+    const carried = typeof produced.text === "string" ? produced.text : "";
+    const content: AnthropicMessageResponse["content"] = [
+      ...(produced.thinking ? [{ type: "thinking" as const, thinking: produced.thinking, signature: "" }] : []),
+      ...(carried.trim() ? [{ type: "text" as const, text: carried }] : []),
+      ...produced.toolCalls.map((tc) => ({
+        type: "tool_use" as const,
+        id: String(tc.id),
+        name: String(tc.function?.name ?? "unknown"),
+        input: parseToolInput(String(tc.function?.arguments ?? "{}")),
+      })),
+    ];
     const outChars = produced.toolCalls.reduce(
       (n, tc) => n + tc.function.name.length + String(tc.function.arguments ?? "").length + 20, 0);
     return {
@@ -424,16 +466,25 @@ async function completeAnthropic(
   }
 
   const text = produced.text;
+  const content: AnthropicMessageResponse["content"] = [
+    ...(produced.thinking ? [{ type: "thinking" as const, thinking: produced.thinking, signature: "" }] : []),
+    { type: "text", text },
+  ];
   return {
     message: {
       id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
       type: "message",
       role: "assistant",
       model: body.model,
-      content: [{ type: "text", text }],
+      content,
       stop_reason: outputFinishReason(text) === "length" ? "max_tokens" : "end_turn",
       stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: estimateOutputTokens(text) },
+      usage: {
+        input_tokens: inputTokens,
+        output_tokens: estimateOutputTokens(text),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
       m365: usage,
     } as AnthropicMessageResponse & { m365?: unknown },
   };
@@ -447,6 +498,20 @@ export async function handleAnthropicMessages(
 ): Promise<Response> {
   const options: HandleAnthropicOptions = opts instanceof AbortSignal ? { signal: opts } : opts;
 
+  // Visibility: Claude Code sends fields we deliberately don't emulate (thinking
+  // budgets, metadata.user_id, output_config.effort, context_management…). Log
+  // once per request so operators can see what's being ignored.
+  const ignored = (["thinking", "metadata", "output_config", "context_management"] as const)
+    .filter((k) => (body as Record<string, unknown>)[k] !== undefined);
+  if (ignored.length > 0) {
+    log.info(`Ignoring Anthropic-only request field(s): ${ignored.join(", ")} (M365 backend has no equivalent)`);
+  }
+
+  // Generic OpenAI-upstream mode (OPENAI_UPSTREAM_BASE_URL set).
+  if (upstreamEnabled()) {
+    return handleUpstreamMessages(body, options.signal);
+  }
+
   if (!body.stream) {
     const result = await completeAnthropic(body, pool, options);
     if ("error" in result) return anthropicErrorFromUpstream(result.error);
@@ -459,6 +524,8 @@ export async function handleAnthropicMessages(
       const send = (name: string, data: unknown) => controller.enqueue(encoder.encode(event(name, data)));
       const heartbeat = setInterval(() => {
         try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch {}
+        // Native CC also tolerates ping events; send both for maximum compat.
+        try { controller.enqueue(encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`)); } catch {}
       }, 15_000);
 
       let nextIndex = 0;
@@ -495,13 +562,19 @@ export async function handleAnthropicMessages(
             content: [],
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: estimateAnthropicInputTokens(body), output_tokens: 0 },
+            usage: {
+            input_tokens: estimateAnthropicInputTokens(body),
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
           },
         });
 
         const chat = toOpenAIChatRequest(body);
         const { produced, usage } = await produceCompletion(chat, pool, {
           signal: options.signal,
+          sessionKey: options.sessionKey,
           // Live passthrough: every upstream delta becomes a text_delta AS IT ARRIVES.
           onTextDelta: (delta) => {
             if (!delta) return;
@@ -531,7 +604,33 @@ export async function handleAnthropicMessages(
         } else if (produced.kind === "tools") {
           stopReason = "tool_use";
           outputChars = 0;
+          // Emit the un-streamed remainder of the carried prose, if any.
+          const carried = typeof produced.text === "string" ? produced.text : "";
+          let remainder = "";
+          if (carried) {
+            outputChars += carried.length;
+            if (carried.startsWith(sent)) {
+              remainder = carried.slice(sent.length);
+            } else {
+              remainder = carried; // diverged — resend authoritatively
+              log.info(`Tool-mode streamed prefix diverged from carried text (sent ${sent.length}, carried ${carried.length} chars)`);
+            }
+          }
           closeOpenBlocks();
+          if (remainder) {
+            const index = openTextBlock();
+            send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: remainder } });
+          }
+          closeOpenBlocks();
+          // ChainOfThought → real Anthropic thinking block (F17.10). signature is
+          // empty: we're the terminal endpoint, nothing will verify it upstream.
+          if (produced.thinking) {
+            const index = nextIndex++;
+            send("content_block_start", { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } });
+            send("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: produced.thinking } });
+            send("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: "" } });
+            send("content_block_stop", { type: "content_block_stop", index });
+          }
           for (const tc of produced.toolCalls) {
             const argsJson = String(tc.function.arguments ?? "{}");
             outputChars += tc.function.name.length + argsJson.length + 20;
@@ -552,6 +651,14 @@ export async function handleAnthropicMessages(
           const finalText = produced.text ?? "";
           stopReason = outputFinishReason(finalText) === "length" ? "max_tokens" : "end_turn";
           outputChars = finalText.length;
+          // ChainOfThought → thinking block (F17.10), emitted ahead of text.
+          if (produced.thinking && !sent.includes(produced.thinking.slice(0, 40))) {
+            const index = nextIndex++;
+            send("content_block_start", { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } });
+            send("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: produced.thinking } });
+            send("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: "" } });
+            send("content_block_stop", { type: "content_block_stop", index });
+          }
           // Three-way prefix comparison: produceCompletion returns TRIMMED text while
           // live deltas carried the raw stream, so `sent` may be slightly LONGER than
           // finalText (trailing whitespace) without being a real divergence.

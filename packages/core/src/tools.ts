@@ -269,6 +269,21 @@ const CONFABULATION_PATTERNS: RegExp[] = [
   // ("unable to execute or retrieve any output") and they were absent from the list.
   /(?:unable|not able|can.?t|cannot)\s+(?:to\s+)?(?:access|inspect|list|read|run|execute|retrieve|fetch|locate|see|open)/i,
   /don.?t\s+have\s+access/i,
+  // F17.12 live captures (/doctor refusal): long-distance "can't run X because
+  // no access to your filesystem" + "requires access to" phrasings that the
+  // {0,60} window missed.
+  /can.?t\s+actually\s+run/i,
+  /(?:don.?t|do\s+not)\s+have\s+access\s+to\s+your\s+(?:local\s+)?(?:filesystem|machine|computer|files?\b)/i,
+  /requires?\s+(?:read\s+|direct\s+)?access\s+to\s+(?:your|the|items?|local)/i,
+  /from\s+(?:here|this\s+chat|this\s+session)[,.]/i,
+  /(?:can.?t|cannot)\s+(?:actually\s+)?produce\b/i,
+  /needs?\s+to\s+be\s+executed\s+inside\b/i,
+  /don.?t\s+have\s+access\s+to\s+your\s+local\s+claude/i,
+  /audit\s+you\s+pasted/i,
+  // F17.12: "I can't actually run X / do not have access to your machine/filesystem"
+  // — the M365 persona's refusal shape when it doubts the harness is real.
+  /(?:can.?t|cannot|do\s+not|don.?t)\s+(?:actually\s+)?(?:run|execute|perform|inspect|access)[^.\n]{0,60}(?:your\s+)?(?:machine|computer|filesystem|local\s+files?|this\s+conversation)/i,
+  /(not|never)\s+(?:a\s+)?(?:real\s+)?(?:tool|i\s+have)[^.\n]{0,40}(?:available|listed)/i,
   /no\s+(?:longer\s+have|access\s+to)/i,   // "no access to" + "no longer have access/the tools"
   /lost\s+(?:access|my\s+access|the\s+ability)/i,
   // Mid-conversation give-up (F12.11, magic model): after a real tool call it claims
@@ -341,6 +356,8 @@ export function looksLikeConfabulation(text: string | null): boolean {
   if (!text) return false;
   const t = text.trim();
   if (t.length < 12) return false;
+  const head = t.length > 600 ? t.slice(0, 600) : t;
+  if (CONFABULATION_PATTERNS.some((re) => re.test(head))) return true;
   return CONFABULATION_PATTERNS.some((re) => re.test(t));
 }
 
@@ -356,17 +373,26 @@ export function looksLikeConfabulation(text: string | null): boolean {
  * ≥2 fences AND (≥120 chars of surrounding prose OR ≥4 fences). A SINGLE action
  * is never reclassified regardless of prose, so the coding loop is untouched.
  */
-export function isProseDocument(parsed: ParseResult): boolean {
+export function isProseDocument(parsed: ParseResult, knownToolNames?: Set<string>): boolean {
   if (!parsed.hasToolCalls || parsed.toolCalls.length < 2) return false;
   const prose = parsed.textContent ? parsed.textContent.trim() : "";
   // Distinguish a coding-agent ACTION turn from a written DOCUMENT.
-  //   ACTION  (execute it): a short preamble + a couple command fences, e.g. Claude's
-  //           "I'll inspect the files first.\n```bash ls```\n```bash cat```" — common,
-  //           must NOT be reclassified or we eat real tool calls (docs §10 F23).
+  //   ACTION  (execute it): short preamble + command fences using KNOWN tool names.
+  //           With batched calls default ON, models naturally emit 4+ fences per
+  //           gather turn (/doctor sweeps). These must NEVER be reclassified.
   //   DOCUMENT (return as text): the model ANSWERING with markdown full of fences
-  //           (F15: "here's a simplified README") — it carries document signatures:
-  //           markdown headers, lots of prose, or many fences.
-  // Flag only documents. (Old heuristic was prose≥120, which ate Claude's preambles.)
+  //           that reference UNKNOWN tools (illustrations, not actions).
+  // If every parsed call matches a known tool name, it's an action turn regardless
+  // of count. Only unknown-name fences + document signatures trigger reclassification.
+  if (knownToolNames && knownToolNames.size > 0) {
+    const unknownCalls = parsed.toolCalls.filter(
+      (c) => !knownToolNames.has(c.function?.name ?? "")
+    );
+    // All calls match known tools → genuine action turn, never a document.
+    if (unknownCalls.length === 0) return false;
+    // Mixed: some unknown → only flag if the unknown ones dominate.
+    if (unknownCalls.length < parsed.toolCalls.length / 2) return false;
+  }
   const hasMarkdownHeaders = /^#{1,6}\s/m.test(prose);
   return parsed.toolCalls.length >= 4 || hasMarkdownHeaders || prose.length >= 300;
 }

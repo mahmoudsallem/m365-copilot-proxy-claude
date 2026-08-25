@@ -135,6 +135,15 @@ export const CANONICAL_MODELS: Record<string, ModelConfig> = {
     supportsTools: true,
     toolMode: "agent",
   },
+  "gpt-5.6-reasoning": {
+    canonicalModel: "gpt-5.6-reasoning",
+    displayName: "GPT-5.6 Reasoning",
+    tone: "Gpt_5_6_Reasoning",
+    backendFamily: "gpt",
+    supportsAgent: false,
+    supportsTools: true,
+    toolMode: "fenced",
+  },
   "think-deeper": {
     canonicalModel: "think-deeper",
     displayName: "GPT Reasoning",
@@ -214,14 +223,16 @@ export const MODEL_ALIASES: Record<string, string> = {
   "claude-haiku-4-5-20250514": "claude-sonnet",
   "claude-3-5-haiku-20241022": "claude-sonnet",
 
-  // GPT-5.6 / Sol / Terra / Luna presets (backed by gpt-5.5)
-  "gpt-5.6": "gpt-5.5",
-  "gpt-5.6-sol": "gpt-5.5",
-  "gpt-5.6-terra": "gpt-5.5",
-  "gpt-5.6-luna": "gpt-5.5",
-  sol: "gpt-5.5",
-  terra: "gpt-5.5",
-  luna: "gpt-5.5",
+  // GPT-5.6 / Sol / Terra / Luna — REAL distinct upstream tone Gpt_5_6_Reasoning
+  // (verified live; tone accepted where gpt-5.5=magic. Effort presets low/medium
+  // are cosmetic until an effort-transmission channel is confirmed.)
+  "gpt-5.6": "gpt-5.6-reasoning",
+  "gpt-5.6-sol": "gpt-5.6-reasoning",
+  "gpt-5.6-terra": "gpt-5.6-reasoning",
+  "gpt-5.6-luna": "gpt-5.6-reasoning",
+  sol: "gpt-5.6-reasoning",
+  terra: "gpt-5.6-reasoning",
+  luna: "gpt-5.6-reasoning",
 
   // Codex presets
   codex: "gpt-5.5",
@@ -336,6 +347,9 @@ export interface CapturedImage {
 export interface CopilotStream {
   [Symbol.asyncIterator](): AsyncIterator<string>;
   fullText: string;
+  /** ChainOfThought reasoning transcript for this turn (null when absent). */
+  thinkingText?: string | null;
+  hasThinking?: boolean;
   images: CapturedImage[];
   hasContent: boolean;
   throttle: { current: number; max: number } | null;

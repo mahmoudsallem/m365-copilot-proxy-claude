@@ -117,3 +117,10 @@ export {
 } from "./tools.js";
 
 export { createLogger, trunc, LOG_PATH } from "./log.js";
+
+export {
+  formatFencedToolDefinitions,
+  deriveFencedSpec,
+  parseFencedToolCalls,
+  FRAMING_VARIANT_NAMES,
+} from "./fenced.js";

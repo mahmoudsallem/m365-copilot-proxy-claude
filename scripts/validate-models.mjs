@@ -11,6 +11,7 @@
 // generous cooldown between probes (--cooldown-ms, default 15000). Requires
 // --yes so it can never burn quota from an accidental loop.
 import fs from "node:fs";
+import path from "node:path";
 
 const args = process.argv.slice(2);
 function arg(name, fallback) {

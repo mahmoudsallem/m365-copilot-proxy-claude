@@ -31,5 +31,7 @@ export default defineEventHandler(async (event) => {
   // when stream:true). Returning it directly lets h3 forward it untouched.
   const systemPromptSpec =
     (event.node?.req?.headers?.["x-m365-system-prompt"] as string | undefined) ?? undefined;
-  return handleChatCompletion(body, pool, { signal: ac.signal, systemPromptSpec });
+  const sessionKey =
+    (event.node?.req?.headers?.["x-m365-session-id"] as string | undefined) ?? undefined;
+  return handleChatCompletion(body, pool, { signal: ac.signal, systemPromptSpec, sessionKey });
 });

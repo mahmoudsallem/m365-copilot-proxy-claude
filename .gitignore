@@ -45,3 +45,11 @@ scripts/harness/out/
 vendor/
 proxy.stdout.log
 proxy.stderr.log
+
+.proxy.pid
+
+# spec workflow artifacts
+.claude/specs/
+
+# machine-local claude config
+.claude/

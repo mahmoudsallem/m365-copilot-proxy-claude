@@ -14,10 +14,14 @@
 //   elapsedMs, frameCount, error
 // }
 
+import { pathToFileURL } from "node:url";
+import { join } from "node:path";
+import { appendFileSync } from "node:fs";
+
 const RS = "\x1E";
 
 const ROOT = process.cwd();
-const wsMod = await import(`${ROOT}/node_modules/.pnpm/ws@8.20.0/node_modules/ws/wrapper.mjs`);
+const wsMod = await import(pathToFileURL(join(ROOT, "node_modules/.pnpm/ws@8.21.1/node_modules/ws/wrapper.mjs")).href);
 const WebSocket = wsMod.default ?? wsMod.WebSocket;
 
 const BASE_ALLOWED = [
@@ -53,6 +57,7 @@ export function oneTurn(o) {
     extraAllowed = [],                // extra allowedMessageTypes (GeneratedCode, …)
     plugins = undefined,              // override plugins; default = BingWebSearch (or [] to disable search)
     variants = VARIANTS,              // override the WS-query variants flag list (string)
+    headers = undefined,              // extra WS-upgrade headers
   } = o;
 
   const sessionId = crypto.randomUUID();
@@ -133,6 +138,7 @@ export function oneTurn(o) {
       headers: {
         "Origin": "https://m365.cloud.microsoft",
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+        ...(headers ?? {}),
       },
     });
 
@@ -200,7 +206,15 @@ export function oneTurn(o) {
 
         if (!handshakeDone) {
           handshakeDone = true;
-          ws.send(JSON.stringify(chatMsg) + RS + JSON.stringify(metrics) + RS);
+          const outbound = [JSON.stringify(chatMsg), JSON.stringify(metrics)].join(RS) + RS;
+          if (process.env.PROBE_DUMP_FILE) {
+            try {
+              appendFileSync(process.env.PROBE_DUMP_FILE,
+                JSON.stringify({ t: Date.now(), dir: "send", frame: chatMsg }) + "\n" +
+                JSON.stringify({ t: Date.now(), dir: "send", frame: metrics }) + "\n");
+            } catch {}
+          }
+          ws.send(outbound);
           continue;
         }
 

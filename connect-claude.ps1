@@ -46,8 +46,10 @@ if ($selectedModel -match '^(sol|terra|luna|codex|openai-codex|gpt-codex|codex-5
 $apiKey = if ($env:M365_PROXY_API_KEY) { $env:M365_PROXY_API_KEY } else { "m365" }
 
 $env:ANTHROPIC_BASE_URL = $proxyUrl
+# AUTH_TOKEN only — setting ANTHROPIC_API_KEY too makes Claude Code warn about
+# ambiguous auth ("Both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY set").
 $env:ANTHROPIC_AUTH_TOKEN = $apiKey
-$env:ANTHROPIC_API_KEY = $apiKey
+Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:ANTHROPIC_MODEL = $selectedModel
 $env:ANTHROPIC_SMALL_FAST_MODEL = $selectedModel
 $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"

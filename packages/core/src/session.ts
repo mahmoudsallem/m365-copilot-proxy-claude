@@ -176,6 +176,9 @@ export interface ChatTurnOptions {
    *  optionsSets + the GenerateGraphicArt allowedMessageType; the generated
    *  images surface on `stream.images`. Agent-less only. */
   generateImages?: boolean;
+  /** Explicit tone for this turn. Takes precedence over getToneForModel(model)
+   *  so callers that already resolved a model never get re-mangled. */
+  tone?: string;
 }
 
 export interface CopilotSessionOptions {
@@ -199,6 +202,13 @@ export class CopilotSession {
   private _turnCount = 0;
   private agentId?: string;
   private nativeActions?: NativeActionConfig;
+  // Warm-socket prefetch (latency): a pre-opened, handshake-completed WebSocket
+  // for THIS conversation, parked right after the previous turn ends so the next
+  // turn skips the ~0.3–3s TLS+upgrade connect. Server closes post-turn sockets
+  // itself (type:7), so this is always a FRESH connection opened early — never a
+  // reused dead one. Disable: M365_NO_WS_PREFETCH=1.
+  private pendingConn: { ws: WebSocket; requestId: string; keepalive?: NodeJS.Timeout } | null = null;
+  private lastToken: string | null = null;
 
   constructor(options?: CopilotSessionOptions) {
     this.sessionId = options?.sessionId ?? crypto.randomUUID();
@@ -214,6 +224,91 @@ export class CopilotSession {
   }
 
   /**
+   * Open a fresh socket for the NEXT turn and park it (handshake completed,
+   * ping-serviced, 20s idle self-close). Called right after a turn's socket
+   * closes so the TLS+upgrade cost overlaps the client's tool-execution gap.
+   */
+  private scheduleWarmSocket(): void {
+    if (process.env.M365_NO_WS_PREFETCH === "1") return;
+    if (!this.lastToken) return;
+    try { this.pendingConn?.ws.close(); } catch {}
+    this.pendingConn = null;
+    const requestId = crypto.randomUUID();
+    setTimeout(() => { void this.openWarm(requestId); }, 30);
+  }
+
+  private async openWarm(requestId: string): Promise<void> {
+    if (!this.lastToken || this.pendingConn) return;
+    const token = this.lastToken;
+    const claims = decodeJwt(token);
+    const params = new URLSearchParams({
+      chatsessionid: requestId,
+      clientrequestid: requestId,
+      "X-SessionId": this.sessionId,
+      ConversationId: this.conversationId,
+      access_token: token,
+      variants: VARIANTS,
+      source: '"officeweb"',
+      product: "Office",
+      agentHost: "Bizchat.FullScreen",
+      licenseType: "Starter",
+      agent: "web",
+      scenario: "OfficeWebIncludedCopilot",
+    });
+    const wsUrl = `wss://substrate.office.com/m365Copilot/Chathub/${claims.oid}@${claims.tid}?${params}`;
+    const t0 = performance.now();
+    await new Promise<void>((resolve) => {
+      const ws = new WebSocket(wsUrl, {
+        headers: {
+          "Origin": "https://m365.cloud.microsoft",
+          "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+        },
+      });
+      let settled = false;
+      let ready = false;
+      let idle: NodeJS.Timeout | null = null;
+      const cleanup = () => {
+        if (idle) { clearTimeout(idle); idle = null; }
+        try { ws.close(); } catch {}
+        if (this.pendingConn?.ws === ws) this.pendingConn = null;
+        settled = true;
+        resolve();
+      };
+      // Idle TTL: an unused parked socket is worthless after ~20s.
+      idle = setTimeout(() => { log.info("Warm socket expired unused"); cleanup(); }, 20_000);
+      ws.on("open", () => {
+        ws.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
+      });
+      ws.on("message", (data: WebSocket.RawData) => {
+        const raw = data.toString().split(RS).filter((f) => f.length > 0);
+        for (const frame of raw) {
+          let parsed: any;
+          try { parsed = JSON.parse(frame); } catch { continue; }
+          if (!ready) {
+            ready = true;
+            this.pendingConn = { ws, requestId };
+            // Keep-alive: server culls idle sockets FAST (<5s observed) — send
+            // the first ping immediately, then every 5s.
+            try { ws.send(JSON.stringify({ type: 6 }) + RS); } catch {}
+            const keepalive = setInterval(() => {
+              try { ws.send(JSON.stringify({ type: 6 }) + RS); } catch {}
+            }, 5_000);
+            if (this.pendingConn) this.pendingConn.keepalive = keepalive;
+            log.info(`Warm connection parked in ${Math.round(performance.now() - t0)}ms`);
+          } else if (parsed.type === 6) {
+            ws.send(JSON.stringify({ type: 6 }) + RS);
+          } else if (parsed.type === 7 || parsed.type === 3) {
+            cleanup(); return;
+          }
+          if (ready && !settled) resolve(); // parking done; keep servicing pings
+        }
+      });
+      ws.on("error", (e: Error) => { log.info("Warm socket error:", e.message); if (!settled) cleanup(); else { if (this.pendingConn?.ws === ws) this.pendingConn = null; } });
+      ws.on("close", () => { if (!settled) { cleanup(); } else { log.info("Warm socket closed by server"); if (this.pendingConn?.ws === ws) this.pendingConn = null; } });
+    }).catch(() => {});
+  }
+
+  /**
    * Send a message in this conversation and stream the response.
    * Each turn opens a fresh WebSocket with invocationId "0" (per SignalR protocol).
    * Session/conversation IDs are reused so M365 maintains server-side context.
@@ -222,6 +317,27 @@ export class CopilotSession {
     const isFirst = this._turnCount === 0;
     this._turnCount++;
     const wantImages = opts?.generateImages ?? false;
+    this.lastToken = token;
+    // Explicit per-turn tone from the transport (ModelSession already resolved
+    // the model). Without this, getToneForModel(model) re-resolves whatever
+    // string the caller passed in `model` — and when callers pass a TONE here
+    // (as RealM365Transport did), every non-default Claude tone collapsed to
+    // the generic `claude-*` fallback (Claude_Sonnet).
+    const toneOverride = opts?.tone;
+    // Consume a pre-warmed connection if one is parked and ready.
+    let warmWs: WebSocket | null = null;
+    if (this.pendingConn?.ws.readyState === WebSocket.OPEN) {
+      warmWs = this.pendingConn.ws;
+      if (this.pendingConn.keepalive) clearInterval(this.pendingConn.keepalive);
+      warmWs.removeAllListeners();
+      this.pendingConn = null;
+      log.info("Reusing pre-warmed connection (connect cost skipped)");
+    } else {
+      const why = this.pendingConn ? "server closed it" : "none parked";
+      try { this.pendingConn?.ws.close(); } catch {}
+      this.pendingConn = null;
+      if (why !== "none parked") log.info("Warm connection lost:", why);
+    }
 
     log.info(`Chat turn ${this._turnCount - 1}: model=${model}, isFirst=${isFirst}, text=${JSON.stringify(trunc(text, 200))}`);
 
@@ -255,6 +371,8 @@ export class CopilotSession {
       // concatenate deltas — we fold both into this one string. See `advance`.
       let answer = "";
       let receivedContent = false;
+      let thinkingText = "";
+      let receivedThinking = false;
       let throttleInfo: { current: number; max: number } | null = null;
       let contentOrigin: string | null = null;
       let messageType: string | null = null;
@@ -377,6 +495,12 @@ export class CopilotSession {
         get turnState() {
           return turnState;
         },
+        get thinkingText() {
+          return receivedThinking ? thinkingText : null;
+        },
+        get hasThinking() {
+          return receivedThinking;
+        },
         get images() {
           return [...imagesByToken.values()];
         },
@@ -404,7 +528,7 @@ export class CopilotSession {
         },
       };
 
-      const ws = new WebSocket(wsUrl, {
+      const ws: WebSocket = warmWs ?? new WebSocket(wsUrl, {
         headers: {
           "Origin": "https://m365.cloud.microsoft",
           "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
@@ -414,8 +538,15 @@ export class CopilotSession {
         },
       });
 
-      let handshakeDone = false;
+      // A pre-warmed socket already completed the SignalR handshake — adopt it
+      // and fire the chat invocation immediately.
+      let handshakeDone = !!warmWs;
       let stopped = false;
+      if (warmWs) {
+        const sendWhenReady = () => sendChat();
+        if (ws.readyState === WebSocket.OPEN) sendWhenReady();
+        else ws.once("open", sendWhenReady);
+      }
 
       // Cancellation: when the caller's signal aborts (HTTP client disconnected),
       // cancel the in-flight M365 turn the same way the real UI does — send the
@@ -444,12 +575,47 @@ export class CopilotSession {
       }
       const clearAbort = () => signal?.removeEventListener("abort", onAbort);
 
+      // F17.13 watchdog: M365 occasionally stalls a turn with ZERO bytes for
+      // minutes ("Thought for 6m29s"). If no frame arrives within
+      // M365_FIRST_BYTE_TIMEOUT_MS (default 90s), send Stop and drop the socket
+      // — the handler's empty-retry then re-runs on a fresh conversation, which
+      // empirically completes in seconds. Only guards PRE-first-byte stalls;
+      // once content flows we never interrupt.
+      const firstByteTimeout = Number(process.env.M365_FIRST_BYTE_TIMEOUT_MS ?? 90_000);
+      // Hard cap on TOTAL pre-first-content time. Progress/keepalive frames
+      // reset the idle timer, so a "Thinking…" stall that drips EarlyProgress
+      // would otherwise never trip the idle branch (observed: 3.1min ttft).
+      const firstContentHardCap = Number(process.env.M365_FIRST_CONTENT_TIMEOUT_MS ?? 180_000);
+      const turnStartWall = Date.now();
+      let lastFrameAt = Date.now();
+      let watchdog: NodeJS.Timeout | null = null;
+      let watchdogFired = false;
+      if (firstByteTimeout > 0 || firstContentHardCap > 0) {
+        watchdog = setInterval(() => {
+          if (stopped || receivedContent || watchdogFired) return;
+          const idleHit = firstByteTimeout > 0 && Date.now() - lastFrameAt >= firstByteTimeout;
+          const capHit = firstContentHardCap > 0 && Date.now() - turnStartWall >= firstContentHardCap;
+          if (!idleHit && !capHit) return;
+          watchdogFired = true;
+          const reason = capHit ? "no content within hard cap" : "no frames (idle)";
+          log.warn(`Watchdog: ${reason} after ${Math.round((Date.now() - turnStartWall) / 1000)}s — Stop frame + fresh retry`);
+          try {
+            if (ws.readyState === WebSocket.OPEN) {
+              dumpFrame(requestId, { target: "stop", type: 1 }, "send");
+              ws.send(STOP_FRAME);
+            }
+          } catch {}
+          setTimeout(() => { try { ws.close(); } catch {} }, 1_000);
+        }, 5_000);
+      }
+
       ws.on("open", () => {
+        lastFrameAt = Date.now();
         log.debug("WS connected, sending handshake");
         ws.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
       });
-
       ws.on("message", (data: WebSocket.RawData) => {
+        lastFrameAt = Date.now();
         const raw = data.toString();
         log.debug("WS recv:", trunc(raw, 500));
         const frames = raw.split(RS).filter((f) => f.length > 0);
@@ -495,9 +661,12 @@ export class CopilotSession {
 
       ws.on("close", () => {
         clearAbort();
+        if (watchdog) clearInterval(watchdog);
         log.info("WS closed, answer length:", answer.length);
         log.debug("Final response:", trunc(answer, 1000));
         onDone();
+        // Warm the NEXT turn's connection while the client processes results.
+        this.scheduleWarmSocket();
       });
 
       const sendChat = () => {
@@ -615,7 +784,7 @@ export class CopilotSession {
                   }
                 : {}),
               isSbsSupported: true,
-              tone: getToneForModel(model),
+              tone: toneOverride ?? getToneForModel(model),
               renderReferencesBehindEOS: true,
               disconnectBehavior: "continue",
         };
@@ -764,6 +933,18 @@ export class CopilotSession {
                   }
                   if (typeof m.turnCount === "number") turnCountServer = m.turnCount;
                   if (m.turnState) turnState = m.turnState;
+                  // ChainOfThought (F17.10): ChatHub marks the model's multi-step
+                  // reasoning transcript via contentOrigin="ChainOfThoughtSummary"
+                  // or addToChainOfThought=true (verified against M365-Copilot2API's
+                  // chathub parser + live frames). Capture it separately from the
+                  // answer so the Anthropic bridge can emit REAL thinking blocks.
+                  const cotFlag = m.addToChainOfThought === true;
+                  const cotOrigin = m.contentOrigin === "ChainOfThoughtSummary";
+                  const cotText = (typeof m.text === "string" ? m.text : "") || (typeof m.hiddenText === "string" ? m.hiddenText : "");
+                  if ((cotFlag || cotOrigin) && cotText) {
+                    thinkingText = thinkingText ? thinkingText + "\n" + cotText : cotText;
+                    receivedThinking = true;
+                  }
                   // A confirmation TRIGGER for a native action arrives here as a
                   // messageType'd bot frame (which the plain-chat path drops). Detect
                   // it and auto-approve on the same socket (H-NATIVE-6).

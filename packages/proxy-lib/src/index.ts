@@ -1,13 +1,37 @@
 import { type ModelSessionOptions, getAvailableModels, resolveModel, isDegradationBackoff, listSystemPrompts, getSystemPrompt } from "@m365-copilot/core";
 import { ChatCompletionRequest } from "./schemas.js";
-import { SessionPool, handleChatCompletion } from "./handler.js";
+import { SessionPool, handleChatCompletion, getTurnStats } from "./handler.js";
+import { toneHealth } from "./health.js";
+import { modelPromptEnabled, modelPromptCandidates, resolveModelSystemPrompt } from "./model-prompts.js";
 import {
   AnthropicMessagesRequest,
   handleAnthropicMessages,
   estimateAnthropicInputTokens,
 } from "./anthropic.js";
 
-export { SessionPool, handleChatCompletion } from "./handler.js";
+export { SessionPool, handleChatCompletion, getTurnStats } from "./handler.js";
+export {
+  classifyFailure,
+  toneHealth,
+  nextHealthyFallback,
+  fallbackChain,
+  failoverEnabled,
+  type FailureClass,
+  type BreakerStatus,
+} from "./health.js";
+export {
+  upstreamEnabled,
+  upstreamConfig,
+  mapUpstreamModel,
+  handleUpstreamChat,
+  handleUpstreamMessages,
+} from "./upstream.js";
+export {
+  modelPromptEnabled,
+  modelPromptCandidates,
+  resolveModelSystemPrompt,
+  type RoutedModelPrompt,
+} from "./model-prompts.js";
 export {
   produceCompletion,
   requestHasTools,
@@ -115,6 +139,25 @@ export function getSystemPromptPayload(name: string): { status: number; body: un
   return { status: 200, body: { name: decodeURIComponent(name), text } };
 }
 
+/**
+ * `GET /v1/model-prompts` — the model→prompt route table with live resolution
+ * status for every advertised model (which corpus prompt each WOULD inject).
+ */
+export function modelPromptRoutesPayload() {
+  return {
+    enabled: modelPromptEnabled(),
+    routes: getAvailableModels().map((id) => {
+      const candidates = modelPromptCandidates(id);
+      let routed: { name: string; chars: number; truncated: boolean } | null = null;
+      try {
+        const hit = resolveModelSystemPrompt(id);
+        if (hit) routed = { name: hit.name, chars: hit.text.length, truncated: hit.truncated };
+      } catch { /* corpus absent — leave unrouted */ }
+      return { model: id, candidates, ...(routed ? { routed } : {}) };
+    }),
+  };
+}
+
 // --- CORS (permissive, matches the previous Hono `cors()` default) ---
 
 const CORS_HEADERS: Record<string, string> = {
@@ -162,6 +205,8 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
 
     // Per-request opt-in system prompt (header beats env; see core/prompts.ts).
     const systemPromptSpec = req.headers.get("x-m365-system-prompt") ?? undefined;
+    // Caller conversation identity: distinct keys never share an M365 thread.
+    const sessionKey = req.headers.get("x-m365-session-id") ?? undefined;
 
     if (method === "GET" && pathname === "/health") {
       return withCors(json(200, {
@@ -172,12 +217,61 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
       }));
     }
 
+    // --- Ops status page (local UI): tone breakers + recent turn latencies. ---
+    if (method === "GET" && pathname === "/" || method === "GET" && pathname === "/status") {
+      const html = `<!doctype html>
+<html><head><meta charset="utf-8"><title>m365-copilot-proxy status</title>
+<meta http-equiv="refresh" content="5">
+<style>
+  body{font-family:ui-monospace,Consolas,monospace;background:#0b0e14;color:#d7dce6;margin:24px}
+  h1{font-size:18px} h2{font-size:14px;color:#8ab4ff;margin:18px 0 6px}
+  table{border-collapse:collapse;font-size:12px}
+  td,th{border:1px solid #2a3040;padding:3px 10px;text-align:left}
+  th{color:#9aa4b8;font-weight:600}
+  .ok{color:#7ee787}.warn{color:#e3b341}.bad{color:#ff7b72}.muted{color:#8b949e}
+  small{color:#8b949e}
+</style></head><body>
+<h1>m365-copilot-proxy <small>· auto-refresh 5s · <a style="color:#8ab4ff" href="/health">/health</a> <a style="color:#8ab4ff" href="/v1/models">/v1/models</a></small></h1>
+<h2>Tone health (circuit breakers)</h2><div id="tones">…</div>
+<h2>Recent upstream turns</h2><div id="turns">…</div>
+<script>
+async function j(u){return (await fetch(u)).json()}
+function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+(async()=>{
+  try{
+    const [h,s]=await Promise.all([j("/health"),j("/internal/stats")]);
+    const badge=(st)=>st==="closed"?"<span class='ok'>closed</span>":st==="half_open"?"<span class='warn'>half-open</span>":"<span class='bad'>OPEN</span>";
+    document.getElementById("tones").innerHTML =
+      "<table><tr><th>model</th><th>breaker</th><th>consecutive failures</th></tr>"+
+      (s.tones.length?s.tones.map(t=>"<tr><td>"+esc(t.model)+"</td><td>"+badge(t.status)+"</td><td>"+t.consecutiveFailures+"</td></tr>").join(""):"<tr><td colspan='3' class='muted'>no failures recorded — all tones healthy</td></tr>")+"</table>"+
+      "<p><small>conversations: "+h.conversations+" · gate: "+JSON.stringify(h.gate)+" · degradedBackoff: "+h.degradedBackoff+"</small></p>";
+    const cls=(o)=>o==="ok"?"<span class='ok'>ok</span>":o==="disengaged"?"<span class='warn'>disengaged</span>":o==="rate_limited"?"<span class='warn'>limited</span>":"<span class='bad'>empty</span>";
+    document.getElementById("turns").innerHTML =
+      "<table><tr><th>when</th><th>model</th><th>total</th><th>ttft</th><th>chars</th><th>outcome</th></tr>"+
+      s.turns.slice().reverse().map(t=>"<tr><td class='muted'>"+new Date(t.at).toLocaleTimeString()+"</td><td>"+esc(t.model)+"</td><td>"+t.totalMs+"ms</td><td>"+(t.ttftMs==null?"—":t.ttftMs+"ms")+"</td><td>"+t.chars+"</td><td>"+cls(t.outcome)+"</td></tr>").join("")+"</table>";
+  }catch(e){document.body.insertAdjacentHTML("beforeend","<pre class='bad'>"+esc(e.message)+"</pre>")}
+})();
+</script></body></html>`;
+      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    if (method === "GET" && pathname === "/internal/stats") {
+      return withCors(json(200, {
+        tones: toneHealth.snapshot(),
+        turns: getTurnStats(),
+      }));
+    }
+
     if (method === "GET" && pathname === "/v1/models") {
       return withCors(json(200, buildModelsPayload()));
     }
 
     if (method === "GET" && pathname === "/v1/system-prompts") {
       return withCors(json(200, listSystemPromptsPayload()));
+    }
+
+    if (method === "GET" && pathname === "/v1/model-prompts") {
+      return withCors(json(200, modelPromptRoutesPayload()));
     }
 
     if (method === "GET" && pathname.startsWith("/v1/system-prompts/")) {
@@ -210,7 +304,7 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
             error: { type: "invalid_request_error", message: err.message },
           }));
         }
-        return withCors(await handleAnthropicMessages(body, pool, { signal: req.signal, systemPrompt: systemPromptSpec }));
+        return withCors(await handleAnthropicMessages(body, pool, { signal: req.signal, systemPrompt: systemPromptSpec, sessionKey }));
       }
 
       let body: ReturnType<typeof ChatCompletionRequest.parse>;
@@ -221,7 +315,7 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
           json(400, { error: { message: err.message, type: "invalid_request_error" } }),
         );
       }
-      return withCors(await handleChatCompletion(body, pool, { signal: req.signal, systemPromptSpec }));
+      return withCors(await handleChatCompletion(body, pool, { signal: req.signal, systemPromptSpec, sessionKey }));
     }
 
     return withCors(

@@ -286,7 +286,19 @@ describe("looksLikeConfabulation", () => {
     expect(looksLikeConfabulation("I ran the commands. - pwd -> /mnt/data")).toBe(true);
   });
 
-  it("does NOT flag genuine final answers or normal prose", () => {
+      it("flags the LIVE /doctor refusal verbatim (long-distance access phrasing)", () => {
+    const live = "I can’t actually run the /doctor audit you pasted because I don’t have access to your local filesystem, Claude Code configuration, transcripts, settings files, or terminal environment from here.";
+    expect(looksLikeConfabulation(live)).toBe(true);
+    expect(looksLikeConfabulation("That doctor workflow requires read access to items such as ~/.claude.json and settings files.")).toBe(true);
+    // False-positive guards stay closed.
+    expect(looksLikeConfabulation("Access granted — the database requires read access via your credentials.")).toBe(false);
+  });
+  it("flags the F17.12 persona-refusal shape (can't run on your machine)", () => {
+    expect(looksLikeConfabulation("I can’t actually run the /doctor workflow because it requires direct access to your local filesystem and machine.")).toBe(true);
+    expect(looksLikeConfabulation("I do not have access to your computer, so I cannot inspect settings files.")).toBe(true);
+    expect(looksLikeConfabulation("get_lucky_number is not a real tool I have available in this conversation.")).toBe(true);
+  });
+it("does NOT flag genuine final answers or normal prose", () => {
     expect(looksLikeConfabulation("Fixed the bug: add now returns a + b, and check.py prints OK.")).toBe(false);
     expect(looksLikeConfabulation("The hostname is web-prod-01.")).toBe(false);
     expect(looksLikeConfabulation("Done.")).toBe(false);
