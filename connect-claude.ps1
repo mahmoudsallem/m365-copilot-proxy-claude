@@ -5,6 +5,10 @@ param(
 
     [string]$SessionId,
 
+    # Explicit opt-in to --dangerously-skip-permissions. Never the default:
+    # normal Claude Code permission prompts remain the safe path.
+    [switch]$Unsafe,
+
     [switch]$NewSession
 )
 
@@ -57,11 +61,23 @@ $env:DISABLE_TELEMETRY = "1"
 $env:DISABLE_ERROR_REPORTING = "1"
 $env:DISABLE_BUG_COMMAND = "1"
 
-Write-Host "[claude-m365] Connected to proxy=$proxyUrl model=$selectedModel" -ForegroundColor Cyan
+# Per-process conversation identity: every launch gets its own x-m365-session-id
+# so two Claude Code processes (or two hosts on the same repo + prompt) can never
+# fuse into one shared M365 thread via the proxy's content fingerprint.
+if ($env:ANTHROPIC_CUSTOM_HEADERS -notmatch 'x-m365-session-id') {
+    $sessionHeader = "x-m365-session-id: cc-$([guid]::NewGuid().ToString('N'))"
+    $env:ANTHROPIC_CUSTOM_HEADERS = if ($env:ANTHROPIC_CUSTOM_HEADERS) { "$env:ANTHROPIC_CUSTOM_HEADERS`n$sessionHeader" } else { $sessionHeader }
+}
+
+Write-Host "[claude-m365] Connected to proxy=$proxyUrl model=$selectedModel session=$($env:ANTHROPIC_CUSTOM_HEADERS -replace '.*x-m365-session-id: ','' -split "`n" | Select-Object -Last 1)" -ForegroundColor Cyan
 Write-Host "Available canonical models: auto, gpt-5.5, gpt-5.5-quick, gpt-5.5-think-deeper, claude-sonnet, claude-opus, quick, think-deeper" -ForegroundColor Gray
 Write-Host "Available presets: sol, terra, luna, codex, haiku" -ForegroundColor DarkGray
 
-$claudeArgs = @("--model", $selectedModel, "--dangerously-skip-permissions")
+$claudeArgs = @("--model", $selectedModel)
+if ($Unsafe) {
+    Write-Host "[claude-m365] UNSAFE MODE: permission prompts disabled (--dangerously-skip-permissions)" -ForegroundColor Yellow
+    $claudeArgs += "--dangerously-skip-permissions"
+}
 
 if ($SessionId) {
     $claudeArgs += @("--resume", $SessionId)

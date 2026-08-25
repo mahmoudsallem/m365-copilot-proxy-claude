@@ -8,6 +8,7 @@ import {
 } from "./index.js";
 import { FakeTransport } from "@m365-copilot/core";
 import { TurnGate } from "./gate.js";
+import { SessionPool, produceCompletion } from "./handler.js";
 import { CANONICAL_MODELS } from "@m365-copilot/core";
 
 /**
@@ -391,5 +392,79 @@ describe("/v1/messages x-m365-system-prompt passthrough", () => {
     expect(res.status).toBe(200);
     await res.text(); // drain the SSE stream
     expect(transport.prompts[0].text).toContain(SYS);
+  });
+});
+
+// --- Cancellation timing: client disconnects must fail fast, never retry-storm ---
+
+describe("cancellation propagation (abort before start + mid-turn)", () => {
+  /**
+   * Scripted transport whose turns hang until the caller's signal fires —
+   * mirroring how a real M365 WebSocket dies on the Stop frame. ModelSession
+   * is allowed exactly ONE reconnect retry per turn, so a fully-cancelled turn
+   * deterministically costs 2 transport attempts; anything more (the historical
+   * empty-retry amplification) is a regression.
+   */
+  class AbortAwareTransport {
+    calls = 0;
+    async chat(args: { signal?: AbortSignal }): Promise<never> {
+      this.calls += 1;
+      return new Promise<never>((_resolve, reject) => {
+        if (args.signal?.aborted) {
+          reject(new Error("aborted before start"));
+          return;
+        }
+        const timer = setTimeout(() => reject(new Error("turn outlived its abort")), 5_000);
+        args.signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            reject(new Error("aborted mid-turn"));
+          },
+          { once: true },
+        );
+      });
+    }
+  }
+
+  const BODY = { model: "claude-sonnet", messages: [{ role: "user" as const, content: "hi" }] };
+
+  it("a pre-aborted signal fails fast with no retry storm", async () => {
+    const transport = new AbortAwareTransport();
+    const pool = new SessionPool({
+      getToken: async () => "fake-token",
+      useAgent: false,
+      transport: transport as never,
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    const { produced } = await produceCompletion(BODY as never, pool, { signal: controller.signal });
+    expect(produced.kind).toBe("error");
+    if (produced.kind === "error") expect(produced.resp.status).toBe(502);
+    // initial attempt + ModelSession's single reconnect — NOT MAX_RETRIES more
+    expect(transport.calls).toBe(2);
+  });
+
+  it("an abort mid-turn cancels the hung stream and does not re-attempt beyond the reconnect", async () => {
+    const transport = new AbortAwareTransport();
+    const pool = new SessionPool({
+      getToken: async () => "fake-token",
+      useAgent: false,
+      transport: transport as never,
+    });
+    const controller = new AbortController();
+    const done = produceCompletion(BODY as never, pool, { signal: controller.signal });
+
+    // Wait until the turn is genuinely in flight, then simulate the client
+    // disconnecting mid-stream.
+    while (transport.calls === 0) await new Promise((r) => setTimeout(r, 1));
+    await new Promise((r) => setTimeout(r, 5));
+    controller.abort();
+
+    const { produced } = await done;
+    expect(produced.kind).toBe("error");
+    if (produced.kind === "error") expect(produced.resp.status).toBe(502);
+    expect(transport.calls).toBe(2);
   });
 });

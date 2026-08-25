@@ -53,8 +53,9 @@ untouched.
 - M365 tool calling is prompt-emulated. It is less reliable than Claude's native tool
   API, and the proxy intentionally keeps the tool set lean because large tool schemas
   can trigger `Disengaged`.
-- The Messages bridge buffers each M365 turn before emitting Anthropic content blocks.
-  It sends SSE heartbeats while the upstream turn is running, but text is not token-live.
+- Streaming is genuinely incremental for prose: text deltas are forwarded as they
+  arrive (with a short holdback window in tool mode so fence bytes never leak).
+  Tool-call blocks and thinking blocks are emitted once the turn's fences are parsed.
 - `/v1/messages/count_tokens` is a character-based estimate because M365 does not expose
   a matching tokenizer.
 - Microsoft account/tenant policy and current M365 service health still control whether
@@ -64,8 +65,15 @@ untouched.
   Claude Code's automatic retries from consuming many messages on a dead conversation;
   retry manually after waiting or restarting the session.
 - Claude Code's `/model` picker contains Anthropic subscription models, not the M365
-  catalog. Unsupported picker IDs (for example `claude-opus-5` / `opus[1m]`) are safely
-  mapped back to `gpt-5.5-think-deeper`; explicit M365 model IDs pass through.
+  catalog. Unsupported picker IDs fall back to `gpt-5.5` (override with
+  `M365_CLAUDE_CODE_MODEL`); explicit M365 model IDs pass through.
+- Every launcher process injects its own `x-m365-session-id` header
+  (`ANTHROPIC_CUSTOM_HEADERS`). Distinct CLI processes — or hosts — therefore never
+  fuse into one shared M365 conversation, even with identical first prompts.
+- M365 conversations survive proxy restarts: the pool persists ConversationId +
+  delta position to `~/.config/opencode-m365/sessions.json` and rehydrates on the
+  next request with the same conversation fingerprint (disable with
+  `M365_NO_SESSION_STORE=1`).
 
 Keep the proxy bound to `127.0.0.1`. Do not expose the endpoint or its bearer token over
 the network.

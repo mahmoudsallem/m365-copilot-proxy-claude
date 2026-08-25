@@ -77,8 +77,9 @@ prompt is tuned. The layers, in handler order:
   the client gets only `tool_calls` with `content: null` (stripped text is logged).
 - **Invented JSON:** `parseToolCalls()` removes `{"confidence":N}`, **drops** a `{"final":…}`
   riding alongside tool calls (premature success), and **unwraps** a lone `{"final":"…"}`.
-- **One call per turn:** keeps only the **first** tool call; M365 batches its whole plan into
-  one response, running later steps on guessed state. Override with `M365_ALLOW_MULTI_TOOL`.
+- **Batched tool calls (default):** M365 may batch several tool calls into one
+  response; they execute sequentially client-side, each seeing the previous
+  `tool_response`. Restore strict one-call-per-turn with `M365_NO_MULTI_TOOL=1`.
 - **Empty ≠ rate limit:** an empty reply is treated as throttling only when the throttle is
   **at-limit**; otherwise it fails fast after a couple of quick retries. Repeated empties
   across **distinct conversations** (the thread-rate-throttle signature) trigger **degradation

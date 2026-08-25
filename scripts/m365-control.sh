@@ -441,6 +441,18 @@ run_claude_proxy() {
   export DISABLE_BUG_COMMAND=1
   unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
 
+  # Per-process conversation identity: each CLI process gets its own
+  # x-m365-session-id so distinct processes/hosts never fuse into one shared
+  # M365 thread through the proxy's content fingerprint.
+  case "${ANTHROPIC_CUSTOM_HEADERS:-}" in
+    *x-m365-session-id*) ;;
+    *)
+      _m365_sid="cc-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "proc-$$-$(date +%s)")"
+      export ANTHROPIC_CUSTOM_HEADERS="${ANTHROPIC_CUSTOM_HEADERS:+${ANTHROPIC_CUSTOM_HEADERS}
+}x-m365-session-id: ${_m365_sid}"
+      ;;
+  esac
+
   printf '[claude-m365] proxy=%s model=%s\n' "$PROXY_URL" "$selected_model" >&2
   exec "$ORIGINAL_CLAUDE" --model "$selected_model" --tools=Bash,Read,Edit,Write,Glob,Grep "$@"
 }
