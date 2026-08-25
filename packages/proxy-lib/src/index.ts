@@ -2,6 +2,7 @@ import { type ModelSessionOptions, getAvailableModels, resolveModel, isDegradati
 import { ChatCompletionRequest } from "./schemas.js";
 import { SessionPool, handleChatCompletion, getTurnStats } from "./handler.js";
 import { toneHealth } from "./health.js";
+import { turnQueueStats } from "./turn-queue.js";
 import { modelPromptEnabled, modelPromptCandidates, resolveModelSystemPrompt } from "./model-prompts.js";
 import {
   AnthropicMessagesRequest,
@@ -41,6 +42,8 @@ export {
   type ProduceOptions,
 } from "./handler.js";
 export { TurnGate, type TurnGateOptions, type TurnGateStats } from "./gate.js";
+export { enqueueTurn, turnQueueStats } from "./turn-queue.js";
+export { SessionStore, defaultSessionStorePath, type PersistedSession } from "./session-store.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
 export {
   AnthropicMessagesRequest,
@@ -213,6 +216,7 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
         status: "ok",
         conversations: pool.size,
         gate: pool.turnGate.stats(),
+        turnQueue: turnQueueStats(),
         degradedBackoff: isDegradationBackoff(),
       }));
     }

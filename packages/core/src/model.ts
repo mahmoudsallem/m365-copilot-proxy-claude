@@ -1,4 +1,4 @@
-import { getToken } from "./auth.js";
+import { getToken, getTokenSilent } from "./auth.js";
 import { getOrCreateAgent, getOrCreateAgentSingleFlight } from "./agent.js";
 import { CopilotSession } from "./session.js";
 import { createLogger, trunc } from "./log.js";
@@ -10,6 +10,19 @@ const log = createLogger("model");
 export interface ModelSessionOptions {
   /** Pre-resolved auth token. If not provided, getToken() is called. */
   getToken?: () => Promise<string>;
+  /**
+   * Proactive re-acquirer, used ONLY when the current token is already near
+   * expiry (see isTokenNearExpiry). Default: core getTokenSilent() — an MSAL
+   * silent refresh. Failures never block the turn (the current token stays
+   * valid until its own exp).
+   */
+  refreshToken?: () => Promise<string>;
+  /**
+   * Seed an EXISTING M365 conversation id (proxy session-store hydration) so a
+   * restarted host resumes the server-side thread instead of spending a fresh
+   * conversation start (thread-rate throttle, docs/hypotheses.md F13).
+   */
+  conversationId?: string;
   /** Whether to attempt agent resolution. Default: true. */
   useAgent?: boolean;
   /** Inject a transport (the thing that actually talks to a backend). Defaults to the real M365 WebSocket transport. */
@@ -82,6 +95,7 @@ export class RealM365Transport implements ModelTransport {
  */
 export class ModelSession {
   private resolveToken: () => Promise<string>;
+  private refreshTokenFn: (() => Promise<string>) | null;
   private useAgent: boolean;
   private transport: ModelTransport;
   private cachedAgentId: string | null | undefined = undefined;
@@ -89,7 +103,7 @@ export class ModelSession {
 
   /** Stable IDs reused across transport reconnections. */
   readonly sessionId: string = crypto.randomUUID();
-  private _conversationId: string = crypto.randomUUID();
+  private _conversationId: string;
   /** Current M365 ConversationId (the throttle/Disengage state keys on this). */
   get conversationId(): string {
     return this._conversationId;
@@ -109,8 +123,10 @@ export class ModelSession {
 
   constructor(options: ModelSessionOptions = {}) {
     this.resolveToken = options.getToken ?? getToken;
+    this.refreshTokenFn = options.refreshToken ?? null;
     this.useAgent = options.useAgent !== false;
     this.transport = options.transport ?? new RealM365Transport();
+    this._conversationId = options.conversationId ?? crypto.randomUUID();
   }
 
   /** Number of turns completed against the current conversation. */
@@ -149,7 +165,24 @@ export class ModelSession {
    * explicitly supports agent attachment (`config.supportsAgent`).
    */
   async run(text: string, model: string = "m365-copilot", signal?: AbortSignal, useAgent: boolean = true): Promise<CopilotStream> {
-    const token = await this.resolveToken();
+    let token = await this.resolveToken();
+    // Proactive refresh (restart-durability companion): MSAL access tokens live
+    // ~1h; a long-lived host otherwise spends the last minutes of every hour
+    // failing mid-turn. When inside the expiry margin, try ONE silent refresh
+    // before the turn. Failure keeps the current token — it still works until
+    // its own exp, and the next successful refresh catches us back up.
+    if (isTokenNearExpiry(token)) {
+      const refresher = this.refreshTokenFn ?? defaultRefreshToken;
+      try {
+        const fresh = await refresher();
+        if (fresh && fresh !== token) {
+          log.info("Token proactively refreshed (inside expiry margin)");
+          token = fresh;
+        }
+      } catch (err: any) {
+        log.warn("Proactive token refresh failed; continuing on current token:", err.message);
+      }
+    }
     const resolvedModel = resolveModel(model);
     const wantAgent = this.useAgent && useAgent && resolvedModel.config.supportsAgent;
 
@@ -232,3 +265,44 @@ export class ModelSession {
     this.turnCounter = 0;
   }
 }
+
+// --- Proactive token expiry helpers ---
+
+/** Refresh when closer to expiry than this. Tune via env; 0 disables the check. */
+const TOKEN_REFRESH_MARGIN_MS = Number(process.env.M365_TOKEN_REFRESH_MARGIN_MS ?? 300_000);
+
+function jwtExpMs(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
+    const raw = JSON.parse(Buffer.from(padded, "base64").toString());
+    return typeof raw?.exp === "number" ? raw.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when an MSAL access token is missing, unparseable-without-exp (treat
+ * conservatively: let it be — only tokens WITH exp are proactively refreshed),
+ * or inside the refresh margin before its exp.
+ */
+export function isTokenNearExpiry(
+  token: string,
+  marginMs: number = TOKEN_REFRESH_MARGIN_MS,
+  now: number = Date.now(),
+): boolean {
+  if (!token) return false;
+  if (marginMs <= 0) return false;
+  const exp = jwtExpMs(token);
+  if (exp == null) return false;
+  return exp - now < marginMs;
+}
+
+/**
+ * Default proactive refresher: an MSAL SILENT re-acquisition. Never falls back
+ * to browser logins here — a refresh attempt must stay invisible and cheap;
+ * the next regular getToken() owns the loud recovery paths.
+ */
+const defaultRefreshToken = async (): Promise<string> => (await getTokenSilent()) ?? "";

@@ -405,7 +405,15 @@ export function anthropicSse(message: AnthropicMessageResponse): Response {
 export interface HandleAnthropicOptions {
   /** Aborts the M365 turn when the client disconnects. */
   signal?: AbortSignal;
-  /** Opt-in system-prompt spec (see core/prompts.ts). Falls back to M365_SYSTEM_PROMPT env. */
+  /**
+   * Opt-in system-prompt spec (name:/path:/literal — see core/prompts.ts).
+   * Falls back to M365_SYSTEM_PROMPT env. Both spellings are accepted because
+   * the Nitro route passes `systemPromptSpec` while embedders historically
+   * passed `systemPrompt`; before unification one of the two paths silently
+   * dropped it.
+   */
+  systemPromptSpec?: string;
+  /** Deprecated alias of {@link systemPromptSpec}. */
   systemPrompt?: string;
   /** Caller conversation identity (x-m365-session-id header) — isolates the M365 thread per caller. */
   sessionKey?: string;
@@ -429,7 +437,7 @@ async function completeAnthropic(
   const chat = toOpenAIChatRequest(body);
   const { produced, usage } = await produceCompletion(chat, pool, {
     signal: opts.signal,
-    systemPromptSpec: opts.systemPrompt,
+    systemPromptSpec: opts.systemPromptSpec ?? opts.systemPrompt,
     sessionKey: opts.sessionKey,
   });
   if (produced.kind === "error") return { error: produced.resp };
@@ -574,6 +582,10 @@ export async function handleAnthropicMessages(
         const chat = toOpenAIChatRequest(body);
         const { produced, usage } = await produceCompletion(chat, pool, {
           signal: options.signal,
+          // The streaming path previously dropped the per-request system prompt
+          // entirely — only the non-stream route honored it. Same resolution as
+          // completeAnthropic so both paths behave identically.
+          systemPromptSpec: options.systemPromptSpec ?? options.systemPrompt,
           sessionKey: options.sessionKey,
           // Live passthrough: every upstream delta becomes a text_delta AS IT ARRIVES.
           onTextDelta: (delta) => {

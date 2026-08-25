@@ -364,3 +364,32 @@ describe("TurnGate", () => {
     expect(Date.now() - bStart).toBeLessThan(2000);
   });
 });
+
+// --- Per-request system-prompt spec must reach produceCompletion on BOTH paths ---
+
+describe("/v1/messages x-m365-system-prompt passthrough", () => {
+  const SYS = "M365-SYSPROMPT-E2E-CHECK";
+  const body = {
+    model: "claude-sonnet",
+    max_tokens: 100,
+    messages: [{ role: "user", content: "ping" }],
+  };
+
+  it("non-stream path honors the header", async () => {
+    const { app, transport } = makeApp();
+    const res = await app.fetch(anthropicRequest(body, { "x-m365-system-prompt": SYS }));
+    expect(res.status).toBe(200);
+    await res.json();
+    expect(transport.prompts[0].text).toContain(SYS);
+  });
+
+  it("stream path honors it too (regression: streaming dropped the spec entirely)", async () => {
+    const { app, transport } = makeApp();
+    const res = await app.fetch(
+      anthropicRequest({ ...body, stream: true }, { "x-m365-system-prompt": SYS }),
+    );
+    expect(res.status).toBe(200);
+    await res.text(); // drain the SSE stream
+    expect(transport.prompts[0].text).toContain(SYS);
+  });
+});

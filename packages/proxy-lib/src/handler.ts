@@ -31,6 +31,8 @@ import {
   type FailureClass,
 } from "./health.js";
 import { upstreamEnabled, handleUpstreamChat } from "./upstream.js";
+import { enqueueTurn } from "./turn-queue.js";
+import { SessionStore } from "./session-store.js";
 import { resolveModelSystemPrompt } from "./model-prompts.js";
 import {
   subAgentsEnabled,
@@ -280,9 +282,32 @@ export class SessionPool {
   private sessionOptions: ModelSessionOptions;
   /** Throttle-aware concurrency gate shared by every conversation in this pool. */
   readonly turnGate = new TurnGate();
+  /**
+   * Restart durability (docs/hypotheses.md F13 economics): a proxy restart used
+   * to spend a fresh M365 conversation start per active thread. Persisting
+   * fingerprint → ConversationId lets the next process RESUME the same
+   * server-side thread instead. Disable with M365_NO_SESSION_STORE=1.
+   */
+  private readonly store: SessionStore | null;
 
   constructor(sessionOptions: ModelSessionOptions = {}) {
     this.sessionOptions = sessionOptions;
+    this.store = process.env.M365_NO_SESSION_STORE === "1"
+      ? null
+      : new SessionStore(process.env.M365_SESSION_STORE_PATH || undefined);
+  }
+
+  /**
+   * Fire-and-forget persistence of one conversation's progress. Called at every
+   * successful turn commit; failures are logged inside the store, never thrown.
+   */
+  persistConversation(fingerprint: string, state: ConversationState): void {
+    this.store?.set(fingerprint, {
+      conversationId: state.session.conversationId,
+      sentMessageCount: state.sentMessageCount,
+      lastUsedAt: Date.now(),
+    });
+    this.store?.flush();
   }
 
   /**
@@ -305,18 +330,30 @@ export class SessionPool {
         log.info(`Conversation ${fingerprint}: messages shrunk (${messages.length} < ${existing.sentMessageCount}), resetting`);
         existing.session.reset();
         existing.sentMessageCount = 0;
+        this.persistConversation(fingerprint, existing);
       }
       existing.lastAccessedAt = Date.now();
       return existing;
     }
 
-    // New conversation
-    log.info(`New conversation ${fingerprint}, ${this.conversations.size} active`);
+    // New conversation — but maybe a PREVIOUS process left a resumable thread
+    // for this exact fingerprint. Hydrate only fresh records (older than the
+    // idle-eviction window means M365 may have GC'd the thread anyway).
+    const prior = this.store?.get(fingerprint) ?? null;
+    const priorFresh = prior && Date.now() - prior.lastUsedAt < MAX_IDLE_MS ? prior : null;
+    if (prior && !priorFresh) this.store?.delete(fingerprint);
     const state: ConversationState = {
-      session: new ModelSession(this.sessionOptions),
-      sentMessageCount: 0,
+      session: priorFresh
+        ? new ModelSession({ ...this.sessionOptions, conversationId: priorFresh.conversationId })
+        : new ModelSession(this.sessionOptions),
+      sentMessageCount: priorFresh?.sentMessageCount ?? 0,
       lastAccessedAt: Date.now(),
     };
+    if (priorFresh) {
+      log.info(`New conversation ${fingerprint.slice(0, 10)}… HYDRATED from disk (cid=${priorFresh.conversationId}, sent=${priorFresh.sentMessageCount})`);
+    } else {
+      log.info(`New conversation ${fingerprint}, ${this.conversations.size} active`);
+    }
     this.conversations.set(fingerprint, state);
     return state;
   }
@@ -338,6 +375,7 @@ export class SessionPool {
       if (now - state.lastAccessedAt > MAX_IDLE_MS) {
         log.info(`Evicting idle conversation ${key}`);
         this.conversations.delete(key);
+        this.store?.delete(key);
       }
     }
   }
@@ -661,9 +699,12 @@ let lastThinking: string | null = null;
       let copilotStream;
       try {
         // Every upstream turn goes through the shared TurnGate: bounded inflight
-        // turns + staggered NEW-conversation starts (thread-rate throttle guard).
-        copilotStream = await pool.turnGate.run(convFingerprint, () =>
-          session.run(text, model, cb.signal, useToolAgent));
+        // turns + staggered NEW-conversation starts (thread-rate throttle guard),
+        // AND through the strict FIFO turn queue (AGENTS.md rule #1 enforced:
+        // one M365 turn at a time account-wide; disable M365_NO_TURN_QUEUE=1).
+        copilotStream = await enqueueTurn(() =>
+          pool.turnGate.run(convFingerprint, () =>
+            session.run(text, model, cb.signal, useToolAgent)));
       } catch (err: any) {
         log.error("Upstream turn failed:", err?.stack ?? err);
         return { error: jsonResponse(502, { error: { message: err.message, type: "upstream_error" } }) };
@@ -846,6 +887,7 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
     const result = await runBuffered(guardForward);
     if ("error" in result) return { kind: "error", resp: result.error };
     conv.sentMessageCount = body.messages.length;
+    pool.persistConversation(convFingerprint, conv);
     let fullText = result.fullText;
 
     log.debug("Raw response (tool mode):", trunc(fullText, 1000));
@@ -892,7 +934,8 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
         if (real.length > 0) { parsed = { hasToolCalls: true, toolCalls: real, textContent: null }; break; }
         return { kind: "error", resp: r.error };
       }
-      conv.sentMessageCount = body.messages.length; // injection consumed a turn
+      conv.sentMessageCount = body.messages.length;
+      pool.persistConversation(convFingerprint, conv); // injection consumed a turn
       fullText = r.fullText;
       searchRounds += 1;
       parsed = parseToolCalls(fullText, [...allTools, TOOLSEARCH_DEF, ...(TASK_DEF ? [TASK_DEF] : [])]);
@@ -936,6 +979,7 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
         return { kind: "error", resp: r.error };
       }
       conv.sentMessageCount = body.messages.length;
+      pool.persistConversation(convFingerprint, conv);
       fullText = r.fullText;
       taskRounds += 1;
       parsed = parseToolCalls(fullText, parseTools);
@@ -979,6 +1023,7 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
       const retry = await runBuffered();
       if ("error" in retry) return { kind: "error", resp: retry.error };
       conv.sentMessageCount = body.messages.length;
+      pool.persistConversation(convFingerprint, conv);
       fullText = retry.fullText;
       parsed = parseToolCalls(fullText, parseTools);
       log.info(`After forcing retry: hasToolCalls=${parsed.hasToolCalls}, count=${parsed.toolCalls.length}`);
@@ -1080,6 +1125,7 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
     const result = await runBuffered(cb.onTextDelta);
     if ("error" in result) return { kind: "error", resp: result.error };
     conv.sentMessageCount = body.messages.length;
+    pool.persistConversation(convFingerprint, conv);
     return { kind: "text", text: result.fullText.trim() || "", thinking: lastThinking ?? undefined };
   }
   } // end produce()

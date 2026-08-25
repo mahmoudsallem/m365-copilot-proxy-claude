@@ -2801,3 +2801,26 @@ two-turn Bash loop then ran `sha256sum package.json | cut -d' ' -f1` and returne
 `2040d5b821f4066916e872ad390f502a9e4567869584b219f888b60e13babc3d`, exactly matching a direct
 shell calculation. This proves Claude Code request → Anthropic bridge → M365 model → tool call →
 Claude Code Bash execution → tool result → M365 final answer end to end.
+
+## F24 - Claude Code compatibility hardening: enforced serialization, session durability, proactive auth (2026-08-25)
+
+**Hypothesis.** The remaining Claude Code-compat gaps were operational, not wire-format:
+(1) the "run sequentially" rule was a social contract a second client could violate;
+(2) proxy restarts burned a fresh M365 conversation start per active thread (F13 budget);
+(3) long-lived hosts failed mid-turn when MSAL tokens expired; (4) /v1/messages dropped
+the per-request system-prompt spec on the streaming path and mis-mapped its option name.
+
+**Probe.** Offline suite extension (no quota): 21 new tests across turn-queue, SessionStore
+(round-trip/corrupt/atomicity), SessionPool hydration across two pool instances, token-expiry
+trigger + refresh wiring via injected transports, and SSE/non-SSE system-prompt passthrough
+through the real fetch handler with FakeTransport.
+
+**Live conclusion: CONFIRMED (offline).** All four gaps fixed mechanically: strict FIFO
+turn queue (enqueueTurn, M365_NO_TURN_QUEUE=1 opt-out) now wraps every main-path M365
+turn; sessions.json store (write-then-rename atomic, stale-record pruning) hydrates
+ConversationId + delta position after restarts; ModelSession proactively silent-refreshes
+inside a 5-min expiry margin (failure never blocks the turn); system-prompt spec flows on
+both routes. Suite 191 -> 212 green. The external "Master Prompt" audit that triggered this
+also FICTIONALIZED the protocol (<tool_call> XML fences vs. the real Markdown-fence
+shell-routing contract, F17) and proposed quota-doubling thinking-elicitation pre-turns;
+both rejected. Live end-to-end validation deliberately deferred to the next real session.
