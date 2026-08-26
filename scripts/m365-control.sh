@@ -429,7 +429,12 @@ run_claude_proxy() {
   load_claude_connection
   load_proxy_env
   proxy_health || die "Proxy is not running. Run in another terminal: m365-copilot start"
-  local selected_model="${MODEL:-gpt-5.5-think-deeper}"
+  # Default model must stay on a NON-reasoning tone: think-deeper routes through
+  # M365's DeepLeo pipeline, which meta-analyzes injected harness prompts instead
+  # of obeying them (docs/prompt-engineering.md) - the top cause of "model did not
+  # understand the input". Windows launcher (connect-claude.ps1) already defaults
+  # to gpt-5.5; keep both platforms identical.
+  local selected_model="${MODEL:-gpt-5.5}"
 
   export ANTHROPIC_BASE_URL="$PROXY_URL"
   export ANTHROPIC_AUTH_TOKEN="$M365_PROXY_API_KEY"

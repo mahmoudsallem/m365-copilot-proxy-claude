@@ -439,6 +439,7 @@ describe("x-m365-profile routing (offline)", () => {
     );
     await safeRes.json();
     const safeManifest = safe.transport.prompts[0].text;
+    expect(safeManifest).toContain("ENVIRONMENT REALITY"); // identity anchor present
     expect(safeManifest).toContain("Read");           // coding tool advertised
     expect(safeManifest).not.toContain("WebFetch");   // deferred, not advertised
     expect(safeManifest).toContain("ToolSearch");     // discovery meta-tool present

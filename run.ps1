@@ -30,7 +30,7 @@ param(
     [switch]$KeepProxy,
     [switch]$NoWatchdog,
     [switch]$StopProxy,
-    [string]$Model = $(if ($env:M365_DEFAULT_MODEL) { $env:M365_DEFAULT_MODEL } else { "gpt-5.5-think-deeper" }),
+    [string]$Model = $(if ($env:M365_DEFAULT_MODEL) { $env:M365_DEFAULT_MODEL } else { "gpt-5.5" }),
     [string]$SystemPrompt = ""
 )
 

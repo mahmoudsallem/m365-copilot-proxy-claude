@@ -2866,3 +2866,22 @@ the PR4 bench before a heuristic is trustworthy; Disengaged-as-turn semantics ch
 was user-endorsed via plan acceptance. Phases 2/3/8 (filesystem workflow validation,
 skills/hooks/MCP fixtures, mandatory real-claude gate) require the actual Claude CLI
 sandbox and remain gated behind PR4 + free disk on E:.
+
+## F27 - Environment-reality anchor + non-reasoning launcher defaults (2026-08-26)
+
+**Hypothesis.** Two of the biggest "model did not understand the input" causes are
+fixable proxy-side: (a) consumer Copilot priors ("I am a sandboxed web assistant")
+override the harness and drive refusal/confabulation turns; (b) several launchers
+defaulted to *-think-deeper tones whose DeepLeo pipeline meta-analyzes harness prompts
+instead of obeying them.
+
+**Change.** (1) Two-sentence ENVIRONMENT REALITY anchor prepended to the tool-manifest
+system block on every tool turn (M365_NO_REALITY_ANCHOR=1 disables) - same pattern as
+the proven confab forcing lines. (2) Linux claude launchers (m365-control.sh,
+claude-local.sh) + run.ps1 now default to gpt-5.5, matching connect-claude.ps1;
+think-deeper remains user-selectable.
+
+**Status: OFFLINE-VERIFIED presence (anchor in manifest asserted), live A/B pending.**
+Per rule #5 this needs a rotated bench sweep (anchor on/off x think-deeper/gpt-5.5)
+before being called confirmed; watch Disengaged rates - F10 warns heavier framing can
+trip the filter.

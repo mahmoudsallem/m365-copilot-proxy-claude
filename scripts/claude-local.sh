@@ -8,7 +8,9 @@ source "${M365_LOCAL_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/m365-copilot-proxy/p
 
 PROXY_PORT="${PORT:-4141}"
 PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
-MODEL="${MODEL:-gpt-5.5-think-deeper}"
+# Non-reasoning tone by default: *-think-deeper routes through M365's DeepLeo
+# pipeline, which meta-analyzes harness prompts instead of obeying them.
+MODEL="${MODEL:-gpt-5.5}"
 CLAUDE_BIN="${CLAUDE_BIN:-${HOME}/.local/bin/claude-anthropic}"
 
 if ! curl -fsS -H "Authorization: Bearer ${M365_PROXY_API_KEY}" "$PROXY_URL/v1/models" >/dev/null; then
