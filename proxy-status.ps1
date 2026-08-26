@@ -35,7 +35,7 @@ if (Test-Path $pidFile) {
 
 if ($isHealthy) {
     Write-Host "Proxy: RUNNING and HEALTHY at $apiUrl $(if ($pidVal) { "(PID $pidVal)" })" -ForegroundColor Green
-    Write-Host "Default API Key: $apiKey" -ForegroundColor Cyan
+    Write-Host "Bearer authentication: configured (key hidden)" -ForegroundColor Cyan
 } else {
     Write-Host "Proxy: STOPPED or Unhealthy at $apiUrl" -ForegroundColor Yellow
 }

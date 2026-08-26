@@ -7,6 +7,20 @@ credentials.
 
 ## Install and start
 
+On Windows, prefer the process-scoped three-command workflow:
+
+```powershell
+.\proxy-up.ps1
+.\claude-m365.ps1
+.\claude-m365.ps1 -Model gpt-5.5-think-deeper
+.\proxy-down.ps1
+```
+
+The first command generates a private bearer key and opens the legitimate
+interactive Microsoft login when needed. `claude-m365.ps1` validates the model,
+creates an isolated proxy session, and launches the existing Claude executable
+without changing global credentials or disabling permissions.
+
 From the repository:
 
 ```sh
@@ -53,6 +67,11 @@ untouched.
 - M365 tool calling is prompt-emulated. It is less reliable than Claude's native tool
   API, and the proxy intentionally keeps the tool set lean because large tool schemas
   can trigger `Disengaged`.
+- Every parsed call is validated against the exact client-provided draft-2020-12
+  JSON Schema. A small deterministic alias repair (for example `path` to an
+  otherwise-missing `file_path`) is revalidated; malformed/invalid calls fail
+  closed and are never emitted as `tool_use`. This is adapter validation, not
+  upstream grammar-constrained decoding.
 - Streaming is genuinely incremental for prose: text deltas are forwarded as they
   arrive (with a short holdback window in tool mode so fence bytes never leak).
   Tool-call blocks and thinking blocks are emitted once the turn's fences are parsed.

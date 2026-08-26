@@ -30,6 +30,8 @@ export interface FakeTransportOptions {
   chunkSize?: number;
   /** Per-turn artificial latency in ms (default 0). */
   latencyMs?: number;
+  /** Test harness mode: make the fake model's final answer equal the real tool result. */
+  echoToolResult?: boolean;
 }
 
 function makeStream(text: string, opts: { chunkSize: number; throttle: { current: number; max: number }; turnCount: number }): CopilotStream {
@@ -95,8 +97,12 @@ export class FakeTransport implements ModelTransport {
     let text: string;
     if (state.responses > 0) {
       const responses = state.responses;
-      text = this.options.finalText?.(responses)
-        ?? `Task complete after ${responses} tool result(s). FAKE_FINAL cid=${args.conversationId.slice(0, 8)} turn=${state.n}`;
+      const resultMatch = [...args.text.matchAll(/<tool_response\b[^>]*>([\s\S]*?)<\/tool_response>/g)].at(-1);
+      const echoedResult = resultMatch?.[1]?.trim() ?? "";
+      text = this.options.echoToolResult && echoedResult
+        ? echoedResult
+        : this.options.finalText?.(responses)
+          ?? `Task complete after ${responses} tool result(s). FAKE_FINAL cid=${args.conversationId.slice(0, 8)} turn=${state.n}`;
     } else if (hasToolManifest) {
       const cmd = this.options.command ?? `echo fake-turn-${state.n}`;
       text = "```bash\n" + cmd + "\n```";

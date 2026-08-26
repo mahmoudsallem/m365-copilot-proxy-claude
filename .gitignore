@@ -30,6 +30,7 @@ scripts/gateway-explore-out/
 scripts/create-full-bot-out/
 scripts/code-interp-out/
 scripts/bench/out/
+benchmarks/claude-code/out/
 scripts/throttle-out/
 scripts/gui-capture-out/
 scripts/*-out/

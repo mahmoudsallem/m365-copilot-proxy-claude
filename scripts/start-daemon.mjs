@@ -8,6 +8,10 @@ import { dirname, resolve } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
 
+if (!process.env.M365_PROXY_API_KEY) {
+  throw new Error("M365_PROXY_API_KEY is required; use proxy-up.ps1 to create and load private local configuration.");
+}
+
 const stateDir = path.join(os.homedir(), ".local", "state", "m365-copilot-proxy");
 fs.mkdirSync(stateDir, { recursive: true });
 
@@ -28,7 +32,7 @@ const child = spawn(process.execPath, [script], {
   cwd: repoRoot,
   env: {
     ...process.env,
-    M365_PROXY_API_KEY: "m365",
+    M365_PROXY_API_KEY: process.env.M365_PROXY_API_KEY,
     M365_REQUIRE_API_KEY: "1",
     HOST: "127.0.0.1",
     NITRO_HOST: "127.0.0.1",

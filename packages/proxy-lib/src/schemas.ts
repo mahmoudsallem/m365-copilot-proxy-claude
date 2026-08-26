@@ -65,3 +65,5 @@ export const ChatCompletionRequest = z.object({
     }),
   ]).optional(),
 });
+
+export type ChatBody = z.infer<typeof ChatCompletionRequest>;

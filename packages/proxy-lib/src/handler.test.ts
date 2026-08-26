@@ -76,4 +76,15 @@ describe("first-turn confabulation recovery", () => {
 
     expect(call).toBeNull();
   });
+
+  it("does not invent missing required arguments for an arbitrary tool", () => {
+    const call = makeOrientationToolCall({
+      model: "gpt-5.5",
+      messages: [{ role: "user", content: "read a file" }],
+      stream: false,
+      tools: [readFileTool],
+    });
+
+    expect(call).toBeNull();
+  });
 });

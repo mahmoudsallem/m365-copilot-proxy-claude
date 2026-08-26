@@ -37,6 +37,31 @@ than "we eyeballed one run." See §M (Methods) for the experimental rig.
 
 ---
 
+## F28 - Anthropic tool-schema fail-closed boundary + Windows lifecycle (2026-08-26)
+
+**Finding (offline, service version N/A).** The fenced parser previously emitted
+model-produced arguments without validating them against the client schema. An
+Ajv draft-2020-12 per-request registry now retains and compiles the full catalog,
+rejects malformed JSON/unknown tools/invalid schemas, and permits only a small
+one-to-one property-alias repair followed by revalidation. n=4 focused registry
+tests + n=2 full offline route cases; the installed Claude Code 2.1.233 harness
+also exposed and closed the draft-dialect mismatch. Falsification: any emitted
+`tool_use` that fails its declared schema, or any valid Claude Code `$schema`
+catalog rejected before an upstream turn.
+
+**Agent-loop evidence.** The fake transport gained an opt-in echo-result mode for
+an unfakeable client harness. A random secret absent from the prompt passed only
+after real Claude Code Bash execution and a matching `tool_result`: n=1/1, one
+tool call, two model turns, final state correct. This proves the local wiring, not
+live M365 model compliance.
+
+The three maintained Windows entry points now generate a private bearer key,
+track and identity-check proxy/watchdog PIDs, cap watchdog restarts, validate
+models, isolate Claude environment/session headers, and preserve normal
+permissions by default.
+
+---
+
 ## 17. Aug 24 2026 — Gap-closure build: progressive tool discovery (ToolSearch), tone-health failover, batched-call opt-in, latency probe
 
 **Premise.** Close the measured gaps vs native Claude Code: (a) 6-tool ceiling,

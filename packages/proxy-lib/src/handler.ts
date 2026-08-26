@@ -44,6 +44,7 @@ import {
 } from "./subagent.js";
 import type { z } from "zod/v4";
 import { createHash } from "node:crypto";
+import { ToolSchemaRegistry } from "./tool-registry.js";
 
 const log = createLogger("handler");
 
@@ -190,6 +191,8 @@ export function makeOrientationToolCall(body: ChatBody): ReturnType<typeof parse
   }
 
   const firstTool = body.tools[0];
+  const required = firstTool.function.parameters?.required;
+  if (Array.isArray(required) && required.length > 0) return null;
   return {
     id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     type: "function",
@@ -562,6 +565,20 @@ export async function produceCompletion(
   }
   const profile = profSel.profile;
   if (profSel.source === "explicit") log.info(`Harness profile: ${profile.name} (explicit)`);
+
+  // Compile the caller's complete tool catalog once, before spending an M365
+  // turn. The same registry validates every parsed/promoted call before it can
+  // cross back to Claude Code.
+  const toolRegistry = new ToolSchemaRegistry(body.tools ?? []);
+  if (toolRegistry.definitionErrors.length > 0) {
+    return fail(400, {
+      error: {
+        message: `Invalid tool definition(s): ${toolRegistry.definitionErrors.join(" ")}`,
+        type: "invalid_request_error",
+        code: "PROXY_TOOL_SCHEMA_ERROR",
+      },
+    });
+  }
 
   // Tone-health routing (W-C): when the requested model's breaker is OPEN
   // (consecutive tone_outage failures), transparently reroute to the first
@@ -1197,6 +1214,29 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
       // client executes it; unbalanced quotes stay advisory via the lint below.
       const repairs = repairBashCommands(parsed.toolCalls);
       if (repairs > 0) log.info(`Repaired ${repairs} bash command(s) (CRLF/heredoc)`);
+
+      const validatedCalls = [];
+      for (const call of parsed.toolCalls) {
+        const checked = toolRegistry.validateAndRepair(call);
+        if (!checked.ok) {
+          log.warn(`Rejected invalid tool call ${call.function.name}: ${checked.message}`);
+          return {
+            kind: "error",
+            resp: jsonResponse(422, {
+              error: {
+                message: [checked.message, ...(checked.errors ?? [])].join(" "),
+                type: "invalid_request_error",
+                code: "PROXY_TOOL_SCHEMA_ERROR",
+              },
+            }),
+          };
+        }
+        if (checked.repaired) {
+          log.info(`Conservatively repaired ${call.function.name} arguments: ${checked.repairs.join(", ")}`);
+        }
+        validatedCalls.push(checked.call);
+      }
+      parsed.toolCalls = validatedCalls;
 
       // Pre-flight lint (advisory, never blocking): flag bash commands with
       // likely-unbalanced quotes or unterminated heredocs so the client-side

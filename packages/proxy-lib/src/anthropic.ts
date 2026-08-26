@@ -312,8 +312,8 @@ export interface AnthropicMessageResponse {
   role: "assistant";
   model: string;
   content: AnthropicContent[];
-  stop_reason: "end_turn" | "tool_use" | "max_tokens";
-  stop_sequence: null;
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
+  stop_sequence: string | null;
   usage: { input_tokens: number; output_tokens: number };
   /** M365 diagnostics (conversation quota %, classifier scores) as extension data. */
   m365?: Record<string, unknown>;
@@ -375,8 +375,8 @@ export function fromOpenAIChatResponse(payload: any, requestedModel: string): An
   };
 }
 
-function anthropicError(status: number, message: string, type = "api_error"): Response {
-  return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
+function anthropicError(status: number, message: string, type = "api_error", code?: string): Response {
+  return new Response(JSON.stringify({ type: "error", error: { type, message, ...(code ? { code } : {}) } }), {
     status,
     headers: { "Content-Type": "application/json" },
   });
@@ -399,9 +399,9 @@ function disengagedTurn(model: string): AnthropicMessageResponse {
   };
 }
 
-async function errorPayload(resp: Response): Promise<{ type?: string; message?: string } | null> {
+async function errorPayload(resp: Response): Promise<{ type?: string; message?: string; code?: string } | null> {
   try {
-    const parsed = (await resp.json()) as { error?: { type?: string; message?: string } };
+    const parsed = (await resp.json()) as { error?: { type?: string; message?: string; code?: string } };
     return parsed?.error ?? null;
   } catch {
     return null;
@@ -410,7 +410,7 @@ async function errorPayload(resp: Response): Promise<{ type?: string; message?: 
 
 function anthropicErrorFromPayload(
   status: number,
-  payload: { type?: string; message?: string } | null,
+  payload: { type?: string; message?: string; code?: string } | null,
 ): Response {
   let message = `M365 upstream returned HTTP ${status}`;
   let upstreamType = "upstream_error";
@@ -423,7 +423,7 @@ function anthropicErrorFromPayload(
   const type = nonRetryable
     ? "invalid_request_error"
     : status === 429 ? "rate_limit_error" : "api_error";
-  return anthropicError(mappedStatus, message, type);
+  return anthropicError(mappedStatus, message, type, payload?.code);
 }
 
 function event(name: string, data: unknown): string {
@@ -494,6 +494,22 @@ function estimateOutputTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
+function applyStopSequences(text: string, sequences: string[] | undefined): {
+  text: string;
+  stopReason: "end_turn" | "stop_sequence";
+  stopSequence: string | null;
+} {
+  let hit: { index: number; sequence: string } | null = null;
+  for (const sequence of sequences ?? []) {
+    if (!sequence) continue;
+    const index = text.indexOf(sequence);
+    if (index >= 0 && (!hit || index < hit.index)) hit = { index, sequence };
+  }
+  return hit
+    ? { text: text.slice(0, hit.index), stopReason: "stop_sequence", stopSequence: hit.sequence }
+    : { text, stopReason: "end_turn", stopSequence: null };
+}
+
 /**
  * Run one Anthropic Messages turn through the shared produceCompletion engine and
  * translate the result back into Anthropic wire shapes. Protocol-neutral errors
@@ -550,7 +566,8 @@ async function completeAnthropic(
     };
   }
 
-  const text = produced.text;
+  const stopped = applyStopSequences(produced.text, body.stop_sequences);
+  const text = stopped.text;
   const content: AnthropicMessageResponse["content"] = [
     ...(produced.thinking ? [{ type: "thinking" as const, thinking: produced.thinking, signature: "" }] : []),
     { type: "text", text },
@@ -562,8 +579,8 @@ async function completeAnthropic(
       role: "assistant",
       model: body.model,
       content,
-      stop_reason: outputFinishReason(text) === "length" ? "max_tokens" : "end_turn",
-      stop_sequence: null,
+      stop_reason: outputFinishReason(text) === "length" ? "max_tokens" : stopped.stopReason,
+      stop_sequence: stopped.stopSequence,
       usage: {
         input_tokens: inputTokens,
         output_tokens: estimateOutputTokens(text),
@@ -681,7 +698,7 @@ export async function handleAnthropicMessages(
           profile: options.profile,
           forceSingleToolUse: requestsSingleToolUse(body),
           // Live passthrough: every upstream delta becomes a text_delta AS IT ARRIVES.
-          onTextDelta: (delta) => {
+          onTextDelta: body.stop_sequences?.length ? undefined : (delta) => {
             if (!delta) return;
             sent += delta;
             send("content_block_delta", {
@@ -692,7 +709,8 @@ export async function handleAnthropicMessages(
           },
         });
 
-        let stopReason: "end_turn" | "tool_use" | "max_tokens";
+        let stopReason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
+        let stopSequence: string | null = null;
         let outputChars: number;
         if (produced.kind === "error") {
           closeOpenBlocks();
@@ -765,8 +783,10 @@ export async function handleAnthropicMessages(
             send("content_block_stop", { type: "content_block_stop", index });
           }
         } else {
-          const finalText = produced.text ?? "";
-          stopReason = outputFinishReason(finalText) === "length" ? "max_tokens" : "end_turn";
+          const stopped = applyStopSequences(produced.text ?? "", body.stop_sequences);
+          const finalText = stopped.text;
+          stopReason = outputFinishReason(finalText) === "length" ? "max_tokens" : stopped.stopReason;
+          stopSequence = stopped.stopSequence;
           outputChars = finalText.length;
           // ChainOfThought → thinking block (F17.10), emitted ahead of text.
           if (produced.thinking && !sent.includes(produced.thinking.slice(0, 40))) {
@@ -804,7 +824,7 @@ export async function handleAnthropicMessages(
 
         send("message_delta", {
           type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
+          delta: { stop_reason: stopReason, stop_sequence: stopSequence },
           usage: { input_tokens: inputTokens, output_tokens: estimateOutputTokens("x".repeat(outputChars)) },
           m365: usage,
         });

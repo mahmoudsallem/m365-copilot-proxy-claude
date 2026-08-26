@@ -137,6 +137,42 @@ describe("/v1/messages agentic tool loop (offline)", () => {
   });
 });
 
+describe("/v1/messages tool schema enforcement (offline)", () => {
+  it("never emits a schema-invalid tool_use", async () => {
+    const { app } = makeApp({ command: "echo not-the-enum" });
+    const res = await app.fetch(anthropicRequest({
+      model: "gpt-5.5",
+      max_tokens: 256,
+      tools: [{
+        ...BASH_TOOL,
+        input_schema: {
+          type: "object",
+          properties: { command: { type: "string", enum: ["echo allowed"] } },
+          required: ["command"],
+          additionalProperties: false,
+        },
+      }],
+      messages: [{ role: "user", content: "run the allowed command" }],
+    }));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.type).toBe("error");
+    expect(body.error.code).toBe("PROXY_TOOL_SCHEMA_ERROR");
+  });
+
+  it("rejects an invalid client schema before calling M365", async () => {
+    const { app, transport } = makeApp();
+    const res = await app.fetch(anthropicRequest({
+      model: "gpt-5.5",
+      max_tokens: 256,
+      tools: [{ name: "Broken", input_schema: { type: "not-a-real-type" } }],
+      messages: [{ role: "user", content: "use the tool" }],
+    }));
+    expect(res.status).toBe(400);
+    expect(transport.prompts).toHaveLength(0);
+  });
+});
+
 // --- Streaming: genuine incremental SSE in Anthropic wire format ---
 
 describe("/v1/messages streaming (offline)", () => {
@@ -192,6 +228,40 @@ describe("/v1/messages streaming (offline)", () => {
     expect(raw).toContain('"stop_reason":"tool_use"');
     expect(raw).toContain("input_json_delta");
     expect(raw).toContain("echo fake-turn-1");
+  });
+});
+
+describe("/v1/messages stop sequences (offline)", () => {
+  it("truncates non-stream text and reports the matched stop sequence", async () => {
+    const { app } = makeApp();
+    const res = await app.fetch(anthropicRequest({
+      model: "gpt-5.5",
+      max_tokens: 256,
+      stop_sequences: [":"],
+      messages: [{ role: "user", content: "hello" }],
+    }));
+    const body = await res.json();
+    expect(body.stop_reason).toBe("stop_sequence");
+    expect(body.stop_sequence).toBe(":");
+    expect(body.content[0].text).toBe("FAKE_ECHO turn=1");
+  });
+
+  it("buffers safely when streaming with stop sequences", async () => {
+    const { app } = makeApp();
+    const res = await app.fetch(anthropicRequest({
+      model: "gpt-5.5",
+      max_tokens: 256,
+      stream: true,
+      stop_sequences: [":"],
+      messages: [{ role: "user", content: "hello" }],
+    }));
+    const raw = await res.text();
+    const chunks = raw.split("\n\n").filter((chunk) => chunk.startsWith("event: "));
+    const deltas = chunks.map((chunk) => JSON.parse(chunk.split("\n")[1].slice(6)));
+    const text = deltas.filter((data) => data.delta?.type === "text_delta").map((data) => data.delta.text).join("");
+    const final = deltas.find((data) => data.type === "message_delta");
+    expect(text).toBe("FAKE_ECHO turn=1");
+    expect(final.delta).toEqual({ stop_reason: "stop_sequence", stop_sequence: ":" });
   });
 });
 

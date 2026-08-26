@@ -19,6 +19,7 @@ function buildSessionOptions(): ModelSessionOptions {
       useAgent: false,
       transport: new FakeTransport({
         command: process.env.M365_FAKE_COMMAND,
+        echoToolResult: process.env.M365_FAKE_ECHO_TOOL_RESULT === "1",
       }),
     };
   }

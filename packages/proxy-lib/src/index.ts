@@ -47,6 +47,7 @@ export { enqueueTurn, turnQueueStats } from "./turn-queue.js";
 export { SessionStore, defaultSessionStorePath, type PersistedSession } from "./session-store.js";
 export { PROFILES, listProfileNames, resolveProfile, isProfileName, toolAllowedByProfile, type HarnessProfile, type ProfileName } from "./profiles.js";
 export { ChatCompletionRequest, ChatMessage, ToolCall, ToolDefinition } from "./schemas.js";
+export { ToolSchemaRegistry, type ToolCallValidation, type ToolCallLike } from "./tool-registry.js";
 export {
   AnthropicMessagesRequest,
   resolveM365Model,
@@ -216,6 +217,14 @@ export function createApp(sessionOptions: ModelSessionOptions = {}): FetchApp {
     if (method === "GET" && pathname === "/health") {
       return withCors(json(200, {
         status: "ok",
+        service: "m365-copilot-proxy",
+        host: "127.0.0.1",
+        anthropic_messages: true,
+        anthropic_count_tokens: true,
+        streaming: true,
+        tool_bridge: true,
+        tool_bridge_mode: "prompt-emulated",
+        active_sessions: pool.size,
         conversations: pool.size,
         gate: pool.turnGate.stats(),
         turnQueue: turnQueueStats(),

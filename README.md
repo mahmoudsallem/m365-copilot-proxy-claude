@@ -64,6 +64,53 @@ Each agent session reuses the same M365 conversation (same `sessionId` + `conver
 
 ## Windows
 
+### Quick start (recommended)
+
+The normal Windows workflow is exactly these three repository-root commands:
+
+```powershell
+.\proxy-up.ps1
+.\claude-m365.ps1
+.\proxy-down.ps1
+```
+
+`proxy-up.ps1` installs locked dependencies only when missing, rebuilds stale
+output, creates a strong private local bearer key, uses the legitimate Microsoft
+browser login on first live use, starts a bounded-restart watchdog, and verifies
+`/health` plus `/v1/models`. It is idempotent. For offline validation use
+`.\proxy-up.ps1 -Fake`; force a refresh with `-Fresh`.
+
+Select and validate a model against the live local catalog before launching the
+real installed Claude Code binary:
+
+```powershell
+.\claude-m365.ps1 -Model gpt-5.5-think-deeper
+```
+
+Each launch gets a new `x-m365-session-id` unless `-SessionId` is supplied. The
+Anthropic environment and bearer key are process-scoped, `ANTHROPIC_API_KEY` is
+removed for the child to avoid ambiguous authentication, and normal Claude Code
+permission prompts remain enabled. `-Unsafe` is the only way the launcher adds
+`--dangerously-skip-permissions`. Existing `run.ps1`, login, TUI, and direct-Claude
+escape hatches remain available for advanced use. Logs are under
+`%USERPROFILE%\.local\state\m365-copilot-proxy`; health is
+`http://127.0.0.1:4141/health`.
+
+### Compatibility boundary
+
+- Native-equivalent interface behavior: Messages request/response shapes,
+  `tool_use`/`tool_result`, SSE ordering, stop reasons, session routing, and MCP
+  tool forwarding back to Claude Code.
+- Adapter-emulated compatibility: M365 fenced tool intent, JSON-Schema validation
+  and conservative argument repair, ToolSearch retrieval, structured-output
+  checks, display-safe M365 reasoning summaries, and token estimates.
+- Not reproducible: Anthropic's inference runtime, native tool-constrained
+  decoding, KV prompt cache, exact tokenizer, hidden system prompt, or internal
+  infrastructure behavior.
+
+The proxy never executes Claude Code's client tools. Claude Code performs the real
+filesystem/shell/MCP action after receiving a validated `tool_use` block.
+
 Everything is cross-platform; use PowerShell instead of the bash launchers.
 `run.ps1` is a one-stop bootstrap — it installs Node LTS (winget) if missing,
 provisions pnpm, installs project dependencies, builds, fetches the system-prompt
