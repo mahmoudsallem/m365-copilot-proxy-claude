@@ -2846,3 +2846,23 @@ TurnGate default maxConcurrent 2 -> 1; SessionStore persistence auto-disables un
 NODE_ENV=test so suites can no longer write the operator's real sessions.json.
 212 -> 232 tests green. Live A/B vs the six-tool baseline is deliberately deferred to
 the PR4 bench gate (sequential runs only).
+
+## F26 - Full-capability transport hardening (2026-08-26)
+
+**Scope executed (offline-green, no quota):** separator-aware ToolSearch tokenizer
+(__ . / -) verified against 50/200/1000-tool catalogs; namespaced MCP fence
+round-trip (mcp__github__*) with tool_use.id / arguments / is_error / orphan-stub
+correlation pinned by tests; explicit M365 Disengage now surfaces as a graceful
+assistant turn on both Anthropic paths (stream + non-stream) instead of a protocol
+error - retry-storm protection unchanged for empties/rate limits; attachment
+placeholders generalized to documents and unknown source-bearing blocks; synthetic
+Task turns routed through the account-wide FIFO with per-job cancellation (race found
+and fixed: parseTools omitted TASK_DEF whenever nothing was deferred - claude-wide
+with a tiny client catalog silently lost Task execution); TurnStat telemetry extended
+(profile, visible/deferred/promoted tools, failover, cancellation).
+
+**Deferred with rationale:** utility-request pooling needs real traffic shapes from
+the PR4 bench before a heuristic is trustworthy; Disengaged-as-turn semantics change
+was user-endorsed via plan acceptance. Phases 2/3/8 (filesystem workflow validation,
+skills/hooks/MCP fixtures, mandatory real-claude gate) require the actual Claude CLI
+sandbox and remain gated behind PR4 + free disk on E:.

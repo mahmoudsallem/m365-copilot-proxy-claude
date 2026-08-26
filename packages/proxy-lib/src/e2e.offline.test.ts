@@ -656,6 +656,229 @@ describe("direct produceCompletion callers get strict profile validation too", (
   });
 });
 
+// --- Phase 1: arbitrary/namespaced tools, correlation, tokenizer scale ---
+
+import { parseFencedToolCalls } from "@m365-copilot/core";
+import { searchDeferredCatalog } from "./handler.js";
+
+// Hermeticity: several fixtures intentionally produce empty/aborted turns, which
+// would latch the shared account-degradation backoff and stall every later test
+// in this file. Disable that policy here; it has its own dedicated suite.
+process.env.M365_NO_BACKOFF = "1";
+
+const MCP_TOOL = {
+  name: "mcp__github__create_pull_request",
+  description: "Create a pull request",
+  input_schema: {
+    type: "object",
+    properties: { title: { type: "string" }, body: { type: "string" } },
+    required: ["title"],
+  },
+};
+
+describe("arbitrary + namespaced tool transport", () => {
+  it("fenced parser accepts namespaced MCP tool names verbatim", () => {
+    // FencedToolSpec mirrors what deriveFencedSpec(buildSpecMap(...)) produces
+    // for this schema: scalar `title` as a header line, `body` as fence body.
+    const specs = new Map([
+      ["mcp__github__create_pull_request", {
+        name: "mcp__github__create_pull_request",
+        description: "Create a PR",
+        headerParams: ["title"],
+        bodyParam: "body",
+      }],
+    ]);
+    const { calls } = parseFencedToolCalls(
+      "```mcp__github__create_pull_request\ntitle: demo\nbody: hello world\n```",
+      specs as never,
+    );
+    expect(calls.length).toBe(1);
+    expect(calls[0].function.name).toBe("mcp__github__create_pull_request");
+    const args = JSON.parse(calls[0].function.arguments);
+    expect(args.title).toBe("demo");
+  });
+
+  it("preserves tool_use.id, arguments and is_error state through conversion", () => {
+    const body = AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: "open a pr" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_mcp_01", name: MCP_TOOL.name, input: { title: "demo", body: "text" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_mcp_01", is_error: true, content: "403 forbidden" }] },
+      ],
+      tools: [MCP_TOOL],
+    });
+    const msgs = toOpenAIChatRequest(body).messages;
+    const assistant = msgs.find((m) => m.role === "assistant" && m.tool_calls?.length)!;
+    expect(assistant.tool_calls[0].id).toBe("toolu_mcp_01");
+    expect(assistant.tool_calls[0].function.name).toBe("mcp__github__create_pull_request");
+    expect(JSON.parse(assistant.tool_calls[0].function.arguments)).toEqual({ title: "demo", body: "text" });
+    const toolMsg = msgs.find((m) => m.role === "tool")!;
+    expect(toolMsg.tool_call_id).toBe("toolu_mcp_01");
+    expect(String(toolMsg.content)).toContain("[tool error]");
+    expect(String(toolMsg.content)).toContain("403 forbidden");
+  });
+
+  it("orphan tool_result gets a synthesized stub pair (documented recovery)", () => {
+    const body = AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: "history was trimmed above" },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "orphan_42", content: "stale output" }] },
+      ],
+    });
+    const msgs = toOpenAIChatRequest(body).messages;
+    const stub = msgs.find((m) => m.role === "assistant" && m.tool_calls?.length);
+    expect(stub).toBeTruthy();
+    const toolMsg = msgs.find((m) => m.role === "tool")!;
+    expect(toolMsg.tool_call_id).toBe("orphan_42");
+    expect(toolMsg.content).toContain("stale output");
+  });
+});
+
+describe("searchDeferredCatalog tokenizer + scale", () => {
+  const mkCatalog = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      function: {
+        name: `mcp__srv${i % 9}__utility_${i}`,
+        description: `utility number ${i} does things`,
+      },
+    }));
+
+  it("tokenizes __ . / - separated names: 'pull request' finds create_pull_request", () => {
+    const catalog = [
+      { function: { name: "mcp__github__list_issues", description: "list issues" } },
+      { function: { name: "mcp__github__create_pull_request", description: "create a PR" } },
+      { function: { name: "filesystem.read_file", description: "read" } },
+      { function: { name: "some/tool-name", description: "misc" } },
+    ];
+    const hits = searchDeferredCatalog(catalog, "create pull request", 3);
+    expect(hits[0]?.function?.name).toBe("mcp__github__create_pull_request");
+  });
+
+  it.each([50, 200, 1000])("handles a %i-tool deferred catalog deterministically", (n) => {
+    const catalog = mkCatalog(n);
+    const target = catalog[n - 1];
+    const hits = searchDeferredCatalog(catalog, `utility_${n - 1}`, 6);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.some((h) => h.function?.name === target.function?.name)).toBe(true);
+  });
+});
+
+// --- Graceful Disengage + queued-Task cancellation ---
+
+class DisengageTransport {
+  calls = 0;
+  reset(): void {}
+  async chat(): Promise<never> {
+    this.calls += 1;
+    return {
+      fullText: "",
+      hasContent: false,
+      throttle: null,
+      contentOrigin: null,
+      messageType: "Disengaged",
+      messageId: null,
+      scores: null,
+      turnCount: null,
+      turnState: null,
+      thinkingText: null,
+      hasThinking: false,
+      images: [],
+      sawAction: false,
+      async *[Symbol.asyncIterator]() {},
+    } as never;
+  }
+}
+
+async function waitFor(fn: () => boolean, ms = 4000): Promise<void> {
+  const t0 = Date.now();
+  while (!fn()) {
+    if (Date.now() - t0 > ms) throw new Error("waitFor timeout");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+describe("explicit Disengaged becomes a graceful assistant turn", () => {
+  const BODY = { model: "claude-sonnet", max_tokens: 100, messages: [{ role: "user", content: "do a thing" }] };
+
+  it("non-stream returns 200 + explanation text + end_turn", async () => {
+    const transport = new DisengageTransport();
+    const app = createApp({ getToken: async () => "t", useAgent: false, transport: transport as never });
+    const res = await app.fetch(anthropicRequest(BODY));
+    expect(res.status).toBe(200);
+    const message = await res.json();
+    expect(message.stop_reason).toBe("end_turn");
+    expect(message.content[0].text).toContain("safety filter engaged");
+    expect(transport.calls).toBe(1); // fail-fast, no retry storm
+  });
+
+  it("stream emits explanation deltas and NEVER an error event", async () => {
+    const transport = new DisengageTransport();
+    const app = createApp({ getToken: async () => "t", useAgent: false, transport: transport as never });
+    const res = await app.fetch(anthropicRequest({ ...BODY, stream: true }));
+    const raw = await res.text();
+    expect(raw).toContain('"text_delta"');
+    expect(raw).toContain("safety filter engaged");
+    expect(raw).not.toContain('"type":"error"');
+    const lastEvent = raw.trim().split("\n\n").pop() ?? "";
+    expect(lastEvent).toContain('"type":"message_stop"');
+  });
+});
+
+describe("queued Task jobs abandon on cancellation", () => {
+  it("second Task job never starts once the caller aborts after the first", async () => {
+    process.env.M365_CONVERSATION_START_GAP_MS = "0"; // sub-agent conversations must not pay the stampede gap
+    class TaskFlowTransport {
+      seen: string[] = [];
+      mainTurns = 0;
+      /** Test holds alpha's turn open so the abort lands BETWEEN the two jobs deterministically. */
+      alphaGate: Promise<void>;
+      private releaseAlpha!: () => void;
+      reset(): void {}
+      constructor() {
+        this.alphaGate = new Promise<void>((r) => { this.releaseAlpha = r; });
+      }
+      async chat(args: { text: string }): Promise<never> {
+        const t = String(args.text);
+        if (t.includes("HARNESS REALITY")) {
+          this.seen.push(t); // record FIRST so the test can observe while alpha is held open
+          if (t.includes("alpha research")) await this.alphaGate;
+          return staticStream("report: findings attached");
+        }
+        this.mainTurns += 1;
+        if (this.mainTurns === 1) {
+          return staticStream("```Task\nprompt: alpha research\n```\n```Task\nprompt: beta research\n```");
+        }
+        return staticStream("FINAL ANSWER");
+      }
+    }
+
+    const transport = new TaskFlowTransport();
+    const pool = new SessionPool({ getToken: async () => "t", useAgent: false, transport: transport as never });
+    const controller = new AbortController();
+    const chatBody = toOpenAIChatRequest(AnthropicMessagesRequest.parse({
+      model: "claude-sonnet",
+      messages: [{ role: "user", content: "delegate two jobs" }],
+      tools: [PROFILE_TOOLS[1]], // Read — enough to enter tool mode
+    }));
+    const done = produceCompletion(chatBody, pool, { signal: controller.signal, profile: "claude-wide" });
+
+    await waitFor(() => transport.seen.length >= 1); // alpha in flight, held open by its gate
+    controller.abort();
+    (transport as unknown as { releaseAlpha: () => void }).releaseAlpha();
+
+    const { produced } = await done;
+    delete process.env.M365_CONVERSATION_START_GAP_MS;
+    expect(produced.kind).toBe("text");
+    if (produced.kind === "text") expect(produced.text).toContain("FINAL ANSWER");
+    expect(transport.seen.length).toBeGreaterThanOrEqual(1);
+    expect(transport.seen.some((t) => t.includes("beta research"))).toBe(false);
+  }, 20_000);
+});
+
 // --- Cancellation timing: client disconnects must fail fast, never retry-storm ---
 
 describe("cancellation propagation (abort before start + mid-turn)", () => {

@@ -91,6 +91,11 @@ function textFromUnknown(value: unknown): string {
           const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
           return `[IMAGE ATTACHED: ${src.media_type ?? "unknown"}${bytes ? `, ~${bytes} bytes` : ""} — vision is not supported by this backend]`;
         }
+        if (item && typeof item === "object" && (item as { type?: string }).type === "document") {
+          const src = (item as { source?: { media_type?: string; data?: string } }).source ?? {};
+          const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
+          return `[DOCUMENT ATTACHED: ${src.media_type ?? "application/pdf"}${bytes ? `, ~${bytes} bytes` : ""} — content not interpreted]`;
+        }
         return "";
       })
       .filter(Boolean)
@@ -195,6 +200,20 @@ export function anthropicMessagesToOpenAI(body: AnthropicBody): OpenAIMessage[] 
         const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
         pendingText.push(
           `[IMAGE ATTACHED: ${src.media_type ?? "unknown"}${bytes ? `, ~${bytes} bytes` : ""} — vision is not supported by this backend]`,
+        );
+      } else if ((block as { type?: string }).type === "document") {
+        const src = (block as { source?: { media_type?: string; data?: string } }).source ?? {};
+        const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
+        pendingText.push(
+          `[DOCUMENT ATTACHED: ${src.media_type ?? "application/pdf"}${bytes ? `, ~${bytes} bytes` : ""} — document content was not interpreted by this backend]`,
+        );
+      } else if ((block as { source?: unknown }).source && block.type !== "text") {
+        // Unknown future content-block kinds that carry binary sources.
+        const bType = (block as { type?: string }).type ?? "unknown";
+        const src = (block as { source?: { media_type?: string; data?: string } }).source ?? {};
+        const bytes = typeof src.data === "string" ? Math.round(src.data.length * 0.75) : 0;
+        pendingText.push(
+          `[ATTACHMENT NOT INTERPRETED: type=${bType}${src.media_type ? `, ${src.media_type}` : ""}${bytes ? `, ~${bytes} bytes` : ""}]`,
         );
       } else if (block.type === "tool_result") {
         flushText();
@@ -363,29 +382,48 @@ function anthropicError(status: number, message: string, type = "api_error"): Re
   });
 }
 
-/**
- * Convert an OpenAI-style error Response from produceCompletion into the Anthropic
- * error envelope. Claude Code retries 5xx/API errors aggressively (up to ten times),
- * which multiplies one empty M365 turn into a quota-burning retry storm. Empty or
- * deliberately disengaged M365 responses need a manual retry/new session, not an
- * immediate replay of the same request, so surface them as a non-retryable
- * invalid_request_error. Preserve genuine rate limits with their normal semantics.
- */
-async function anthropicErrorFromUpstream(upstream: Response): Promise<Response> {
-  let message = `M365 upstream returned HTTP ${upstream.status}`;
-  let upstreamType = "upstream_error";
-  try {
-    const payload = await upstream.json() as any;
-    message = payload?.error?.message ?? message;
-    upstreamType = payload?.error?.type ?? upstreamType;
-  } catch {}
+const DISENGAGED_EXPLANATION =
+  "M365 Copilot declined this request (its safety filter engaged). Rephrase the task, reduce the attached tools or context, or switch to the default model - then retry.";
 
+/** A normal assistant turn explaining a Disengage — no scary protocol error for the user. */
+function disengagedTurn(model: string): AnthropicMessageResponse {
+  return {
+    id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text: DISENGAGED_EXPLANATION }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 0, output_tokens: estimateOutputTokens(DISENGAGED_EXPLANATION) },
+  };
+}
+
+async function errorPayload(resp: Response): Promise<{ type?: string; message?: string } | null> {
+  try {
+    const parsed = (await resp.json()) as { error?: { type?: string; message?: string } };
+    return parsed?.error ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function anthropicErrorFromPayload(
+  status: number,
+  payload: { type?: string; message?: string } | null,
+): Response {
+  let message = `M365 upstream returned HTTP ${status}`;
+  let upstreamType = "upstream_error";
+  if (payload) {
+    message = payload.message ?? message;
+    upstreamType = payload.type ?? upstreamType;
+  }
   const nonRetryable = upstreamType === "upstream_empty_response" || upstreamType === "disengaged";
-  const status = nonRetryable ? 400 : upstream.status;
+  const mappedStatus = nonRetryable ? 400 : status;
   const type = nonRetryable
     ? "invalid_request_error"
-    : upstream.status === 429 ? "rate_limit_error" : "api_error";
-  return anthropicError(status, message, type);
+    : status === 429 ? "rate_limit_error" : "api_error";
+  return anthropicError(mappedStatus, message, type);
 }
 
 function event(name: string, data: unknown): string {
@@ -561,7 +599,19 @@ export async function handleAnthropicMessages(
 
   if (!body.stream) {
     const result = await completeAnthropic(body, pool, options);
-    if ("error" in result) return anthropicErrorFromUpstream(result.error);
+    if ("error" in result) {
+      const payload = await errorPayload(result.error);
+      // Explicit M365 Disengage -> a normal assistant turn explaining what
+      // happened, NOT a protocol error (Claude Code would retry-storm and the
+      // user would just see a red failure for what is really a content filter).
+      if (payload?.type === "disengaged") {
+        log.info("Disengaged -> graceful assistant turn (non-stream)");
+        return new Response(JSON.stringify(disengagedTurn(body.model)), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return anthropicErrorFromPayload(result.error.status, payload);
+    }
     return new Response(JSON.stringify(result.message), { headers: { "Content-Type": "application/json" } });
   }
 
@@ -646,14 +696,26 @@ export async function handleAnthropicMessages(
         let outputChars: number;
         if (produced.kind === "error") {
           closeOpenBlocks();
-          let error = { type: "api_error", message: "M365 upstream error" };
-          try {
-            const payload = JSON.parse(await produced.resp.text()) as any;
-            error = {
-              type: payload?.error?.type ?? error.type,
-              message: payload?.error?.message ?? error.message,
-            };
-          } catch {}
+          const payload = await errorPayload(produced.resp);
+          if (payload?.type === "disengaged") {
+            // Graceful turn: explanation text + clean end, never an SSE error event.
+            log.info("Disengaged -> graceful assistant turn (stream)");
+            const idx = openTextBlock();
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: idx,
+              delta: { type: "text_delta", text: DISENGAGED_EXPLANATION },
+            });
+            closeOpenBlocks();
+            send("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: "end_turn", stop_sequence: null },
+              usage: { output_tokens: estimateOutputTokens(DISENGAGED_EXPLANATION) },
+            });
+            send("message_stop", { type: "message_stop" });
+            return;
+          }
+          let error = { type: payload?.type ?? "api_error", message: payload?.message ?? "M365 upstream error" };
           send("error", { type: "error", error });
           return;
         } else if (produced.kind === "tools") {

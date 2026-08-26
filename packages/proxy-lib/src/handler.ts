@@ -58,6 +58,18 @@ export interface TurnStat {
   outcome: "ok" | "empty" | "disengaged" | "rate_limited";
   /** Harness profile active for the turn (telemetry only). */
   profile?: string;
+  /** Tool-surface telemetry: advertised vs deferred sizes at turn time. */
+  visibleTools?: number;
+  deferredTools?: number;
+  promotedTools?: number;
+  /** ToolSearch discovery rounds consumed by the request so far. */
+  toolSearchRounds?: number;
+  /** Synthetic Task sub-agent jobs launched by the request so far. */
+  taskJobs?: number;
+  /** Inline tone-failover reroute happened (depth > 0). */
+  failoverUsed?: boolean;
+  /** Caller aborted this turn. */
+  cancelled?: boolean;
 }
 
 const TURN_STATS_CAP = 80;
@@ -252,10 +264,17 @@ export function searchDeferredCatalog(
   const terms = query.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length > 1);
   if (terms.length === 0) return [];
   const scored = catalog.map((t) => {
-    const hay = `${t.function?.name ?? ""} ${t.function?.description ?? ""}`.toLowerCase();
+    const name = (t.function?.name ?? "").toLowerCase();
+    const desc = (t.function?.description ?? "").toLowerCase();
+    // Namespaced names tokenize on EVERY separator (mcp__srv__tool, plugin.tool,
+    // some/tool-name) so "pull request" hits mcp__github__create_pull_request.
+    const nameTokens = new Set(name.split(/[^a-z0-9_]+/).filter(Boolean));
     let score = 0;
     for (const term of terms) {
-      if (hay.includes(term)) score += hay.startsWith(term) || (t.function?.name ?? "").toLowerCase().includes(term) ? 2 : 1;
+      if (!term) continue;
+      if (nameTokens.has(term)) score += 3;       // exact token in the NAME
+      else if (name.includes(term)) score += 2;   // substring of the name
+      else if (desc.includes(term)) score += 1;   // description-only mention
     }
     return { t, score };
   });
@@ -796,7 +815,20 @@ let lastThinking: string | null = null;
       const totalTime = Math.round(performance.now() - startTime);
       const ttft = firstTokenTime ? Math.round(firstTokenTime - startTime) : null;
       log.info(`Upstream turn latency: total=${totalTime}ms, ttft=${ttft ?? "N/A"}ms, chars=${fullText.length}, model=${model}`);
-      recordTurnStat({ at: Date.now(), model, totalMs: totalTime, ttftMs: ttft, chars: fullText.length, outcome: fullText.length > 0 ? "ok" : "empty", profile: profile.name });
+      recordTurnStat({
+        at: Date.now(),
+        model,
+        totalMs: totalTime,
+        ttftMs: ttft,
+        chars: fullText.length,
+        outcome: fullText.length > 0 ? "ok" : "empty",
+        profile: profile.name,
+        visibleTools: advertisedTools.length,
+        deferredTools: deferredCatalog.length,
+        promotedTools: conv.promotedTools?.size ?? 0,
+        failoverUsed: depth > 0,
+        cancelled: cb.signal?.aborted === true,
+      });
 
       // Image gen (§14): the picture arrives on a GraphicArt frame, usually with NO
       // chat text — so an image turn looks empty to the checks below and would burn
@@ -958,9 +990,11 @@ lastThinking = (copilotStream as { thinkingText?: string | null }).thinkingText 
     let fullText = result.fullText;
 
     log.debug("Raw response (tool mode):", trunc(fullText, 1000));
-    // Parse against the FULL client-declared catalog (+ our synthetic meta-tool):
-    // deferred tools stay executable even though their schemas are hidden from M365.
-    const parseTools = deferredCatalog.length > 0 || advertisedTools.length !== allTools.length
+    // Parse against the FULL client-declared catalog (+ our synthetic meta-tools):
+    // deferred tools stay executable even though their schemas are hidden from M365,
+    // and the synthetic Task tool must parse even when nothing was deferred
+    // (e.g. claude-wide with a tiny client catalog).
+    const parseTools = deferredCatalog.length > 0 || advertisedTools.length !== allTools.length || TASK_DEF
       ? [...allTools, TOOLSEARCH_DEF, ...(TASK_DEF ? [TASK_DEF] : [])]
       : body.tools;
         let parsed = parseToolCalls(fullText, parseTools);
