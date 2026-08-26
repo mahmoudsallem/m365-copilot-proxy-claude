@@ -54,3 +54,4 @@ proxy.stderr.log
 
 # machine-local claude config
 .claude/
+benchmarks/*

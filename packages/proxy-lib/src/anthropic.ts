@@ -270,13 +270,32 @@ export function requestsSingleToolUse(body: AnthropicBody): boolean {
 /**
  * Claude Code's /model picker sends Anthropic model names or custom model aliases.
  * Resolve against our centralized capability-aware model registry.
+ *
+ * Two cases are surfaced rather than resolved silently, because both change
+ * which model the caller is actually talking to: an unresolvable request
+ * falling back to a default, and a resolved alias (e.g. any "haiku" name)
+ * that maps to a materially different canonical model. `console.warn` here
+ * (not the M365_DEBUG-gated logger) is deliberate — this is a correctness/
+ * honesty signal an operator should see by default, matching the mission's
+ * "never silently tell the user they're on a different model" requirement.
  */
 export function resolveM365Model(requested: string): string {
   try {
     const resolved = resolveModel(requested);
+    for (const warning of resolved.warnings) {
+      log.warn(`Model resolution warning: ${warning}`);
+      console.warn(`[anthropic] ${warning}`);
+    }
     return resolved.canonicalModel;
-  } catch {
-    return process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5";
+  } catch (err) {
+    const fallback = process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5";
+    const reason = err instanceof Error ? err.message : String(err);
+    log.warn(`Unresolvable model "${requested}" (${reason}) — falling back to "${fallback}".`);
+    console.warn(
+      `[anthropic] Unresolvable model "${requested}" — falling back to "${fallback}". ` +
+        `Set M365_CLAUDE_CODE_MODEL to override, or use an exact M365 model id from GET /v1/models.`,
+    );
+    return fallback;
   }
 }
 

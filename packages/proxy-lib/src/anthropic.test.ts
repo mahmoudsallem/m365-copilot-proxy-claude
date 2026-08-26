@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   AnthropicMessagesRequest,
   anthropicSse,
@@ -62,6 +62,29 @@ describe("Anthropic Messages compatibility", () => {
     expect(resolveM365Model("claude-opus-5")).toBe("claude-opus");
     expect(resolveM365Model("opus[1m]")).toBe("claude-opus");
     expect(resolveM365Model("gpt-5.5-think-deeper")).toBe("gpt-5.5-think-deeper");
+  });
+
+  it("warns (does not silently substitute) when a Haiku alias resolves to a different canonical model", () => {
+    const warnings: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((msg) => { warnings.push(String(msg)); });
+    try {
+      expect(resolveM365Model("claude-haiku-4-5")).toBe("claude-sonnet");
+      expect(warnings.some((w) => w.includes("haiku") && w.includes("claude-sonnet"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("warns (does not silently swallow) when a model string is unresolvable and falls back", () => {
+    const warnings: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((msg) => { warnings.push(String(msg)); });
+    try {
+      const resolved = resolveM365Model("totally-not-a-real-model-xyz");
+      expect(resolved).toBe(process.env.M365_CLAUDE_CODE_MODEL ?? "gpt-5.5");
+      expect(warnings.some((w) => w.includes("totally-not-a-real-model-xyz") && w.includes("falling back"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
